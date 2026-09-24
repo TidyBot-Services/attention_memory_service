@@ -53,6 +53,11 @@ def test_standalone_service_starts_with_empty_store_and_auth(tmp_path):
 def test_service_refuses_weak_key(tmp_path):
     with pytest.raises(ValueError, match="at least 16"):
         create_app(tmp_path / "memory.sqlite3", api_key="short")
+    with pytest.raises(ValueError, match="must differ"):
+        create_app(
+            tmp_path / "memory.sqlite3", api_key="memory-service-test-key",
+            operator_key="memory-service-test-key",
+        )
 
 
 def test_store_identity_is_stable_and_distinguishes_databases(tmp_path):

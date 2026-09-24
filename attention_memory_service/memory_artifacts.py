@@ -134,6 +134,8 @@ class MemoryArtifactStore:
                 "event_key": event["event_key"],
                 "event_type": event["event_type"],
                 "status": event["payload"].get("memory", {}).get("status"),
+                "reason": event["payload"].get("reason") or event["payload"].get("memory", {}).get("status_reason"),
+                "actor": event["payload"].get("actor"),
             }
             for event in self.store.events()
             if event["entity_type"] == "memory" and event["entity_id"] == memory_id
@@ -149,6 +151,9 @@ class MemoryArtifactStore:
             "validation/plan.json": _json(plan),
             "validation/pairs.jsonl": _jsonl(pairs),
             "validation/impact.json": _json(self.v2.impact_report(memory_id)),
+            "validation/scope.json": _json({
+                "supported_variations": self.v2.impact_report(memory_id)["validated_scope"],
+            }),
             "lifecycle.jsonl": _jsonl(lifecycle),
             "usage.jsonl": _jsonl(uses),
         }

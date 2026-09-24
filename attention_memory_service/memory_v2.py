@@ -71,6 +71,32 @@ class MemoryV2Manager:
             raise ValueError("validation plan needs five distinct development seeds")
         if any(classify_seed(seed) != "dev" for seed in seeds):
             raise PermissionError("validation plan is development-only")
+        cases = plan.get("cases")
+        axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
+        if not isinstance(cases, list) or len(cases) != len(seeds):
+            raise ValueError("validation plan needs a variation case for every seed")
+        if [case.get("seed") for case in cases if isinstance(case, dict)] != seeds:
+            raise ValueError("variation cases must follow the frozen seed order")
+        for case in cases:
+            if not isinstance(case, dict) or set(case) != {"seed", *axes, "camera_names", "task_prompt"} or any(
+                not isinstance(case[axis], str) or not case[axis].strip() for axis in axes
+            ) or not isinstance(case["camera_names"], list) or not case["camera_names"] or any(
+                not isinstance(name, str) or not name for name in case["camera_names"]
+            ) or not isinstance(case["task_prompt"], str) or not case["task_prompt"].strip():
+                raise ValueError("variation case needs explicit scene/object/camera/task IDs")
+        if any(len({case[axis] for case in cases}) < 2 for axis in axes):
+            raise ValueError("validation must vary each declared axis")
+        if len({tuple(case["camera_names"]) for case in cases}) < 2 or len({case["task_prompt"] for case in cases}) < 2:
+            raise ValueError("camera and task variants need different concrete views and prompts")
+        camera_map = {case["camera_config_id"]: tuple(case["camera_names"]) for case in cases}
+        task_map = {case["task_variant_id"]: case["task_prompt"] for case in cases}
+        if (
+            len(camera_map) != len({tuple(case["camera_names"]) for case in cases})
+            or len(task_map) != len({case["task_prompt"] for case in cases})
+            or any(camera_map[case["camera_config_id"]] != tuple(case["camera_names"]) for case in cases)
+            or any(task_map[case["task_variant_id"]] != case["task_prompt"] for case in cases)
+        ):
+            raise ValueError("camera/task variant IDs must map one-to-one to concrete settings")
         credits = plan.get("assistance_credits")
         if isinstance(credits, bool) or not isinstance(credits, int) or credits < 0:
             raise ValueError("validation plan credits must be nonnegative")
@@ -236,7 +262,13 @@ class MemoryV2Manager:
             if self._provenance(item.memory_id) is None:
                 continue
             self.provenance(item.memory_id)
-            if all(item.applicability.get(key) == context.get(key) for key in ("perception_mode", "suite", "task_id")):
+            if not all(item.applicability.get(key) == context.get(key) for key in ("perception_mode", "suite", "task_id")):
+                continue
+            axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
+            if not all(isinstance(context.get(axis), str) and context[axis] for axis in axes):
+                continue
+            scope = self.impact_report(item.memory_id)["validated_scope"]
+            if {axis: context[axis] for axis in axes} in scope:
                 result.append(item)
         return result
 
@@ -272,7 +304,16 @@ class MemoryV2Manager:
         if control["run"]["budget"] != treatment["run"]["budget"]:
             raise StateConflictError("paired budgets differ")
         plan = self.get_plan(memory_id)
-        if plan is not None and (
+        if plan is None:
+            raise StateConflictError("paired validation requires a frozen variation plan")
+        expected_case = next((case for case in plan["cases"] if case["seed"] == seed), None)
+        expected_variation = None if expected_case is None else {
+            axis: expected_case[axis]
+            for axis in ("scene_id", "object_set_id", "camera_config_id", "task_variant_id", "camera_names", "task_prompt")
+        }
+        if expected_variation is None or control["variation"] != expected_variation or treatment["variation"] != expected_variation:
+            raise StateConflictError("paired runs did not attest the planned variation")
+        if (
             seed not in plan["seeds"]
             or control["run"]["policy_id"] != plan["policy_id"]
             or control["run"]["budget"]["assistance_credits"] != plan["assistance_credits"]
@@ -280,6 +321,8 @@ class MemoryV2Manager:
             raise StateConflictError("paired run differs from recorded validation plan")
         if not control["policy_sha256"] or control["policy_sha256"] != treatment["policy_sha256"]:
             raise StateConflictError("paired policy code differs")
+        if not control["config_sha256"] or control["config_sha256"] != treatment["config_sha256"]:
+            raise StateConflictError("paired execution configuration differs")
         if control["memory_ids"] or control["exposure"] != "none":
             raise StateConflictError("control must not receive memory")
         if treatment["memory_ids"] != [memory_id] or treatment["exposure"] != "candidate_validation":
@@ -318,6 +361,8 @@ class MemoryV2Manager:
         control_success = treatment_success = control_credits = treatment_credits = 0
         control_seconds = treatment_seconds = control_unsafe = treatment_unsafe = 0.0
         control_gpu = treatment_gpu = control_tokens = treatment_tokens = 0.0
+        supporting_successes = []
+        counterexamples = []
         for pair in pairs:
             control = self._trial(pair["control_attempt_id"])
             treatment = self._trial(pair["treatment_attempt_id"])
@@ -335,9 +380,53 @@ class MemoryV2Manager:
             treatment_gpu += treatment["gpu_seconds"]
             control_tokens += control["tokens"]
             treatment_tokens += treatment["tokens"]
-            control_unsafe += self._verify_safety(pair["control_safety"])
-            treatment_unsafe += self._verify_safety(pair["treatment_safety"])
+            control_pair_unsafe = self._verify_safety(pair["control_safety"])
+            treatment_pair_unsafe = self._verify_safety(pair["treatment_safety"])
+            control_unsafe += control_pair_unsafe
+            treatment_unsafe += treatment_pair_unsafe
+            evidence = {
+                "seed": pair["seed"],
+                "variation": treatment["variation"],
+                "control_attempt_id": pair["control_attempt_id"],
+                "treatment_attempt_id": pair["treatment_attempt_id"],
+            }
+            if treatment["success"] and (
+                not control["success"] or treatment["credits"] < control["credits"]
+            ):
+                supporting_successes.append({
+                    **evidence,
+                    "reason": "success_gain" if not control["success"] else "assistance_saved",
+                    "assistance_credits_saved": control["credits"] - treatment["credits"],
+                })
+            if (
+                not treatment["success"]
+                or treatment_pair_unsafe > control_pair_unsafe
+                or treatment["credits"] > control["credits"]
+            ):
+                counterexamples.append({
+                    **evidence,
+                    "reason": (
+                        "treatment_failed" if not treatment["success"]
+                        else "safety_regression" if treatment_pair_unsafe > control_pair_unsafe
+                        else "assistance_regression"
+                    ),
+                    "control_native_success": bool(control["success"]),
+                    "treatment_native_success": bool(treatment["success"]),
+                    "control_unsafe_attempts": control_pair_unsafe,
+                    "treatment_unsafe_attempts": treatment_pair_unsafe,
+                })
         n = len(pairs)
+        axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
+        scope_tuple = lambda variation: {axis: variation[axis] for axis in axes}
+        blocked = {_encoded(scope_tuple(item["variation"])) for item in counterexamples}
+        validated_scope = []
+        seen_scope = set()
+        for item in supporting_successes:
+            variation = scope_tuple(item["variation"])
+            key = _encoded(variation)
+            if key not in blocked and key not in seen_scope:
+                validated_scope.append(variation)
+                seen_scope.add(key)
         return {
             "memory_id": memory_id,
             "source_kind": provenance["source_kind"],
@@ -345,6 +434,10 @@ class MemoryV2Manager:
             "paired_dev_seeds": n,
             "control_successes": control_success,
             "treatment_successes": treatment_success,
+            "empirical_confidence": treatment_success / n if n else None,
+            "supporting_successes": supporting_successes,
+            "counterexamples": counterexamples,
+            "validated_scope": validated_scope,
             "success_gain": treatment_success - control_success,
             "success_rate_gain": (treatment_success - control_success) / n if n else None,
             "future_assistance_credits_saved": control_credits - treatment_credits,
@@ -371,6 +464,9 @@ class MemoryV2Manager:
 
     def validate_and_promote(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
         report = self.impact_report(memory_id)
+        plan = self.get_plan(memory_id)
+        if plan is None or {pair["seed"] for pair in self.list_pairs(memory_id)} != set(plan["seeds"]):
+            raise StateConflictError("all predefined variation cases must be completed")
         memory = self.store.get_memory(memory_id)
         if memory is None or memory.status not in {
             MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED,
@@ -380,8 +476,10 @@ class MemoryV2Manager:
             raise StateConflictError("at least five distinct paired dev seeds are required")
         if report["treatment_unsafe_attempts"] > report["control_unsafe_attempts"]:
             raise StateConflictError("safety regression blocks memory promotion")
-        if report["success_gain"] <= 0:
-            raise StateConflictError("no measured success gain")
+        if report["success_gain"] < 0:
+            raise StateConflictError("success regression blocks memory promotion")
+        if report["success_gain"] == 0 and report["future_assistance_credits_saved"] <= 0:
+            raise StateConflictError("no measured success gain or assistance saving")
         if report["treatment_successes"] < 3:
             raise StateConflictError("insufficient treatment successes")
         if report["treatment_successes"] / report["paired_dev_seeds"] < 0.75:
@@ -428,6 +526,8 @@ class MemoryV2Manager:
             "mode": runtime.get("perception_mode"), "memory_ids": ids,
             "exposure": runtime.get("memory_exposure"),
             "policy_sha256": runtime.get("policy_sha256"),
+            "config_sha256": runtime.get("validation_config_sha256"),
+            "variation": runtime.get("validation_variation"),
             "credits": self.store.budget_status(attempt["run_id"])["used"],
             "seconds": float(raw["outcome"]["elapsed_seconds"]),
             "gpu_seconds": float(resources["gpu_seconds"]["used"]),

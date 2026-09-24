@@ -49,12 +49,13 @@ class MemoryManager:
             reason="validated_memory_promoted",
         )
 
-    def disable(self, memory_id: str, *, reason: str) -> MemoryRecord:
+    def disable(self, memory_id: str, *, reason: str, actor: str | None = None) -> MemoryRecord:
         return self.store.transition_memory(
             memory_id,
             MemoryStatus.DISABLED,
             event_key=f"memory-disable:{memory_id}",
             reason=reason,
+            actor=actor,
         )
 
     def enable(self, memory_id: str) -> MemoryRecord:
@@ -65,12 +66,13 @@ class MemoryManager:
             reason="human_reenabled",
         )
 
-    def rollback(self, memory_id: str, *, reason: str) -> MemoryRecord:
+    def rollback(self, memory_id: str, *, reason: str, actor: str | None = None) -> MemoryRecord:
         return self.store.transition_memory(
             memory_id,
             MemoryStatus.ROLLED_BACK,
             event_key=f"memory-rollback:{memory_id}",
             reason=reason,
+            actor=actor,
         )
 
     def expire_due(self, *, now: float) -> list[MemoryRecord]:

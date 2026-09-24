@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -298,6 +300,38 @@ class AttentionStore:
         payload = self._get_payload("memories", memory_id)
         return None if payload is None else self._decode_memory(payload)
 
+    def set_memory_expiry(
+        self, memory_id: str, *, expires_at: float, actor: str, reason: str,
+    ) -> MemoryRecord:
+        """Update an active memory's expiry with an auditable operator event."""
+        if not math.isfinite(expires_at):
+            raise ValueError("memory expiry must be finite")
+        if not actor.strip() or not reason.strip():
+            raise ValueError("expiry change requires actor and reason")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT payload FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                raise StateConflictError("unknown memory")
+            current = self._decode_memory(json.loads(row[0]))
+            if current.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED}:
+                raise StateConflictError("expiry can only change on active memory")
+            updated = replace(current, expires_at=expires_at)
+            connection.execute(
+                "UPDATE memories SET payload = ? WHERE id = ?",
+                (_json(updated.artifact()), memory_id),
+            )
+            connection.execute(
+                "INSERT INTO events(event_key, entity_type, entity_id, event_type, payload) "
+                "VALUES (?, 'memory', ?, 'memory.expiry_set', ?)",
+                (
+                    f"memory-expiry:{memory_id}:{uuid.uuid4().hex}", memory_id,
+                    _json({"memory": updated.artifact(), "actor": actor, "reason": reason}),
+                ),
+            )
+        return updated
+
     def transition_memory(
         self,
         memory_id: str,
@@ -308,6 +342,7 @@ class AttentionStore:
         validation_successes: int | None = None,
         validation_failures: int | None = None,
         reason: str | None = None,
+        actor: str | None = None,
     ) -> MemoryRecord:
         with self._transaction() as connection:
             existing_event = connection.execute(
@@ -345,7 +380,7 @@ class AttentionStore:
                 "UPDATE memories SET payload = ? WHERE id = ?",
                 (_json(updated.artifact()), memory_id),
             )
-            payload = {"memory": updated.artifact()}
+            payload = {"memory": updated.artifact(), "actor": actor, "reason": reason}
             connection.execute(
                 "INSERT INTO events(event_key, entity_type, entity_id, event_type, payload) "
                 "VALUES (?, 'memory', ?, ?, ?)",

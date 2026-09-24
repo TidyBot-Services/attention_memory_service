@@ -58,15 +58,36 @@ class UseInput(BaseModel):
     evidence_refs: tuple[str, ...] = ()
 
 
-def create_app(store_path: Path, *, api_key: str) -> FastAPI:
+class OperatorInput(BaseModel):
+    actor: str
+    reason: str
+
+
+class ExpiryInput(OperatorInput):
+    expires_at: float
+
+
+def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None) -> FastAPI:
     if not api_key or len(api_key) < 16:
         raise ValueError("Memory Service requires an API key of at least 16 characters")
+    if operator_key is not None and len(operator_key) < 16:
+        raise ValueError("Memory Service operator key must have at least 16 characters")
+    if operator_key is not None and hmac.compare_digest(operator_key, api_key):
+        raise ValueError("operator key must differ from the service API key")
     service = MemoryService(store_path)
     app = FastAPI(title="TidyBot Attention Memory Service", version="2")
 
     def authorized(x_memory_service_key: str | None = Header(default=None)) -> None:
         if not x_memory_service_key or not hmac.compare_digest(x_memory_service_key, api_key):
             raise HTTPException(status_code=401, detail="invalid Memory Service key")
+
+    def operator_authorized(
+        x_memory_service_key: str | None = Header(default=None),
+        x_memory_operator_key: str | None = Header(default=None),
+    ) -> None:
+        authorized(x_memory_service_key)
+        if operator_key is None or not x_memory_operator_key or not hmac.compare_digest(x_memory_operator_key, operator_key):
+            raise HTTPException(status_code=403, detail="operator authorization required")
 
     def guarded(call, *args, **kwargs):
         try:
@@ -112,8 +133,8 @@ def create_app(store_path: Path, *, api_key: str) -> FastAPI:
     def pair(payload: PairInput):
         def save_safety(value: dict[str, Any]) -> Path:
             encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-            if len(encoded) > 65536:
-                raise ValueError("safety monitor artifact exceeds 64 KiB")
+            if len(encoded) > 8 * 1024 * 1024:
+                raise ValueError("safety monitor artifact exceeds 8 MiB")
             digest = hashlib.sha256(encoded).hexdigest()
             directory = store_path.parent / "memory-safety-evidence"
             directory.mkdir(parents=True, exist_ok=True)
@@ -170,6 +191,18 @@ def create_app(store_path: Path, *, api_key: str) -> FastAPI:
     def promote(memory_id: str):
         return guarded(service.promote, memory_id).artifact()
 
+    @app.post("/memories/{memory_id}/disable", dependencies=[Depends(operator_authorized)])
+    def disable(memory_id: str, payload: OperatorInput):
+        return guarded(service.disable, memory_id, **payload.model_dump()).artifact()
+
+    @app.post("/memories/{memory_id}/rollback", dependencies=[Depends(operator_authorized)])
+    def rollback(memory_id: str, payload: OperatorInput):
+        return guarded(service.rollback, memory_id, **payload.model_dump()).artifact()
+
+    @app.put("/memories/{memory_id}/expiry", dependencies=[Depends(operator_authorized)])
+    def set_expiry(memory_id: str, payload: ExpiryInput):
+        return guarded(service.set_expiry, memory_id, **payload.model_dump()).artifact()
+
     return app
 
 
@@ -179,9 +212,13 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8768)
     parser.add_argument("--api-key-env", default="ATTENTION_MEMORY_API_KEY")
+    parser.add_argument("--operator-key-env", default="ATTENTION_MEMORY_OPERATOR_KEY")
     args = parser.parse_args()
     key = os.environ.get(args.api_key_env, "")
-    app = create_app(args.store_path, api_key=key)
+    app = create_app(
+        args.store_path, api_key=key,
+        operator_key=os.environ.get(args.operator_key_env) or None,
+    )
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port)

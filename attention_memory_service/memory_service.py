@@ -82,6 +82,8 @@ class MemoryService:
         return self.v2.provenance(memory_id)
 
     def retrieve(self, context: dict[str, Any], *, now: float) -> list[MemoryRecord]:
+        for expired in MemoryManager(self.store).expire_due(now=now):
+            self.artifacts.publish(expired.memory_id)
         return self.v2.retrieve(context, now=now)
 
     def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
@@ -121,6 +123,33 @@ class MemoryService:
 
     def promote(self, memory_id: str) -> MemoryRecord:
         memory = self.v2.validate_and_promote(memory_id)
+        self.artifacts.publish(memory_id)
+        return memory
+
+    def disable(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
+        if not actor.strip() or not reason.strip():
+            raise ValueError("human disable requires actor and reason")
+        memory = MemoryManager(self.store).disable(
+            memory_id, reason=reason, actor=actor,
+        )
+        self.artifacts.publish(memory_id)
+        return memory
+
+    def rollback(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
+        if not actor.strip() or not reason.strip():
+            raise ValueError("human rollback requires actor and reason")
+        memory = MemoryManager(self.store).rollback(
+            memory_id, reason=reason, actor=actor,
+        )
+        self.artifacts.publish(memory_id)
+        return memory
+
+    def set_expiry(
+        self, memory_id: str, *, expires_at: float, actor: str, reason: str,
+    ) -> MemoryRecord:
+        memory = self.store.set_memory_expiry(
+            memory_id, expires_at=expires_at, actor=actor, reason=reason,
+        )
         self.artifacts.publish(memory_id)
         return memory
 

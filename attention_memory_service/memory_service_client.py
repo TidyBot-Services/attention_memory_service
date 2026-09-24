@@ -21,13 +21,17 @@ def _memory(value: dict[str, Any]) -> MemoryRecord:
 
 
 class MemoryServiceClient:
-    def __init__(self, base_url: str, *, api_key: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self, base_url: str, *, api_key: str, timeout: float = 30.0,
+        operator_key: str | None = None,
+    ) -> None:
         if not base_url.startswith(("http://127.0.0.1:", "http://localhost:", "https://")):
             raise ValueError("remote Memory Service requires HTTPS")
         if not api_key:
             raise ValueError("Memory Service API key is required")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.operator_key = operator_key
         self.timeout = timeout
 
     def health(self) -> dict[str, Any]:
@@ -95,14 +99,43 @@ class MemoryServiceClient:
     def promote(self, memory_id: str) -> MemoryRecord:
         return _memory(self._call("POST", f"/memories/{quote(memory_id, safe='')}/promote"))
 
-    def _call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    def disable(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
+        return _memory(self._call(
+            "POST", f"/memories/{quote(memory_id, safe='')}/disable",
+            {"actor": actor, "reason": reason}, operator=True,
+        ))
+
+    def rollback(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
+        return _memory(self._call(
+            "POST", f"/memories/{quote(memory_id, safe='')}/rollback",
+            {"actor": actor, "reason": reason}, operator=True,
+        ))
+
+    def set_expiry(
+        self, memory_id: str, *, expires_at: float, actor: str, reason: str,
+    ) -> MemoryRecord:
+        return _memory(self._call(
+            "PUT", f"/memories/{quote(memory_id, safe='')}/expiry",
+            {"expires_at": expires_at, "actor": actor, "reason": reason},
+            operator=True,
+        ))
+
+    def _call(
+        self, method: str, path: str, payload: dict[str, Any] | None = None,
+        *, operator: bool = False,
+    ) -> Any:
+        if operator and not self.operator_key:
+            raise PermissionError("operator key is required")
         data = None if payload is None else json.dumps(payload).encode()
+        headers = {
+            "X-Memory-Service-Key": self.api_key,
+            "Content-Type": "application/json",
+        }
+        if operator:
+            headers["X-Memory-Operator-Key"] = self.operator_key
         request = Request(
             self.base_url + path, data=data, method=method,
-            headers={
-                "X-Memory-Service-Key": self.api_key,
-                "Content-Type": "application/json",
-            },
+            headers=headers,
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
