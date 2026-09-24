@@ -33,6 +33,9 @@ class MemoryServiceClient:
     def health(self) -> dict[str, Any]:
         return self._call("GET", "/health")
 
+    def store_id(self) -> str:
+        return str(self._call("GET", "/store")["store_id"])
+
     def source_for_agent(self, request_id: str) -> dict[str, Any]:
         return self._call("GET", f"/sources/{quote(request_id, safe='')}")
 

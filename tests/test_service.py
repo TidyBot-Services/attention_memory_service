@@ -6,6 +6,7 @@ import json
 import pytest
 
 from attention_memory_service import MemoryService
+from attention_memory_service.identity import store_id
 from attention_memory_service.memory_service_api import create_app
 
 
@@ -52,3 +53,10 @@ def test_standalone_service_starts_with_empty_store_and_auth(tmp_path):
 def test_service_refuses_weak_key(tmp_path):
     with pytest.raises(ValueError, match="at least 16"):
         create_app(tmp_path / "memory.sqlite3", api_key="short")
+
+
+def test_store_identity_is_stable_and_distinguishes_databases(tmp_path):
+    first = tmp_path / "first.sqlite3"
+    second = tmp_path / "second.sqlite3"
+    assert store_id(first) == store_id(first)
+    assert store_id(first) != store_id(second)

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from .core.models import MemoryUseRecord
 from .core.store import StateConflictError
+from .identity import store_id
 from .memory_service import MemoryService
 
 
@@ -82,6 +83,10 @@ def create_app(store_path: Path, *, api_key: str) -> FastAPI:
     @app.get("/health")
     def health():
         return {"status": "ok", "schema_version": "attentionbench.memory-service.v2"}
+
+    @app.get("/store", dependencies=[Depends(authorized)])
+    def identity():
+        return {"store_id": store_id(store_path)}
 
     @app.get("/sources/{request_id}", dependencies=[Depends(authorized)])
     def source(request_id: str):
