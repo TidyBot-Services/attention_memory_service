@@ -17,6 +17,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+from .core.models import MemoryUseRecord
 from .core.store import StateConflictError
 from .memory_service import MemoryService
 
@@ -43,6 +44,17 @@ class PairInput(BaseModel):
     treatment_attempt_id: str
     control_safety: dict[str, Any]
     treatment_safety: dict[str, Any]
+
+
+class UseInput(BaseModel):
+    use_id: str
+    memory_id: str
+    memory_version: int
+    run_id: str
+    attempt_id: str
+    used_at: float
+    outcome: str
+    evidence_refs: tuple[str, ...] = ()
 
 
 def create_app(store_path: Path, *, api_key: str) -> FastAPI:
@@ -84,6 +96,12 @@ def create_app(store_path: Path, *, api_key: str) -> FastAPI:
         return [item.artifact() for item in guarded(
             service.retrieve, payload.context, now=payload.now,
         )]
+
+    @app.post("/uses", dependencies=[Depends(authorized)])
+    def use(payload: UseInput):
+        return guarded(
+            service.record_use, MemoryUseRecord(**payload.model_dump())
+        ).artifact()
 
     @app.post("/pairs", dependencies=[Depends(authorized)])
     def pair(payload: PairInput):

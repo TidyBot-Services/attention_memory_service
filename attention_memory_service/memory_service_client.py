@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from .core.models import MemoryRecord, MemoryStatus
+from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord
 from .core.store import StateConflictError
 
 
@@ -29,6 +29,9 @@ class MemoryServiceClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+
+    def health(self) -> dict[str, Any]:
+        return self._call("GET", "/health")
 
     def source_for_agent(self, request_id: str) -> dict[str, Any]:
         return self._call("GET", f"/sources/{quote(request_id, safe='')}")
@@ -61,6 +64,11 @@ class MemoryServiceClient:
                 "POST", "/retrieve", {"context": context, "now": now},
             )
         ]
+
+    def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
+        payload = self._call("POST", "/uses", use.artifact())
+        payload["evidence_refs"] = tuple(payload.get("evidence_refs", ()))
+        return MemoryUseRecord(**payload)
 
     def record_pair(
         self, *, memory_id: str, control_attempt_id: str,
