@@ -39,6 +39,27 @@ class RetrieveInput(BaseModel):
     now: float
 
 
+class UseGrantInput(RetrieveInput):
+    memory_id: str
+    attempt_id: str
+
+
+class DevUseInput(BaseModel):
+    memory_id: str
+    development_id: str
+    context: dict[str, Any]
+    source_policy_sha256: str
+    now: float
+
+
+class DevResultInput(BaseModel):
+    grant_id: str
+    run_id: str
+    result_policy_sha256: str
+    artifact_uri: str
+    artifact_sha256: str
+
+
 class PairInput(BaseModel):
     memory_id: str
     control_attempt_id: str
@@ -103,7 +124,10 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "schema_version": "attentionbench.memory-service.v2"}
+        return {
+            "status": "ok", "schema_version": "attentionbench.memory-service.v2",
+            "capabilities": ["attempt_bound_use_grants", "development_use_evidence"],
+        }
 
     @app.get("/store", dependencies=[Depends(authorized)])
     def identity():
@@ -122,6 +146,26 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
         return [item.artifact() for item in guarded(
             service.retrieve, payload.context, now=payload.now,
         )]
+
+    @app.post("/use-grants", dependencies=[Depends(authorized)])
+    def use_grant(payload: UseGrantInput):
+        return guarded(
+            service.authorize_use, payload.context,
+            memory_id=payload.memory_id, attempt_id=payload.attempt_id,
+            now=payload.now,
+        )
+
+    @app.post("/dev-use-grants", dependencies=[Depends(authorized)])
+    def dev_use_grant(payload: DevUseInput):
+        return guarded(service.authorize_dev_use, **payload.model_dump())
+
+    @app.get("/dev-use-grants/{grant_id}", dependencies=[Depends(authorized)])
+    def get_dev_use(grant_id: str):
+        return guarded(service.get_dev_use, grant_id)
+
+    @app.post("/dev-use-results", dependencies=[Depends(authorized)])
+    def dev_use_result(payload: DevResultInput):
+        return guarded(service.record_dev_result, **payload.model_dump())
 
     @app.post("/uses", dependencies=[Depends(authorized)])
     def use(payload: UseInput):
@@ -162,6 +206,10 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     @app.get("/memories/{memory_id}/provenance", dependencies=[Depends(authorized)])
     def provenance(memory_id: str):
         return guarded(service.provenance, memory_id)
+
+    @app.get("/memories/{memory_id}/preflight", dependencies=[Depends(authorized)])
+    def preflight(memory_id: str):
+        return guarded(service.check_candidate, memory_id)
 
     @app.get("/memories/{memory_id}/impact", dependencies=[Depends(authorized)])
     def impact(memory_id: str):

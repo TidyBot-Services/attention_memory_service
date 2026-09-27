@@ -134,6 +134,8 @@ class MemoryArtifactStore:
                 "event_key": event["event_key"],
                 "event_type": event["event_type"],
                 "status": event["payload"].get("memory", {}).get("status"),
+                "version": event["payload"].get("memory", {}).get("version"),
+                "expires_at": event["payload"].get("memory", {}).get("expires_at"),
                 "reason": event["payload"].get("reason") or event["payload"].get("memory", {}).get("status_reason"),
                 "actor": event["payload"].get("actor"),
             }

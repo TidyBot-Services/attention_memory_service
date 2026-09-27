@@ -391,13 +391,20 @@ class AttentionStore:
     def list_memories(self) -> list[MemoryRecord]:
         return [self._decode_memory(value) for value in self._list_payloads("memories")]
 
-    def record_memory_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
+    def record_memory_use(
+        self, use: MemoryUseRecord, *, allow_revoked_after_retrieval: bool = False
+    ) -> MemoryUseRecord:
         memory = self.get_memory(use.memory_id)
         if memory is None:
             raise StateConflictError(f"memory {use.memory_id!r} does not exist")
         if memory.version != use.memory_version:
             raise StateConflictError("memory-use version does not match stored memory")
-        if memory.status is not MemoryStatus.TRUSTED:
+        if memory.status is not MemoryStatus.TRUSTED and not (
+            allow_revoked_after_retrieval
+            and memory.status in {
+                MemoryStatus.DISABLED, MemoryStatus.EXPIRED, MemoryStatus.ROLLED_BACK,
+            }
+        ):
             raise StateConflictError("only trusted memory can be used")
         if self.get_attempt(use.attempt_id) is None:
             raise StateConflictError(f"attempt {use.attempt_id!r} does not exist")

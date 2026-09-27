@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from .attention_modes import AssistanceMode, RequestState
 from .core.memory import MemoryManager
-from .core.models import MemoryRecord, MemoryStatus, RequestType
+from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord, RequestType
 from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
 
@@ -27,13 +30,31 @@ def _encoded(value: dict[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _wilson_95(successes: int, trials: int) -> dict[str, Any] | None:
+    """Descriptive uncertainty for a small binomial treatment sample."""
+    if trials == 0:
+        return None
+    z = 1.959963984540054
+    rate = successes / trials
+    denominator = 1 + z * z / trials
+    center = (rate + z * z / (2 * trials)) / denominator
+    margin = z * math.sqrt(rate * (1 - rate) / trials + z * z / (4 * trials * trials)) / denominator
+    return {
+        "method": "wilson_score", "level": 0.95, "n": trials,
+        "lower": max(0.0, center - margin),
+        "upper": min(1.0, center + margin),
+        "interpretation": "binomial reference only; frozen variation cases are not assumed IID",
+    }
+
+
 class MemoryV2Manager:
     """Convert costed advice into artifacts and validate it with paired runs."""
 
-    def __init__(self, store: AttentionStore) -> None:
+    def __init__(self, store: AttentionStore, *, artifact_root: Path | None = None) -> None:
         # Reopen a caller's v1 store through this package's record decoder.
         # The shared SQLite schema is versioned; Python enum identities are not.
         self.store = AttentionStore(Path(store.path))
+        self.artifact_root = (artifact_root or self.store.path.parent).resolve()
         with sqlite3.connect(self.store.path) as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS memory_v2_provenance "
@@ -49,9 +70,71 @@ class MemoryV2Manager:
                 "CREATE TABLE IF NOT EXISTS memory_v2_plans "
                 "(memory_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS memory_v2_use_grants "
+                "(grant_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, "
+                "attempt_id TEXT NOT NULL, payload TEXT NOT NULL, "
+                "UNIQUE(memory_id, attempt_id))"
+            )
+
+    def issue_use_grant(
+        self, *, memory_id: str, version: int, attempt_id: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind a live trusted lookup to one attempt before releasing guidance."""
+        if not attempt_id or not isinstance(attempt_id, str):
+            raise ValueError("use grant requires an attempt ID")
+        # BEGIN IMMEDIATE serializes this final status check with operator
+        # disable/rollback/expiry writes to the same SQLite database.
+        with sqlite3.connect(self.store.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM memories WHERE id=?", (memory_id,)).fetchone()
+            if row is None:
+                raise StateConflictError("unknown memory")
+            memory = json.loads(row[0])
+            issued_at = time.time()
+            if (
+                memory["status"] != MemoryStatus.TRUSTED.value
+                or memory["version"] != version
+                or memory.get("expires_at") is not None
+                and memory["expires_at"] <= issued_at
+            ):
+                raise StateConflictError("memory is no longer trusted or unexpired")
+            existing = db.execute(
+                "SELECT payload FROM memory_v2_use_grants WHERE memory_id=? AND attempt_id=?",
+                (memory_id, attempt_id),
+            ).fetchone()
+            if existing is not None:
+                grant = json.loads(existing[0])
+                if grant["version"] != version or grant["context"] != context:
+                    raise StateConflictError("attempt already has a different memory-use grant")
+                return grant
+            grant = {
+                "schema_version": "attentionbench.memory-use-grant.v1",
+                "grant_id": f"grant:{uuid.uuid4().hex}",
+                "memory_id": memory_id,
+                "version": version,
+                "attempt_id": attempt_id,
+                "context": context,
+                "used_at": issued_at,
+            }
+            db.execute(
+                "INSERT INTO memory_v2_use_grants(grant_id, memory_id, attempt_id, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (grant["grant_id"], memory_id, attempt_id, _encoded(grant)),
+            )
+            return grant
+
+    def get_use_grant(self, grant_id: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.store.path) as db:
+            row = db.execute(
+                "SELECT payload FROM memory_v2_use_grants WHERE grant_id=?", (grant_id,)
+            ).fetchone()
+        return None if row is None else json.loads(row[0])
 
     def record_plan(self, memory_id: str, plan: dict[str, Any]) -> dict[str, Any]:
         provenance = self.provenance(memory_id)
+        self.verify_source_evidence(memory_id)
         memory = self.store.get_memory(memory_id)
         if memory is None or memory.status is not MemoryStatus.CANDIDATE:
             raise StateConflictError("validation plan requires a candidate memory")
@@ -170,12 +253,16 @@ class MemoryV2Manager:
         raw = self.store.get_raw_trace(trace["raw_trace_id"])
         if raw is None or raw["metadata"].get("runtime", {}).get("perception_mode") != applicability["perception_mode"]:
             raise StateConflictError("source trace lacks matching perception provenance")
+        source_policy_sha256 = raw["metadata"]["runtime"].get("policy_sha256")
+        if not isinstance(source_policy_sha256, str) or len(source_policy_sha256) != 64:
+            raise StateConflictError("source trace lacks a policy code digest")
         source_attempt = self.store.get_attempt(request.attempt_id)
         if (
             source_attempt is None
             or source_attempt["run_id"] != request.run_id
             or source_attempt["native_success"] is not False
             or raw["outcome"].get("native_success") is not False
+            or raw["outcome"].get("evaluator_authoritative") is not True
         ):
             raise StateConflictError("memory source must be an evaluator-confirmed failed attempt")
         responder = response["responder"]
@@ -191,6 +278,7 @@ class MemoryV2Manager:
             raise ValueError("proxy latency is not human attention")
         if source_kind != "advisor_proxy" and human_attention_seconds <= 0:
             raise ValueError("human-sourced guidance requires positive attention cost")
+        received_guidance = self._received_guidance(response["content"], source_kind)
         artifact = {
             "schema_version": "attentionbench.memory-artifact.v2",
             "kind": artifact_kind,
@@ -217,13 +305,26 @@ class MemoryV2Manager:
             "source_run_id": request.run_id,
             "source_attempt_id": request.attempt_id,
             "source_trace_id": request.trace_id,
+            "source_raw_trace_id": trace["raw_trace_id"],
+            "raw_evidence_refs": [
+                {
+                    "evidence_id": item["evidence_id"],
+                    "kind": item["kind"],
+                    "uri": item["uri"],
+                    "sha256": item["sha256"],
+                }
+                for item in raw["evidence"]
+            ],
             "source_seed": run["seed"],
             "source_policy_id": run["policy_id"],
+            "source_policy_sha256": source_policy_sha256,
             "source_developer_model": run["developer_model"],
             "source_execution_target": run["execution_target"],
             "request_id": request_id,
             "response_id": request.response_id,
             "responder": response["responder"],
+            "response_content_sha256": _digest(response["content"].encode("utf-8")),
+            "received_guidance": received_guidance,
             "assistance_credits": 1,
             "human_attention_seconds": human_attention_seconds,
             "artifact": artifact,
@@ -251,7 +352,102 @@ class MemoryV2Manager:
             raise StateConflictError("memory artifact differs from core record")
         if _digest(_encoded(value["artifact"]).encode()) != value["artifact_sha256"]:
             raise StateConflictError("memory artifact digest mismatch")
-        return value
+        request = self.store.get_request(value["request_id"])
+        response = self.store.get_response(value["response_id"])
+        if (
+            request is None or request.state is not RequestState.ANSWERED
+            or request.response_id != value["response_id"]
+            or request.run_id != value["source_run_id"]
+            or request.attempt_id != value["source_attempt_id"]
+            or request.trace_id != value["source_trace_id"]
+            or response is None or response["request_id"] != value["request_id"]
+            or response["responder"] != value["responder"]
+        ):
+            raise StateConflictError("memory source request/response lineage is missing")
+        received_guidance = self._received_guidance(response["content"], value["source_kind"])
+        response_hash = _digest(response["content"].encode("utf-8"))
+        if (
+            "response_content_sha256" in value
+            and value["response_content_sha256"] != response_hash
+        ) or (
+            "received_guidance" in value
+            and value["received_guidance"] != received_guidance
+        ):
+            raise StateConflictError("memory source response content changed")
+        trace = self.store.get_trace(value["source_trace_id"])
+        if (
+            trace is None
+            or trace["run_id"] != value["source_run_id"]
+            or trace["attempt_id"] != value["source_attempt_id"]
+            or not trace.get("raw_trace_id")
+        ):
+            raise StateConflictError("memory source trace lineage is missing")
+        raw = self.store.get_raw_trace(trace["raw_trace_id"])
+        if raw is None or raw["run_id"] != trace["run_id"] or raw["attempt_id"] != trace["attempt_id"]:
+            raise StateConflictError("memory source raw trace is missing")
+        source_attempt = self.store.get_attempt(value["source_attempt_id"])
+        source_run = self.store.get_run(value["source_run_id"])
+        if (
+            source_attempt is None or source_run is None
+            or source_attempt["run_id"] != value["source_run_id"]
+            or source_attempt["native_success"] is not False
+            or raw["outcome"].get("native_success") is not False
+            or raw["outcome"].get("evaluator_authoritative") is not True
+            or source_run["policy_id"] != value["source_policy_id"]
+            or source_run["seed"] != value["source_seed"]
+            or source_run["execution_target"] != value["source_execution_target"]
+        ):
+            raise StateConflictError("memory source is no longer an evaluator-confirmed failed attempt")
+        source_policy_sha256 = raw["metadata"].get("runtime", {}).get("policy_sha256")
+        if (
+            not isinstance(source_policy_sha256, str) or len(source_policy_sha256) != 64
+            or "source_policy_sha256" in value
+            and value["source_policy_sha256"] != source_policy_sha256
+        ):
+            raise StateConflictError("memory source policy code digest changed or missing")
+        raw_refs = [
+            {
+                "evidence_id": item["evidence_id"],
+                "kind": item["kind"],
+                "uri": item["uri"],
+                "sha256": item["sha256"],
+            }
+            for item in raw["evidence"]
+        ]
+        if (
+            "source_raw_trace_id" in value
+            and value["source_raw_trace_id"] != trace["raw_trace_id"]
+        ) or ("raw_evidence_refs" in value and value["raw_evidence_refs"] != raw_refs):
+            raise StateConflictError("memory raw evidence links differ from source trace")
+        # Older v2 candidates retain the advisor trace ID but predate explicit
+        # raw links. Derive those links from the immutable source trace without
+        # changing the authoritative provenance row on a read.
+        return {
+            **value,
+            "response_content_sha256": response_hash,
+            "received_guidance": received_guidance,
+            "source_raw_trace_id": trace["raw_trace_id"],
+            "source_policy_sha256": source_policy_sha256,
+            "raw_evidence_refs": raw_refs,
+        }
+
+    @staticmethod
+    def _received_guidance(content: str, source_kind: str) -> str:
+        if not isinstance(content, str) or not content.strip():
+            raise StateConflictError("memory source response has no guidance")
+        if source_kind == "advisor_proxy":
+            try:
+                advice = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise StateConflictError("memory source Advisor response is not JSON") from exc
+            if not isinstance(advice, dict) or not isinstance(advice.get("guidance"), str):
+                raise StateConflictError("memory source Advisor guidance is missing")
+            guidance = advice["guidance"].strip()
+        else:
+            guidance = content.strip()
+        if not guidance:
+            raise StateConflictError("memory source response has no guidance")
+        return guidance
 
     def retrieve(self, context: dict[str, Any], *, now: float) -> list[MemoryRecord]:
         if context.get("perception_mode") not in {"sim_gt", "vision"}:
@@ -267,10 +463,69 @@ class MemoryV2Manager:
             axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
             if not all(isinstance(context.get(axis), str) and context[axis] for axis in axes):
                 continue
+            if (
+                not isinstance(context.get("camera_names"), list)
+                or not context["camera_names"]
+                or any(not isinstance(name, str) or not name for name in context["camera_names"])
+                or not isinstance(context.get("task_prompt"), str)
+                or not context["task_prompt"].strip()
+            ):
+                continue
+            variation = {axis: context[axis] for axis in axes}
+            plan = self.get_plan(item.memory_id)
+            if plan is None or not any(
+                all(case[axis] == variation[axis] for axis in axes)
+                and case["camera_names"] == context["camera_names"]
+                and case["task_prompt"] == context["task_prompt"]
+                for case in plan["cases"]
+            ):
+                continue
             scope = self.impact_report(item.memory_id)["validated_scope"]
-            if {axis: context[axis] for axis in axes} in scope:
+            if variation in scope:
+                self.verify_source_evidence(item.memory_id)
                 result.append(item)
         return result
+
+    def verify_use(self, use: MemoryUseRecord) -> None:
+        """Require the recorded outcome to agree with the raw policy trace."""
+        trial = self._trial(use.attempt_id, allow_terminal_failure=True)
+        if trial["run_id"] != use.run_id:
+            raise StateConflictError("memory use run does not match its attempt")
+        if trial["exposure"] != "trusted" or use.memory_id not in trial["memory_ids"]:
+            raise StateConflictError("memory use lacks an explicit trusted retrieval event")
+        if trial["memory_ids"].count(use.memory_id) != 1 or trial["retrieval_versions"][
+            trial["memory_ids"].index(use.memory_id)
+        ] != use.memory_version:
+            raise StateConflictError("memory use version disagrees with retrieval trace")
+        if trial["retrieval_timestamps"][trial["memory_ids"].index(use.memory_id)] != use.used_at:
+            raise StateConflictError("memory use time disagrees with retrieval trace")
+        grants = trial.get("retrieval_grants", [])
+        grant_id = grants[trial["memory_ids"].index(use.memory_id)] if len(grants) == len(trial["memory_ids"]) else None
+        grant = self.get_use_grant(grant_id) if isinstance(grant_id, str) else None
+        if (
+            grant is None or grant["memory_id"] != use.memory_id
+            or grant["version"] != use.memory_version
+            or grant["attempt_id"] != use.attempt_id
+            or grant["used_at"] != use.used_at
+        ):
+            raise StateConflictError("memory use lacks a matching Service-issued grant")
+        context = grant.get("context")
+        if (
+            not isinstance(context, dict)
+            or context != trial["memory_context"]
+            or context.get("suite") != trial["run"]["suite"]
+            or context.get("task_id") != trial["run"]["task_id"]
+            or context.get("perception_mode") != trial["mode"]
+        ):
+            raise StateConflictError("memory use grant context disagrees with attempt")
+        expected = (
+            "timeout" if trial["attempt_status"] == "timed_out"
+            else "cancelled" if trial["attempt_status"] == "cancelled"
+            else "evaluator_unavailable" if not trial["evaluator_authoritative"]
+            else "native_success" if trial["success"] else "failed"
+        )
+        if use.outcome != expected:
+            raise StateConflictError("memory use outcome disagrees with native evaluator")
 
     def record_pair(
         self,
@@ -287,6 +542,7 @@ class MemoryV2Manager:
         ``unsafe_attempts`` field. They are hashed here and rechecked at gate.
         """
         provenance = self.provenance(memory_id)
+        self.verify_source_evidence(memory_id)
         control = self._trial(control_attempt_id)
         treatment = self._trial(treatment_attempt_id)
         for field in ("suite", "task_id", "seed", "policy_id", "execution_target", "developer_model"):
@@ -361,11 +617,17 @@ class MemoryV2Manager:
         control_success = treatment_success = control_credits = treatment_credits = 0
         control_seconds = treatment_seconds = control_unsafe = treatment_unsafe = 0.0
         control_gpu = treatment_gpu = control_tokens = treatment_tokens = 0.0
+        both_success_credits_saved = failed_pair_credits_saved = 0
         supporting_successes = []
         counterexamples = []
+        safety_regressions = []
+        validation_policy_hashes: set[str] = set()
         for pair in pairs:
             control = self._trial(pair["control_attempt_id"])
             treatment = self._trial(pair["treatment_attempt_id"])
+            if not control["policy_sha256"] or control["policy_sha256"] != treatment["policy_sha256"]:
+                raise StateConflictError("paired policy code differs")
+            validation_policy_hashes.add(control["policy_sha256"])
             if control["run"]["seed"] != pair["seed"] or treatment["run"]["seed"] != pair["seed"]:
                 raise StateConflictError("validation seed changed")
             if control["memory_ids"] or control["exposure"] != "none" or treatment["memory_ids"] != [memory_id] or treatment["exposure"] != "candidate_validation":
@@ -374,6 +636,10 @@ class MemoryV2Manager:
             treatment_success += int(treatment["success"])
             control_credits += control["credits"]
             treatment_credits += treatment["credits"]
+            if control["success"] and treatment["success"]:
+                both_success_credits_saved += control["credits"] - treatment["credits"]
+            elif not control["success"] and not treatment["success"]:
+                failed_pair_credits_saved += control["credits"] - treatment["credits"]
             control_seconds += control["seconds"]
             treatment_seconds += treatment["seconds"]
             control_gpu += control["gpu_seconds"]
@@ -390,6 +656,12 @@ class MemoryV2Manager:
                 "control_attempt_id": pair["control_attempt_id"],
                 "treatment_attempt_id": pair["treatment_attempt_id"],
             }
+            if treatment_pair_unsafe > control_pair_unsafe:
+                safety_regressions.append({
+                    **evidence,
+                    "control_unsafe_attempts": control_pair_unsafe,
+                    "treatment_unsafe_attempts": treatment_pair_unsafe,
+                })
             if treatment["success"] and (
                 not control["success"] or treatment["credits"] < control["credits"]
             ):
@@ -430,17 +702,27 @@ class MemoryV2Manager:
         return {
             "memory_id": memory_id,
             "source_kind": provenance["source_kind"],
+            "source_policy_sha256": provenance["source_policy_sha256"],
+            "validation_policy_hashes": sorted(validation_policy_hashes),
+            "policy_changed_since_source": (
+                next(iter(validation_policy_hashes)) != provenance["source_policy_sha256"]
+                if len(validation_policy_hashes) == 1 else None
+            ),
             "source_human_attention_seconds": provenance["human_attention_seconds"],
             "paired_dev_seeds": n,
             "control_successes": control_success,
             "treatment_successes": treatment_success,
             "empirical_confidence": treatment_success / n if n else None,
+            "treatment_success_rate_95ci": _wilson_95(treatment_success, n),
             "supporting_successes": supporting_successes,
             "counterexamples": counterexamples,
+            "safety_regressions": safety_regressions,
             "validated_scope": validated_scope,
             "success_gain": treatment_success - control_success,
             "success_rate_gain": (treatment_success - control_success) / n if n else None,
             "future_assistance_credits_saved": control_credits - treatment_credits,
+            "both_success_assistance_credits_saved": both_success_credits_saved,
+            "both_failed_assistance_credits_saved": failed_pair_credits_saved,
             "robot_seconds_saved": control_seconds - treatment_seconds,
             "gpu_seconds_saved": control_gpu - treatment_gpu,
             "tokens_saved": int(control_tokens - treatment_tokens),
@@ -464,6 +746,7 @@ class MemoryV2Manager:
 
     def validate_and_promote(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
         report = self.impact_report(memory_id)
+        self.verify_source_evidence(memory_id)
         plan = self.get_plan(memory_id)
         if plan is None or {pair["seed"] for pair in self.list_pairs(memory_id)} != set(plan["seeds"]):
             raise StateConflictError("all predefined variation cases must be completed")
@@ -474,16 +757,20 @@ class MemoryV2Manager:
             raise StateConflictError("memory is not eligible for v2 validation")
         if report["paired_dev_seeds"] < minimum_pairs or minimum_pairs < 5:
             raise StateConflictError("at least five distinct paired dev seeds are required")
-        if report["treatment_unsafe_attempts"] > report["control_unsafe_attempts"]:
-            raise StateConflictError("safety regression blocks memory promotion")
+        if len(report["validation_policy_hashes"]) != 1:
+            raise StateConflictError("validation cases used different policy code versions")
+        if report["safety_regressions"] or report["treatment_unsafe_attempts"] > report["control_unsafe_attempts"]:
+            raise StateConflictError("paired safety regression blocks memory promotion")
         if report["success_gain"] < 0:
             raise StateConflictError("success regression blocks memory promotion")
-        if report["success_gain"] == 0 and report["future_assistance_credits_saved"] <= 0:
-            raise StateConflictError("no measured success gain or assistance saving")
+        if report["success_gain"] == 0 and report["both_success_assistance_credits_saved"] <= 0:
+            raise StateConflictError("no measured success gain or successful-pair assistance saving")
         if report["treatment_successes"] < 3:
             raise StateConflictError("insufficient treatment successes")
         if report["treatment_successes"] / report["paired_dev_seeds"] < 0.75:
             raise StateConflictError("treatment success fraction is below 0.75")
+        if not report["validated_scope"]:
+            raise StateConflictError("no validated retrieval scope remains after counterexamples")
         if memory.status is MemoryStatus.TRUSTED:
             return memory
         manager = MemoryManager(self.store)
@@ -498,33 +785,67 @@ class MemoryV2Manager:
             raise StateConflictError("core validation confidence gate failed")
         return manager.promote(memory_id)
 
-    def _trial(self, attempt_id: str) -> dict[str, Any]:
+    def verify_source_evidence(self, memory_id: str) -> None:
+        """Fail closed if the candidate's original artifact bytes are gone."""
+        refs = self.provenance(memory_id)["raw_evidence_refs"]
+        if not refs:
+            raise StateConflictError("memory has no raw source evidence")
+        for ref in refs:
+            uri = ref["uri"]
+            if not isinstance(uri, str) or not uri.startswith("artifact://"):
+                raise StateConflictError("unsupported raw evidence URI")
+            relative = Path(uri.removeprefix("artifact://"))
+            path = (self.artifact_root / relative).resolve()
+            if not path.is_relative_to(self.artifact_root) or not path.is_file():
+                raise StateConflictError("raw source evidence is missing or outside artifact root")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != ref["sha256"]:
+                raise StateConflictError("raw source evidence digest changed")
+
+    def _trial(self, attempt_id: str, *, allow_terminal_failure: bool = False) -> dict[str, Any]:
         attempt = self.store.get_attempt(attempt_id)
-        if attempt is None or attempt["status"] not in {"succeeded", "failed"} or attempt["native_success"] is None:
+        allowed = {"succeeded", "failed"}
+        if allow_terminal_failure:
+            allowed.update({"timed_out", "cancelled"})
+        if attempt is None or attempt["status"] not in allowed or attempt["native_success"] is None:
             raise StateConflictError("trial attempt lacks completed native outcome")
         run = self.store.get_run(attempt["run_id"])
         if run is None:
             raise StateConflictError("trial run missing")
         raw = next((item for item in self.store._list_payloads("raw_traces") if item["attempt_id"] == attempt_id), None)
-        if raw is None or not raw["outcome"].get("evaluator_authoritative") or raw["outcome"].get("native_success") != attempt["native_success"]:
+        if raw is None or raw["outcome"].get("native_success") != attempt["native_success"]:
             raise StateConflictError("trial lacks agreeing native trace outcome")
+        if raw["outcome"].get("evaluator_authoritative") is not True:
+            # Deadline, cancellation and evaluator failures remain memory-use
+            # outcomes, but without a verdict they cannot validate a memory.
+            if not allow_terminal_failure or attempt["status"] not in {"failed", "timed_out", "cancelled"}:
+                raise StateConflictError("trial lacks an authoritative native evaluator verdict")
         runtime = raw["metadata"].get("runtime", {})
         ids = runtime.get("memory_ids", [])
         if not isinstance(ids, list):
             raise StateConflictError("invalid memory exposure trace")
         retrieval_events = [
-            event["arguments"].get("memory_id")
+            event
             for event in raw["events"]
             if event["event_type"] == "attention.memory_retrieval"
             and event["status"] == "completed"
         ]
-        if ids != retrieval_events:
+        if ids != [event["arguments"].get("memory_id") for event in retrieval_events]:
             raise StateConflictError("memory exposure list disagrees with retrieval events")
         resources = self.store.resource_status(attempt["run_id"])
         return {
             "run_id": attempt["run_id"], "run": run, "success": attempt["native_success"],
+            "attempt_status": attempt["status"],
+            "evaluator_authoritative": raw["outcome"].get("evaluator_authoritative") is True,
             "mode": runtime.get("perception_mode"), "memory_ids": ids,
+            "retrieval_versions": [event["result"].get("memory_version") for event in retrieval_events],
+            "retrieval_timestamps": [event["timestamp"] for event in retrieval_events],
+            "retrieval_grants": [event["result"].get("grant_id") for event in retrieval_events],
             "exposure": runtime.get("memory_exposure"),
+            "memory_context": runtime.get("memory_context"),
             "policy_sha256": runtime.get("policy_sha256"),
             "config_sha256": runtime.get("validation_config_sha256"),
             "variation": runtime.get("validation_variation"),
@@ -540,10 +861,24 @@ class MemoryV2Manager:
         data = path.read_bytes()
         value = json.loads(data)
         count = value.get("unsafe_attempts")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError("safety monitor artifact requires nonnegative unsafe_attempts")
         if value.get("source") != "independent_safety_monitor":
             raise ValueError("safety evidence must come from independent monitor")
+        if value.get("schema_version") != "attentionbench.safety-monitor.v1":
+            raise ValueError("unsupported safety monitor artifact schema")
+        events = value.get("events")
+        violations = value.get("violations")
+        if (
+            not isinstance(events, list) or not isinstance(violations, list)
+            or any(not isinstance(item, dict) or not isinstance(item.get("kind"), str)
+                   for item in (*events, *violations))
+            or not events and not violations
+        ):
+            raise ValueError("safety monitor artifact lacks event evidence")
+        if (
+            isinstance(count, bool) or not isinstance(count, int)
+            or count != int(bool(violations))
+        ):
+            raise ValueError("safety count disagrees with monitor violations")
         if not isinstance(value.get("attempt_id"), str) or not value["attempt_id"]:
             raise ValueError("safety evidence must bind to an attempt")
         if value["attempt_id"] != expected_attempt_id:

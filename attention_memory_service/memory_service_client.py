@@ -52,6 +52,9 @@ class MemoryServiceClient:
     def provenance(self, memory_id: str) -> dict[str, Any]:
         return self._call("GET", f"/memories/{quote(memory_id, safe='')}/provenance")
 
+    def check_candidate(self, memory_id: str) -> dict[str, Any]:
+        return self._call("GET", f"/memories/{quote(memory_id, safe='')}/preflight")
+
     def record_plan(self, memory_id: str, plan: dict[str, Any]) -> dict[str, Any]:
         return self._call("PUT", f"/memories/{quote(memory_id, safe='')}/plan", plan)
 
@@ -71,6 +74,40 @@ class MemoryServiceClient:
                 "POST", "/retrieve", {"context": context, "now": now},
             )
         ]
+
+    def authorize_use(
+        self, context: dict[str, Any], *, memory_id: str,
+        attempt_id: str, now: float,
+    ) -> dict[str, Any]:
+        return self._call("POST", "/use-grants", {
+            "context": context, "memory_id": memory_id,
+            "attempt_id": attempt_id, "now": now,
+        })
+
+    def authorize_dev_use(
+        self, *, memory_id: str, development_id: str, context: dict[str, Any],
+        source_policy_sha256: str, now: float,
+    ) -> dict[str, Any]:
+        return self._call("POST", "/dev-use-grants", {
+            "memory_id": memory_id, "development_id": development_id,
+            "context": context, "source_policy_sha256": source_policy_sha256,
+            "now": now,
+        })
+
+    def get_dev_use(self, grant_id: str) -> dict[str, Any]:
+        return self._call("GET", f"/dev-use-grants/{quote(grant_id, safe='')}")
+
+    def record_dev_result(
+        self, *, grant_id: str, run_id: str, result_policy_sha256: str,
+        artifact_uri: str, artifact_sha256: str,
+    ) -> dict[str, Any]:
+        return self._call("POST", "/dev-use-results", {
+            "grant_id": grant_id, "run_id": run_id,
+            "result_policy_sha256": result_policy_sha256,
+            "artifact_uri": artifact_uri,
+            "artifact_sha256": artifact_sha256,
+        })
+
 
     def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
         payload = self._call("POST", "/uses", use.artifact())

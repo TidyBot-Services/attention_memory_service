@@ -7,6 +7,8 @@ also used by the local HTTP facade; it does not require a daemon for tests.
 
 from __future__ import annotations
 
+import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ from .attention_modes import RequestState
 from .core.memory import MemoryManager
 from .core.models import MemoryRecord, MemoryUseRecord, RequestType
 from .core.store import AttentionStore, StateConflictError
+from .dev_use import DevMemoryUse
 from .memory_artifacts import MemoryArtifactStore
 from .memory_v2 import MemoryV2Manager
 
@@ -25,10 +28,11 @@ class MemoryService:
         # classes from two separately imported packages.
         path = store if isinstance(store, Path) else Path(store.path)
         self.store = AttentionStore(path)
-        self.v2 = MemoryV2Manager(self.store)
+        self.v2 = MemoryV2Manager(self.store, artifact_root=artifact_root)
         self.artifacts = MemoryArtifactStore(
             self.store, artifact_root or self.store.path.parent,
         )
+        self.dev_use = DevMemoryUse(self)
 
     def source_for_agent(self, request_id: str) -> dict[str, Any]:
         """Return an answered hint and bounded public context, never raw evaluator debug."""
@@ -81,14 +85,80 @@ class MemoryService:
     def provenance(self, memory_id: str) -> dict[str, Any]:
         return self.v2.provenance(memory_id)
 
+    def check_candidate(self, memory_id: str) -> dict[str, Any]:
+        """Read-only evidence check before freezing or executing validation."""
+        memory = self.get_memory(memory_id)
+        if memory.status.value != "candidate":
+            raise StateConflictError("preflight requires a candidate memory")
+        self.v2.verify_source_evidence(memory_id)
+        provenance = self.v2.provenance(memory_id)
+        return {
+            "memory_id": memory_id,
+            "status": memory.status.value,
+            "suite": memory.applicability["suite"],
+            "task_id": memory.applicability["task_id"],
+            "perception_mode": memory.applicability["perception_mode"],
+            "source_policy_id": provenance["source_policy_id"],
+            "source_policy_sha256": provenance["source_policy_sha256"],
+            "source_evidence_verified": True,
+        }
+
     def retrieve(self, context: dict[str, Any], *, now: float) -> list[MemoryRecord]:
-        for expired in MemoryManager(self.store).expire_due(now=now):
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+            raise ValueError("retrieval time must be finite")
+        # Callers may replay an older experiment, but live retrieval must not
+        # resurrect a memory whose operator-set expiry has already passed.
+        effective_now = max(float(now), time.time())
+        for expired in MemoryManager(self.store).expire_due(now=effective_now):
             self.artifacts.publish(expired.memory_id)
-        return self.v2.retrieve(context, now=now)
+        return self.v2.retrieve(context, now=effective_now)
+
+    def authorize_use(
+        self, context: dict[str, Any], *, memory_id: str,
+        attempt_id: str, now: float,
+    ) -> dict[str, Any]:
+        memory = next(
+            (item for item in self.retrieve(context, now=now) if item.memory_id == memory_id),
+            None,
+        )
+        if memory is None:
+            raise StateConflictError("memory is no longer trusted or applicable")
+        return self.v2.issue_use_grant(
+            memory_id=memory_id, version=memory.version,
+            attempt_id=attempt_id, context=context,
+        )
+
+    def authorize_dev_use(
+        self, *, memory_id: str, development_id: str, context: dict[str, Any],
+        source_policy_sha256: str, now: float,
+    ) -> dict[str, Any]:
+        """Issue a separately tracked, scope-checked Dev guidance exposure."""
+        return self.dev_use.authorize(
+            memory_id=memory_id, development_id=development_id,
+            context=context, source_policy_sha256=source_policy_sha256,
+            now=now,
+        )
+
+    def get_dev_use(self, grant_id: str) -> dict[str, Any]:
+        return self.dev_use.get(grant_id)
+
+    def record_dev_result(
+        self, *, grant_id: str, run_id: str, result_policy_sha256: str,
+        artifact_uri: str, artifact_sha256: str,
+    ) -> dict[str, Any]:
+        return self.dev_use.record_result(
+            grant_id=grant_id, run_id=run_id,
+            result_policy_sha256=result_policy_sha256,
+            artifact_uri=artifact_uri, artifact_sha256=artifact_sha256,
+        )
 
     def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
         self.v2.provenance(use.memory_id)
-        result = MemoryManager(self.store).record_use(use)
+        self.v2.verify_use(use)
+        # A memory may be revoked after the policy already retrieved it. The
+        # verified raw retrieval event proves this is a historical use, not a
+        # new exposure of disabled guidance.
+        result = self.store.record_memory_use(use, allow_revoked_after_retrieval=True)
         self.artifacts.publish(use.memory_id)
         return result
 
