@@ -11,11 +11,12 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, StrictInt
 
 from .core.models import MemoryUseRecord
 from .core.store import StateConflictError
@@ -45,6 +46,7 @@ class UseGrantInput(RetrieveInput):
 
 
 class DevUseInput(BaseModel):
+    memory_version: StrictInt | None = None
     memory_id: str
     development_id: str
     context: dict[str, Any]
@@ -88,14 +90,57 @@ class ExpiryInput(OperatorInput):
     expires_at: float
 
 
-def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None) -> FastAPI:
+class ImportInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    import_id: str
+    catalog_id: str
+    descriptor: str
+
+
+class ImportedCandidateInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    source_import_id: str
+    created_at: float
+
+
+class ImportedPairInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    control_import_id: str
+    treatment_import_id: str
+
+
+class ImportedResultInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    grant_id: str
+    execution_import_id: str
+
+
+class ValidationGrantInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    cell: str
+    version: StrictInt
+    seed: StrictInt
+    context: dict[str, Any]
+    policy_sha256: str
+    config_sha256: str
+    exposure: str
+
+
+def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None,
+               importer_key: str | None = None,
+               dev_v2_catalogs: dict[str, Any] | None = None) -> FastAPI:
     if not api_key or len(api_key) < 16:
         raise ValueError("Memory Service requires an API key of at least 16 characters")
     if operator_key is not None and len(operator_key) < 16:
         raise ValueError("Memory Service operator key must have at least 16 characters")
     if operator_key is not None and hmac.compare_digest(operator_key, api_key):
         raise ValueError("operator key must differ from the service API key")
-    service = MemoryService(store_path)
+    if importer_key is not None and (len(importer_key) < 16 or importer_key in {api_key, operator_key}):
+        raise ValueError('importer key must be distinct and have at least 16 characters')
+    service = MemoryService(store_path, dev_v2_catalogs=dev_v2_catalogs)
     app = FastAPI(title="TidyBot Attention Memory Service", version="2")
 
     def authorized(x_memory_service_key: str | None = Header(default=None)) -> None:
@@ -110,6 +155,55 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
         if operator_key is None or not x_memory_operator_key or not hmac.compare_digest(x_memory_operator_key, operator_key):
             raise HTTPException(status_code=403, detail="operator authorization required")
 
+    def importer_authorized(x_memory_service_key: str | None = Header(default=None),
+                            x_memory_importer_key: str | None = Header(default=None)):
+        authorized(x_memory_service_key)
+        if importer_key is None or not x_memory_importer_key or not hmac.compare_digest(importer_key, x_memory_importer_key):
+            raise HTTPException(status_code=403, detail='offline importer authorization required')
+
+    def private_memory_authorized(request: Request,
+                                  x_memory_service_key: str | None = Header(default=None),
+                                  x_memory_importer_key: str | None = Header(default=None)):
+        provenance = service.v2._provenance(request.path_params['memory_id'])
+        if provenance and provenance.get('channel') == 'dev_v2':
+            importer_authorized(x_memory_service_key, x_memory_importer_key)
+
+    def online_memory(memory):
+        value = memory.artifact()
+        provenance = service.v2._provenance(memory.memory_id)
+        if provenance and provenance.get('channel') == 'dev_v2':
+            for key in ('confidence', 'validation_successes', 'validation_failures', 'status_reason'):
+                value.pop(key, None)
+        return value
+
+    @app.post('/dev-v2/executions', dependencies=[Depends(importer_authorized)])
+    def import_execution(payload: ImportInput):
+        return guarded(service.import_dev_v2_execution, **payload.model_dump())
+
+    @app.post('/dev-v2/sources', dependencies=[Depends(importer_authorized)])
+    def import_source(payload: ImportInput):
+        return guarded(service.import_dev_v2_source, **payload.model_dump())
+
+    @app.post('/dev-v2/trials', dependencies=[Depends(importer_authorized)])
+    def import_trial(payload: ImportInput):
+        return guarded(service.import_dev_v2_trial, **payload.model_dump())
+
+    @app.post('/dev-v2/validation-grants', dependencies=[Depends(importer_authorized)])
+    def validation_grant(payload: ValidationGrantInput):
+        return guarded(service.authorize_dev_v2_validation, **payload.model_dump())
+
+    @app.post('/dev-v2/candidates', dependencies=[Depends(importer_authorized)])
+    def imported_candidate(payload: ImportedCandidateInput):
+        return guarded(service.create_dev_v2_candidate, **payload.model_dump()).artifact()
+
+    @app.post('/dev-v2/pairs', dependencies=[Depends(importer_authorized)])
+    def imported_pair(payload: ImportedPairInput):
+        return guarded(service.record_dev_v2_pair, **payload.model_dump())
+
+    @app.post('/dev-v2/results', dependencies=[Depends(importer_authorized)])
+    def imported_result(payload: ImportedResultInput):
+        return guarded(service.record_dev_v2_result, **payload.model_dump())
+
     def guarded(call, *args, **kwargs):
         try:
             return call(*args, **kwargs)
@@ -119,14 +213,14 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, KeyError, sqlite3.DatabaseError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/health")
     def health():
         return {
             "status": "ok", "schema_version": "attentionbench.memory-service.v2",
-            "capabilities": ["attempt_bound_use_grants", "development_use_evidence"],
+            "capabilities": ["attempt_bound_use_grants", "development_use_evidence", 'sealed_dev_v2_imports'],
         }
 
     @app.get("/store", dependencies=[Depends(authorized)])
@@ -143,7 +237,7 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
 
     @app.post("/retrieve", dependencies=[Depends(authorized)])
     def retrieve(payload: RetrieveInput):
-        return [item.artifact() for item in guarded(
+        return [online_memory(item) for item in guarded(
             service.retrieve, payload.context, now=payload.now,
         )]
 
@@ -175,6 +269,8 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
 
     @app.post("/pairs", dependencies=[Depends(authorized)])
     def pair(payload: PairInput):
+        if (service.v2._provenance(payload.memory_id) or {}).get('channel') == 'dev_v2':
+            raise HTTPException(status_code=403, detail='Dev v2 pairs require offline imported trial evidence')
         def save_safety(value: dict[str, Any]) -> Path:
             encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
             if len(encoded) > 8 * 1024 * 1024:
@@ -199,43 +295,43 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
             treatment_safety=guarded(save_safety, payload.treatment_safety),
         )
 
-    @app.get("/memories/{memory_id}", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def memory(memory_id: str):
-        return guarded(service.get_memory, memory_id).artifact()
+        return online_memory(guarded(service.get_memory, memory_id))
 
-    @app.get("/memories/{memory_id}/provenance", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}/provenance", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def provenance(memory_id: str):
         return guarded(service.provenance, memory_id)
 
-    @app.get("/memories/{memory_id}/preflight", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}/preflight", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def preflight(memory_id: str):
         return guarded(service.check_candidate, memory_id)
 
-    @app.get("/memories/{memory_id}/impact", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}/impact", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def impact(memory_id: str):
         return guarded(service.impact_report, memory_id)
 
-    @app.get("/memories/{memory_id}/pairs", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}/pairs", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def pairs(memory_id: str):
         return guarded(service.list_pairs, memory_id)
 
-    @app.put("/memories/{memory_id}/plan", dependencies=[Depends(authorized)])
+    @app.put("/memories/{memory_id}/plan", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def plan(memory_id: str, payload: dict[str, Any]):
         return guarded(service.record_plan, memory_id, payload)
 
-    @app.get("/memories/{memory_id}/plan", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}/plan", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def get_plan(memory_id: str):
         return guarded(service.get_plan, memory_id)
 
-    @app.post("/memories/{memory_id}/export", dependencies=[Depends(authorized)])
+    @app.post("/memories/{memory_id}/export", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def export(memory_id: str):
         return {"directory": str(guarded(service.export_package, memory_id))}
 
-    @app.get("/memories/{memory_id}/artifact", dependencies=[Depends(authorized)])
+    @app.get("/memories/{memory_id}/artifact", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def artifact(memory_id: str):
         return guarded(service.verify_package, memory_id)
 
-    @app.post("/memories/{memory_id}/promote", dependencies=[Depends(authorized)])
+    @app.post("/memories/{memory_id}/promote", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
     def promote(memory_id: str):
         return guarded(service.promote, memory_id).artifact()
 
@@ -261,11 +357,15 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8768)
     parser.add_argument("--api-key-env", default="ATTENTION_MEMORY_API_KEY")
     parser.add_argument("--operator-key-env", default="ATTENTION_MEMORY_OPERATOR_KEY")
+    parser.add_argument('--importer-key-env', default='ATTENTION_MEMORY_IMPORTER_KEY')
+    parser.add_argument('--dev-v2-catalogs', type=Path)
     args = parser.parse_args()
     key = os.environ.get(args.api_key_env, "")
     app = create_app(
         args.store_path, api_key=key,
         operator_key=os.environ.get(args.operator_key_env) or None,
+        importer_key=os.environ.get(args.importer_key_env) or None,
+        dev_v2_catalogs=json.loads(args.dev_v2_catalogs.read_text()) if args.dev_v2_catalogs else None,
     )
     import uvicorn
 

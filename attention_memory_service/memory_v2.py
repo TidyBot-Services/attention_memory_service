@@ -139,6 +139,10 @@ class MemoryV2Manager:
         if memory is None or memory.status is not MemoryStatus.CANDIDATE:
             raise StateConflictError("validation plan requires a candidate memory")
         applicability = provenance["artifact"]["applicability"]
+        if provenance.get('channel') == 'dev_v2':
+            from .dev_v2 import SCOPE, AXES
+            if any(plan.get(k) != applicability[k] for k in SCOPE if k not in AXES):
+                raise StateConflictError('validation plan needs exact SDK/namespace/robot scope')
         if plan.get("schema_version") != "attentionbench.memory-validation-plan.v2":
             raise ValueError("unsupported memory validation plan")
         if plan.get("memory_id") != memory_id:
@@ -222,6 +226,8 @@ class MemoryV2Manager:
         artifact_kind: str = "text_hint",
         human_attention_seconds: float = 0.0,
     ) -> MemoryRecord:
+        if 'sdk_sha256' in applicability or 'namespace' in applicability:
+            raise StateConflictError('exact Dev v2 scope requires trusted source importer')
         if artifact_kind not in {"text_hint", "policy_patch", "skill"}:
             raise ValueError("unsupported structured memory artifact kind")
         if not guidance.strip() or not repair.strip():
@@ -352,6 +358,16 @@ class MemoryV2Manager:
             raise StateConflictError("memory artifact differs from core record")
         if _digest(_encoded(value["artifact"]).encode()) != value["artifact_sha256"]:
             raise StateConflictError("memory artifact digest mismatch")
+        if value.get("channel") == "dev_v2":
+            from .dev_v2 import DevV2Evidence, SCOPE
+            source = DevV2Evidence(self.store).source(value["source_import_id"])
+            if (memory.applicability != value["artifact"]["applicability"]
+                    or any(memory.applicability.get(k) != source["context"][k] for k in SCOPE)
+                    or memory.guidance != source["guidance"]
+                    or memory.candidate_repair != source["repair"]
+                    or value["source_policy_sha256"] != source["source_policy_sha256"]):
+                raise StateConflictError("Dev v2 source/Memory binding changed")
+            return value
         request = self.store.get_request(value["request_id"])
         response = self.store.get_response(value["response_id"])
         if (
@@ -457,7 +473,11 @@ class MemoryV2Manager:
         for item in matches:
             if self._provenance(item.memory_id) is None:
                 continue
-            self.provenance(item.memory_id)
+            provenance = self.provenance(item.memory_id)
+            if 'sdk_sha256' in context or 'namespace' in context:
+                from .dev_v2 import SCOPE
+                if provenance.get('channel') != 'dev_v2' or any(item.applicability.get(k) != context.get(k) for k in SCOPE):
+                    continue
             if not all(item.applicability.get(key) == context.get(key) for key in ("perception_mode", "suite", "task_id")):
                 continue
             axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
@@ -545,6 +565,12 @@ class MemoryV2Manager:
         self.verify_source_evidence(memory_id)
         control = self._trial(control_attempt_id)
         treatment = self._trial(treatment_attempt_id)
+        if provenance.get("channel") == "dev_v2":
+            from .dev_v2 import SCOPE, AXES
+            for trial in (control, treatment):
+                if any(trial.get("context", {}).get(k) != provenance["artifact"]["applicability"][k]
+                       for k in SCOPE if k not in AXES):
+                    raise StateConflictError("Dev v2 validation exact SDK/namespace/robot scope mismatch")
         for field in ("suite", "task_id", "seed", "policy_id", "execution_target", "developer_model"):
             if control["run"][field] != treatment["run"][field]:
                 raise StateConflictError(f"paired runs differ on {field}")
@@ -787,7 +813,11 @@ class MemoryV2Manager:
 
     def verify_source_evidence(self, memory_id: str) -> None:
         """Fail closed if the candidate's original artifact bytes are gone."""
-        refs = self.provenance(memory_id)["raw_evidence_refs"]
+        provenance = self.provenance(memory_id)
+        if provenance.get("channel") == "dev_v2":
+            # provenance() reopens the sealed ledger and all original receipts.
+            return
+        refs = provenance["raw_evidence_refs"]
         if not refs:
             raise StateConflictError("memory has no raw source evidence")
         for ref in refs:
@@ -806,6 +836,10 @@ class MemoryV2Manager:
                 raise StateConflictError("raw source evidence digest changed")
 
     def _trial(self, attempt_id: str, *, allow_terminal_failure: bool = False) -> dict[str, Any]:
+        from .dev_v2 import DevV2Evidence
+        imported = DevV2Evidence(self.store).trial(attempt_id)
+        if imported is not None:
+            return imported
         attempt = self.store.get_attempt(attempt_id)
         allowed = {"succeeded", "failed"}
         if allow_terminal_failure:

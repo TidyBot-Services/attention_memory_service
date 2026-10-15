@@ -117,3 +117,10 @@ Attention store run, post-edit policy SHA-256, and persisted
 before exposing guidance. This boundary assumes the Service can read the
 shared Attention store and resulting artifact path; remote deployments must
 mount these paths or add an independently verified artifact transport.
+
+The isolated Dev v2 channel supports sealed executor/validator source imports,
+original-provider-backed candidates, existing paired validation/promotion and
+bundle-bound Dev grant results. See [the Dev v2 contract](docs/dev-v2-import-contract.md)
+for startup catalogs, separate importer credentials, exact payloads, privacy
+boundaries, main-client follow-up and isolated HTTP verification. This capability
+alone is not evidence of a genuine provider/native integration run.

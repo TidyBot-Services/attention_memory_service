@@ -36,7 +36,7 @@ class DevMemoryUse:
 
     def authorize(
         self, *, memory_id: str, development_id: str, context: dict[str, Any],
-        source_policy_sha256: str, now: float,
+        source_policy_sha256: str, now: float, memory_version: int | None = None,
     ) -> dict[str, Any]:
         if not isinstance(development_id, str) or not development_id.strip():
             raise ValueError("development_id is required")
@@ -51,6 +51,18 @@ class DevMemoryUse:
                        if item.memory_id == memory_id), None)
         if memory is None:
             raise StateConflictError("memory is not trusted or applicable to Dev context")
+        provenance = self.service.v2._provenance(memory_id)
+        if provenance and provenance.get('channel') == 'dev_v2':
+            if type(memory_version) is not int or memory_version != memory.version:
+                raise StateConflictError('explicit exact trusted Memory version required')
+        elif memory_version is not None and (type(memory_version) is not int or memory_version != memory.version):
+            raise StateConflictError('requested Memory version changed')
+        with sqlite3.connect(self.service.store.path) as db:
+            prior = db.execute('SELECT payload FROM memory_dev_exposures WHERE memory_id=? AND development_id=?', (memory_id, development_id)).fetchone()
+        if prior:
+            old = json.loads(prior[0])
+            if (old.get('result') or {}).get('schema_version') == 'attentionbench.dev-v2-memory-result.v1':
+                self.service.dev_v2.verify_result(old)
         with sqlite3.connect(self.service.store.path) as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT payload FROM memories WHERE id=?", (memory_id,)).fetchone()
@@ -71,7 +83,7 @@ class DevMemoryUse:
                 if (old["context"] != context or old["source_policy_sha256"] != source_policy_sha256
                         or old["memory_version"] != memory.version):
                     raise StateConflictError("development ID already binds different Memory evidence")
-                return old
+                return _online_grant(old)
             record = {
                 "schema_version": "attentionbench.dev-memory-exposure.v1",
                 "grant_id": f"devgrant:{uuid.uuid4().hex}",
@@ -105,6 +117,13 @@ class DevMemoryUse:
         if not all(isinstance(value, str) and _SHA.fullmatch(value) for value in
                    (result_policy_sha256, artifact_sha256)):
             raise ValueError("result source and artifact SHA-256 are required")
+        with sqlite3.connect(self.service.store.path) as db:
+            grant_row = db.execute('SELECT payload FROM memory_dev_exposures WHERE grant_id=?', (grant_id,)).fetchone()
+        if grant_row:
+            grant = json.loads(grant_row[0])
+            provenance = self.service.v2._provenance(grant['memory_id'])
+            if provenance and provenance.get('channel') == 'dev_v2':
+                raise StateConflictError('Dev v2 results require offline sealed bundle import')
         run = self.service.store.get_run(run_id)
         if run is None or run.get("status") not in {"failed", "completed", "cancelled"}:
             raise StateConflictError("Dev result requires a terminal native run")
@@ -165,11 +184,39 @@ class DevMemoryUse:
         if row is None:
             raise StateConflictError("unknown Dev Memory grant")
         record = json.loads(row[0])
+        provenance = self.service.v2._provenance(record['memory_id'])
+        if provenance and provenance.get('channel') == 'dev_v2':
+            # New-channel reads release guidance again. Preserve the legacy
+            # historical-read API; enforce live eligibility on Dev v2 grants.
+            with sqlite3.connect(self.service.store.path) as db:
+                memory = db.execute('SELECT payload FROM memories WHERE id=?',
+                                    (record['memory_id'],)).fetchone()
+            current = {} if memory is None else json.loads(memory[0])
+            if (current.get('status') != 'trusted'
+                    or current.get('version') != record['memory_version']
+                    or current.get('expires_at') is not None and current['expires_at'] <= time.time()):
+                raise StateConflictError('Dev Memory grant was revoked, expired or changed version')
+            if not any(m.memory_id == record['memory_id'] and m.version == record['memory_version'] for m in self.service.retrieve(record['context'], now=time.time())):
+                raise StateConflictError('Dev v2 grant no longer has verified exact scope')
         result = record.get("result")
-        if result is not None:
+        if result is not None and result.get('schema_version') == 'attentionbench.dev-v2-memory-result.v1':
+            self.service.dev_v2.verify_result(record)
+            # No private bundle/native result pointers leave the offline side.
+            record['result'] = {k: result[k] for k in ('schema_version', 'execution_import_id',
+                'run_id', 'cell', 'version', 'source_policy_sha256', 'result_policy_sha256', 'claim')}
+        elif result is not None:
             artifact = Path(result["artifact_uri"])
             if (not artifact.is_file()
                     or hashlib.sha256(artifact.read_bytes()).hexdigest()
                     != result["artifact_sha256"]):
                 raise StateConflictError("Dev result artifact changed after recording")
         return record
+
+
+def _online_grant(record):
+    record = dict(record)
+    result = record.get('result')
+    if result and result.get('schema_version') == 'attentionbench.dev-v2-memory-result.v1':
+        record['result'] = {k: result[k] for k in ('schema_version', 'execution_import_id', 'run_id',
+            'cell', 'version', 'source_policy_sha256', 'result_policy_sha256', 'claim')}
+    return record

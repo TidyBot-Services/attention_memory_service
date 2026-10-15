@@ -24,6 +24,7 @@ class MemoryServiceClient:
     def __init__(
         self, base_url: str, *, api_key: str, timeout: float = 30.0,
         operator_key: str | None = None,
+        importer_key: str | None = None,
     ) -> None:
         if not base_url.startswith(("http://127.0.0.1:", "http://localhost:", "https://")):
             raise ValueError("remote Memory Service requires HTTPS")
@@ -32,6 +33,7 @@ class MemoryServiceClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.operator_key = operator_key
+        self.importer_key = importer_key
         self.timeout = timeout
 
     def health(self) -> dict[str, Any]:
@@ -61,6 +63,27 @@ class MemoryServiceClient:
     def get_plan(self, memory_id: str) -> dict[str, Any] | None:
         return self._call("GET", f"/memories/{quote(memory_id, safe='')}/plan")
 
+    def import_dev_v2_execution(self, **payload):
+        return self._call('POST', '/dev-v2/executions', payload, importer=True)
+
+    def import_dev_v2_source(self, **payload):
+        return self._call('POST', '/dev-v2/sources', payload, importer=True)
+
+    def import_dev_v2_trial(self, **payload):
+        return self._call('POST', '/dev-v2/trials', payload, importer=True)
+
+    def authorize_dev_v2_validation(self, **payload):
+        return self._call('POST', '/dev-v2/validation-grants', payload, importer=True)
+
+    def create_dev_v2_candidate(self, **payload):
+        return _memory(self._call('POST', '/dev-v2/candidates', payload, importer=True))
+
+    def record_dev_v2_pair(self, **payload):
+        return self._call('POST', '/dev-v2/pairs', payload, importer=True)
+
+    def record_dev_v2_result(self, **payload):
+        return self._call('POST', '/dev-v2/results', payload, importer=True)
+
     def export_package(self, memory_id: str) -> Path:
         result = self._call("POST", f"/memories/{quote(memory_id, safe='')}/export")
         return Path(result["directory"])
@@ -86,12 +109,12 @@ class MemoryServiceClient:
 
     def authorize_dev_use(
         self, *, memory_id: str, development_id: str, context: dict[str, Any],
-        source_policy_sha256: str, now: float,
+        source_policy_sha256: str, now: float, memory_version: int | None = None,
     ) -> dict[str, Any]:
         return self._call("POST", "/dev-use-grants", {
             "memory_id": memory_id, "development_id": development_id,
             "context": context, "source_policy_sha256": source_policy_sha256,
-            "now": now,
+            "now": now, "memory_version": memory_version,
         })
 
     def get_dev_use(self, grant_id: str) -> dict[str, Any]:
@@ -159,7 +182,7 @@ class MemoryServiceClient:
 
     def _call(
         self, method: str, path: str, payload: dict[str, Any] | None = None,
-        *, operator: bool = False,
+        *, operator: bool = False, importer: bool = False,
     ) -> Any:
         if operator and not self.operator_key:
             raise PermissionError("operator key is required")
@@ -170,6 +193,12 @@ class MemoryServiceClient:
         }
         if operator:
             headers["X-Memory-Operator-Key"] = self.operator_key
+        if importer and not self.importer_key:
+            raise PermissionError('offline importer key is required')
+        # A separately configured offline client can use the existing plan /
+        # preflight / promote paths; online clients never acquire this header.
+        if self.importer_key:
+            headers['X-Memory-Importer-Key'] = self.importer_key
         request = Request(
             self.base_url + path, data=data, method=method,
             headers=headers,
