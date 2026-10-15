@@ -415,6 +415,30 @@ class AttentionStore:
         )
         return use
 
+    def count_memory_events(self, memory_id: str, event_type: str) -> int:
+        with self._connect() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM events WHERE entity_type = 'memory' "
+                "AND entity_id = ? AND event_type = ?", (memory_id, event_type)).fetchone()[0])
+
+    def memory_events(self, memory_id: str) -> list[dict[str, Any]]:
+        """Status history of one memory, oldest first, with actor and reason."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, event_type, payload FROM events WHERE entity_type = 'memory' "
+                "AND entity_id = ? ORDER BY sequence", (memory_id,)).fetchall()
+        history = []
+        for sequence, event_type, payload in rows:
+            value = json.loads(payload)
+            memory = value.get("memory") or {}
+            history.append({
+                "sequence": sequence, "status": event_type.removeprefix("memory."),
+                "actor": value.get("actor"), "reason": value.get("reason"),
+                "version": memory.get("version"), "confidence": memory.get("confidence"),
+                "expires_at": memory.get("expires_at"),
+            })
+        return history
+
     def list_memory_uses(self, memory_id: str) -> list[dict[str, Any]]:
         return [
             value

@@ -263,11 +263,79 @@ class MemoryService:
     def disable(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
         if not actor.strip() or not reason.strip():
             raise ValueError("human disable requires actor and reason")
+        current = self.store.get_memory(memory_id)
+        if current is not None and current.status.value == "disabled":
+            return current  # idempotent retry
         memory = MemoryManager(self.store).disable(
             memory_id, reason=reason, actor=actor,
         )
         self.artifacts.publish(memory_id)
         return memory
+
+    def enable(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
+        """Re-enable a human-disabled memory. Rolled-back and expired ones stay revoked."""
+        if not actor.strip() or not reason.strip():
+            raise ValueError("human re-enable requires actor and reason")
+        current = self.store.get_memory(memory_id)
+        if current is not None and current.status.value == "trusted":
+            return current  # idempotent retry
+        memory = MemoryManager(self.store).enable(memory_id, reason=reason, actor=actor)
+        self.artifacts.publish(memory_id)
+        return memory
+
+    def evaluate(self, memory_id: str) -> MemoryRecord:
+        """Decide a fully validated candidate: trusted, or rejected with the failed gates."""
+        memory = self.v2.finalize_validation(memory_id)
+        self.artifacts.publish(memory_id)
+        return memory
+
+    def decision(self, memory_id: str) -> dict[str, Any] | None:
+        self.v2.provenance(memory_id)
+        return self.v2.get_decision(memory_id)
+
+    def history(self, memory_id: str) -> list[dict[str, Any]]:
+        self.get_memory(memory_id)
+        return self.store.memory_events(memory_id)
+
+    def uses(self, memory_id: str) -> list[dict[str, Any]]:
+        self.get_memory(memory_id)
+        return self.store.list_memory_uses(memory_id)
+
+    def list_memories(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        """Compact catalogue of the shared (non-private) memories with validation progress."""
+        rows = []
+        for memory in self.store.list_memories():
+            if status is not None and memory.status.value != status:
+                continue
+            provenance = self.v2._provenance(memory.memory_id)
+            if provenance is None or provenance.get("channel") == "dev_v2":
+                continue
+            plan = self.v2.get_plan(memory.memory_id)
+            pairs = self.v2.list_pairs(memory.memory_id)
+            decision = self.v2.get_decision(memory.memory_id)
+            rows.append({
+                "memory_id": memory.memory_id, "version": memory.version,
+                "status": memory.status.value, "status_reason": memory.status_reason,
+                "guidance": memory.guidance, "applicability": memory.applicability,
+                "confidence": memory.confidence,
+                "validation_successes": memory.validation_successes,
+                "validation_failures": memory.validation_failures,
+                "created_at": memory.created_at, "expires_at": memory.expires_at,
+                "source_kind": provenance["source_kind"],
+                "source_run_id": provenance["source_run_id"],
+                "source_attempt_id": provenance["source_attempt_id"],
+                "source_trace_id": provenance["source_trace_id"],
+                "request_id": provenance["request_id"],
+                "responder": provenance["responder"],
+                "validation": {
+                    "planned_seeds": None if plan is None else len(plan["seeds"]),
+                    "completed_pairs": len(pairs),
+                    "decision": None if decision is None else decision["decision"],
+                    "failed_gates": [] if decision is None else decision["failed_gates"],
+                },
+                "use_count": len(self.store.list_memory_uses(memory.memory_id)),
+            })
+        return rows
 
     @evidence_operation
     def rollback(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:

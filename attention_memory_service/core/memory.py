@@ -50,20 +50,26 @@ class MemoryManager:
         )
 
     def disable(self, memory_id: str, *, reason: str, actor: str | None = None) -> MemoryRecord:
+        # A memory can be disabled, re-enabled and disabled again: every cycle
+        # needs its own event key or the second disable replays the first one.
+        cycle = self.store.count_memory_events(memory_id, "memory.disabled")
         return self.store.transition_memory(
             memory_id,
             MemoryStatus.DISABLED,
-            event_key=f"memory-disable:{memory_id}",
+            event_key=f"memory-disable:{memory_id}" + (f":{cycle}" if cycle else ""),
             reason=reason,
             actor=actor,
         )
 
-    def enable(self, memory_id: str) -> MemoryRecord:
+    def enable(self, memory_id: str, *, reason: str = "human_reenabled",
+               actor: str | None = None) -> MemoryRecord:
+        cycle = self.store.count_memory_events(memory_id, "memory.trusted")
         return self.store.transition_memory(
             memory_id,
             MemoryStatus.TRUSTED,
-            event_key=f"memory-enable:{memory_id}",
-            reason="human_reenabled",
+            event_key=f"memory-enable:{memory_id}:{cycle}",
+            reason=reason,
+            actor=actor,
         )
 
     def rollback(self, memory_id: str, *, reason: str, actor: str | None = None) -> MemoryRecord:

@@ -335,6 +335,30 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     def promote(memory_id: str):
         return guarded(service.promote, memory_id).artifact()
 
+    @app.get("/memories", dependencies=[Depends(authorized)])
+    def list_memories(status: str | None = None):
+        return {"memories": guarded(service.list_memories, status=status)}
+
+    @app.get("/memories/{memory_id}/uses", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
+    def memory_uses(memory_id: str):
+        return {"uses": guarded(service.uses, memory_id)}
+
+    @app.get("/memories/{memory_id}/history", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
+    def memory_history(memory_id: str):
+        return {"history": guarded(service.history, memory_id)}
+
+    @app.get("/memories/{memory_id}/decision", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
+    def memory_decision(memory_id: str):
+        return {"decision": guarded(service.decision, memory_id)}
+
+    @app.post("/memories/{memory_id}/evaluate", dependencies=[Depends(authorized), Depends(private_memory_authorized)])
+    def evaluate(memory_id: str):
+        return guarded(service.evaluate, memory_id).artifact()
+
+    @app.post("/memories/{memory_id}/enable", dependencies=[Depends(operator_authorized)])
+    def enable(memory_id: str, payload: OperatorInput):
+        return guarded(service.enable, memory_id, **payload.model_dump()).artifact()
+
     @app.post("/memories/{memory_id}/disable", dependencies=[Depends(operator_authorized)])
     def disable(memory_id: str, payload: OperatorInput):
         return guarded(service.disable, memory_id, **payload.model_dump()).artifact()

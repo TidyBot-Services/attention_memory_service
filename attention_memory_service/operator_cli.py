@@ -14,7 +14,8 @@ def main() -> int:
     parser.add_argument("--service-url", default="http://127.0.0.1:8768")
     parser.add_argument("--actor", required=True, help="human operator identifier")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("disable", "rollback", "set-expiry"):
+    commands.add_parser("evaluate").add_argument("memory_id")
+    for name in ("disable", "enable", "rollback", "set-expiry"):
         command = commands.add_parser(name)
         command.add_argument("memory_id")
         command.add_argument("--reason", required=True)
@@ -26,7 +27,11 @@ def main() -> int:
         api_key=os.environ.get("ATTENTION_MEMORY_API_KEY", ""),
         operator_key=os.environ.get("ATTENTION_MEMORY_OPERATOR_KEY"),
     )
-    if args.command == "disable":
+    if args.command == "evaluate":
+        memory = client.evaluate(args.memory_id)
+    elif args.command == "enable":
+        memory = client.enable(args.memory_id, actor=args.actor, reason=args.reason)
+    elif args.command == "disable":
         memory = client.disable(args.memory_id, actor=args.actor, reason=args.reason)
     elif args.command == "rollback":
         memory = client.rollback(args.memory_id, actor=args.actor, reason=args.reason)

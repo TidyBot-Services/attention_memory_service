@@ -159,6 +159,27 @@ class MemoryServiceClient:
     def promote(self, memory_id: str) -> MemoryRecord:
         return _memory(self._call("POST", f"/memories/{quote(memory_id, safe='')}/promote"))
 
+    def list_memories(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        suffix = "" if status is None else f"?status={quote(status, safe='')}"
+        return self._call("GET", f"/memories{suffix}")["memories"]
+
+    def uses(self, memory_id: str) -> list[dict[str, Any]]:
+        return self._call("GET", f"/memories/{quote(memory_id, safe='')}/uses")["uses"]
+
+    def history(self, memory_id: str) -> list[dict[str, Any]]:
+        return self._call("GET", f"/memories/{quote(memory_id, safe='')}/history")["history"]
+
+    def decision(self, memory_id: str) -> dict[str, Any] | None:
+        return self._call("GET", f"/memories/{quote(memory_id, safe='')}/decision")["decision"]
+
+    def evaluate(self, memory_id: str) -> MemoryRecord:
+        return _memory(self._call("POST", f"/memories/{quote(memory_id, safe='')}/evaluate", {}))
+
+    def enable(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
+        return _memory(self._call(
+            "POST", f"/memories/{quote(memory_id, safe='')}/enable",
+            {"actor": actor, "reason": reason}, operator=True))
+
     def disable(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:
         return _memory(self._call(
             "POST", f"/memories/{quote(memory_id, safe='')}/disable",

@@ -71,6 +71,10 @@ class MemoryV2Manager:
                 "(memory_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
             )
             db.execute(
+                "CREATE TABLE IF NOT EXISTS memory_v2_decisions "
+                "(memory_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            db.execute(
                 "CREATE TABLE IF NOT EXISTS memory_v2_use_grants "
                 "(grant_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, "
                 "attempt_id TEXT NOT NULL, payload TEXT NOT NULL, "
@@ -770,33 +774,56 @@ class MemoryV2Manager:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
-    def validate_and_promote(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
-        report = self.impact_report(memory_id)
-        self.verify_source_evidence(memory_id)
+    GATE_MESSAGES = {
+        "insufficient_pairs": "at least five distinct paired dev seeds are required",
+        "mixed_policy_versions": "validation cases used different policy code versions",
+        "safety_regression": "paired safety regression blocks memory promotion",
+        "success_regression": "success regression blocks memory promotion",
+        "no_measured_gain": "no measured success gain or successful-pair assistance saving",
+        "insufficient_treatment_successes": "insufficient treatment successes",
+        "treatment_fraction_below_0.75": "treatment success fraction is below 0.75",
+        "no_validated_scope": "no validated retrieval scope remains after counterexamples",
+    }
+
+    def _gate_failures(self, report: dict[str, Any], *, minimum_pairs: int) -> list[str]:
+        """Failed promotion gates, in the order they have always been checked."""
+        failures = []
+        if report["paired_dev_seeds"] < minimum_pairs or minimum_pairs < 5:
+            failures.append("insufficient_pairs")
+        if len(report["validation_policy_hashes"]) != 1:
+            failures.append("mixed_policy_versions")
+        if report["safety_regressions"] or report["treatment_unsafe_attempts"] > report["control_unsafe_attempts"]:
+            failures.append("safety_regression")
+        if report["success_gain"] < 0:
+            failures.append("success_regression")
+        if report["success_gain"] == 0 and report["both_success_assistance_credits_saved"] <= 0:
+            failures.append("no_measured_gain")
+        if report["treatment_successes"] < 3:
+            failures.append("insufficient_treatment_successes")
+        if report["paired_dev_seeds"] and report["treatment_successes"] / report["paired_dev_seeds"] < 0.75:
+            failures.append("treatment_fraction_below_0.75")
+        if not report["validated_scope"]:
+            failures.append("no_validated_scope")
+        return failures
+
+    def _plan_complete(self, memory_id: str) -> dict[str, Any]:
         plan = self.get_plan(memory_id)
         if plan is None or {pair["seed"] for pair in self.list_pairs(memory_id)} != set(plan["seeds"]):
             raise StateConflictError("all predefined variation cases must be completed")
+        return plan
+
+    def validate_and_promote(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
+        report = self.impact_report(memory_id)
+        self.verify_source_evidence(memory_id)
+        self._plan_complete(memory_id)
         memory = self.store.get_memory(memory_id)
         if memory is None or memory.status not in {
             MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED,
         }:
             raise StateConflictError("memory is not eligible for v2 validation")
-        if report["paired_dev_seeds"] < minimum_pairs or minimum_pairs < 5:
-            raise StateConflictError("at least five distinct paired dev seeds are required")
-        if len(report["validation_policy_hashes"]) != 1:
-            raise StateConflictError("validation cases used different policy code versions")
-        if report["safety_regressions"] or report["treatment_unsafe_attempts"] > report["control_unsafe_attempts"]:
-            raise StateConflictError("paired safety regression blocks memory promotion")
-        if report["success_gain"] < 0:
-            raise StateConflictError("success regression blocks memory promotion")
-        if report["success_gain"] == 0 and report["both_success_assistance_credits_saved"] <= 0:
-            raise StateConflictError("no measured success gain or successful-pair assistance saving")
-        if report["treatment_successes"] < 3:
-            raise StateConflictError("insufficient treatment successes")
-        if report["treatment_successes"] / report["paired_dev_seeds"] < 0.75:
-            raise StateConflictError("treatment success fraction is below 0.75")
-        if not report["validated_scope"]:
-            raise StateConflictError("no validated retrieval scope remains after counterexamples")
+        failures = self._gate_failures(report, minimum_pairs=minimum_pairs)
+        if failures:
+            raise StateConflictError(self.GATE_MESSAGES[failures[0]])
         if memory.status is MemoryStatus.TRUSTED:
             return memory
         manager = MemoryManager(self.store)
@@ -810,6 +837,55 @@ class MemoryV2Manager:
         if updated.status is not MemoryStatus.VALIDATED:
             raise StateConflictError("core validation confidence gate failed")
         return manager.promote(memory_id)
+
+    def finalize_validation(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
+        """Close a completed validation: promote to trusted, or reject with the failed gates.
+
+        The decision, its gates and the full impact report are kept so a rejected
+        candidate stays explainable. An incomplete plan is not a verdict.
+        """
+        memory = self.store.get_memory(memory_id)
+        if memory is None:
+            raise StateConflictError("unknown memory")
+        if memory.status in {MemoryStatus.TRUSTED, MemoryStatus.REJECTED}:
+            return memory
+        if memory.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED}:
+            raise StateConflictError("memory is not eligible for v2 validation")
+        self.verify_source_evidence(memory_id)
+        self._plan_complete(memory_id)
+        report = self.impact_report(memory_id)
+        failures = self._gate_failures(report, minimum_pairs=minimum_pairs)
+        decision = {
+            "schema_version": "attentionbench.memory-validation-decision.v1",
+            "memory_id": memory_id, "decision": "rejected" if failures else "promoted",
+            "failed_gates": failures,
+            "failed_gate_messages": [self.GATE_MESSAGES[code] for code in failures],
+            "minimum_pairs": minimum_pairs, "report": report, "decided_at": time.time(),
+        }
+        if not failures:
+            promoted = self.validate_and_promote(memory_id, minimum_pairs=minimum_pairs)
+            self._record_decision(memory_id, decision)
+            return promoted
+        rejected = self.store.transition_memory(
+            memory_id, MemoryStatus.REJECTED, event_key=f"memory-reject:{memory_id}",
+            confidence=report["empirical_confidence"] or 0.0,
+            validation_successes=report["treatment_successes"],
+            validation_failures=report["paired_dev_seeds"] - report["treatment_successes"],
+            reason="validation_gate_failed: " + ", ".join(failures),
+        )
+        self._record_decision(memory_id, decision)
+        return rejected
+
+    def _record_decision(self, memory_id: str, decision: dict[str, Any]) -> None:
+        with sqlite3.connect(self.store.path) as db:
+            db.execute("INSERT OR IGNORE INTO memory_v2_decisions(memory_id, payload) VALUES (?, ?)",
+                       (memory_id, _encoded(decision)))
+
+    def get_decision(self, memory_id: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.store.path) as db:
+            row = db.execute("SELECT payload FROM memory_v2_decisions WHERE memory_id=?",
+                             (memory_id,)).fetchone()
+        return None if row is None else json.loads(row[0])
 
     def verify_source_evidence(self, memory_id: str) -> None:
         """Fail closed if the candidate's original artifact bytes are gone."""
