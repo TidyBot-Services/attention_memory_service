@@ -51,6 +51,7 @@ def test_passing_validation_promotes_and_records_the_decision(manager, monkeypat
     memory = manager.finalize_validation("memory-1")
     assert memory.status is MemoryStatus.TRUSTED
     decision = manager.get_decision("memory-1")
+    assert decision["profile"] == "default"
     assert decision["decision"] == "promoted" and decision["failed_gates"] == []
     assert decision["report"]["treatment_successes"] == 5
     assert manager.finalize_validation("memory-1").status is MemoryStatus.TRUSTED  # idempotent

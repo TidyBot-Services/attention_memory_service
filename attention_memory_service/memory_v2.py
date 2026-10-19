@@ -66,6 +66,8 @@ class MemoryV2Manager:
                 "seed INTEGER NOT NULL, payload TEXT NOT NULL, "
                 "UNIQUE(memory_id, seed))"
             )
+            db.execute("CREATE TABLE IF NOT EXISTS memory_v2_scene_pairs "
+                       "(pair_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, payload TEXT NOT NULL)")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS memory_v2_plans "
                 "(memory_id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
@@ -155,6 +157,11 @@ class MemoryV2Manager:
             raise StateConflictError("validation plan applicability mismatch")
         if plan.get("policy_id") != provenance["source_policy_id"]:
             raise StateConflictError("validation plan policy mismatch")
+        profile = plan.get('profile', 'default')
+        if profile == 'single_scene_v1':
+            return self._record_single_scene_plan(memory_id, plan, provenance)
+        if profile != 'default':
+            raise ValueError('unknown validation profile')
         seeds = plan.get("seeds")
         if (not isinstance(seeds, list) or len(seeds) < 5
                 or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)
@@ -208,6 +215,49 @@ class MemoryV2Manager:
                 "INSERT INTO memory_v2_plans(memory_id, payload) VALUES (?, ?)",
                 (memory_id, encoded),
             )
+        return plan
+
+    def _record_single_scene_plan(self, memory_id, plan, provenance):
+        from .dev_v2 import SCOPE, AXES, SHA
+        if provenance.get('channel') != 'dev_v2' or not provenance.get('failure_signature'):
+            raise StateConflictError('single-scene profile needs a frozen Dev v2 failure signature')
+        seed = provenance['source_seed']
+        case = {'seed': seed, **{k: provenance['artifact']['applicability'][k] for k in AXES}}
+        # Camera names and prompt come from the sealed source context, not the
+        # policy-patch applicability (which predates this profile).
+        source = self.provenance(memory_id)
+        from .dev_v2 import DevV2Evidence
+        context = DevV2Evidence(self.store).source(source['source_import_id'])['context']
+        case.update(camera_names=context['camera_names'], task_prompt=context['task_prompt'])
+        pairs = plan.get('pairs')
+        if (plan.get('failure_signature') != provenance['failure_signature']
+                or plan.get('seeds') != [seed] or plan.get('cases') != [case]
+                or not isinstance(pairs, list) or len(pairs) < 5
+                or any(not isinstance(p, dict) or set(p) != {'pair_id', 'control_cell', 'treatment_cell'}
+                       or any(not isinstance(v, str) or not v for v in p.values()) for p in pairs)
+                or len({p['pair_id'] for p in pairs}) != len(pairs)
+                or len({cell for p in pairs for cell in (p['control_cell'], p['treatment_cell'])}) != 2 * len(pairs)):
+            raise ValueError('single-scene plan needs one exact source tuple and five distinct pairs')
+        if classify_seed(seed) != 'dev':
+            raise PermissionError('validation plan is development-only')
+        if any(plan.get(k) != context[k] for k in SCOPE if k not in AXES):
+            raise StateConflictError('single-scene plan differs from source scope')
+        if any(not isinstance(plan.get(k), str) or SHA.fullmatch(plan[k]) is None
+               for k in ('validation_policy_sha256', 'validation_config_sha256')):
+            raise ValueError('single-scene plan needs frozen policy and config SHA-256')
+        credits = plan.get('assistance_credits')
+        if type(credits) is not int or credits < 0:
+            raise ValueError('validation plan credits must be nonnegative')
+        encoded = _encoded(plan)
+        with sqlite3.connect(self.store.path) as db:
+            row = db.execute('SELECT payload FROM memory_v2_plans WHERE memory_id=?', (memory_id,)).fetchone()
+            if row:
+                if row[0] != encoded:
+                    raise StateConflictError('validation plan is immutable once recorded')
+                return json.loads(row[0])
+            if db.execute('SELECT 1 FROM memory_v2_scene_pairs WHERE memory_id=? LIMIT 1', (memory_id,)).fetchone():
+                raise StateConflictError('validation plan cannot be backfilled after pairs')
+            db.execute('INSERT INTO memory_v2_plans(memory_id,payload) VALUES (?,?)', (memory_id, encoded))
         return plan
 
     def get_plan(self, memory_id: str) -> dict[str, Any] | None:
@@ -369,7 +419,9 @@ class MemoryV2Manager:
                     or any(memory.applicability.get(k) != source["context"][k] for k in SCOPE)
                     or memory.guidance != source["guidance"]
                     or memory.candidate_repair != source["repair"]
-                    or value["source_policy_sha256"] != source["source_policy_sha256"]):
+                    or value["source_policy_sha256"] != source["source_policy_sha256"]
+                    or value.get('failure_signature') != source.get('failure_signature')
+                    or value['artifact'].get('failure_signature') != source.get('failure_signature')):
                 raise StateConflictError("Dev v2 source/Memory binding changed")
             return value
         request = self.store.get_request(value["request_id"])
@@ -478,6 +530,14 @@ class MemoryV2Manager:
             if self._provenance(item.memory_id) is None:
                 continue
             provenance = self.provenance(item.memory_id)
+            plan = self.get_plan(item.memory_id)
+            if plan and plan.get('profile', 'default') == 'single_scene_v1':
+                from .dev_v2 import SCOPE
+                if (context.get('seed') != provenance['source_seed']
+                        or any(item.applicability.get(k) != context.get(k) for k in SCOPE)
+                        or context.get('camera_names') != plan['cases'][0]['camera_names']
+                        or context.get('task_prompt') != plan['cases'][0]['task_prompt']):
+                    continue
             if 'sdk_sha256' in context or 'namespace' in context:
                 from .dev_v2 import SCOPE
                 if provenance.get('channel') != 'dev_v2' or any(item.applicability.get(k) != context.get(k) for k in SCOPE):
@@ -496,7 +556,6 @@ class MemoryV2Manager:
             ):
                 continue
             variation = {axis: context[axis] for axis in axes}
-            plan = self.get_plan(item.memory_id)
             if plan is None or not any(
                 all(case[axis] == variation[axis] for axis in axes)
                 and case["camera_names"] == context["camera_names"]
@@ -628,6 +687,24 @@ class MemoryV2Manager:
             "control_safety": safety[0],
             "treatment_safety": safety[1],
         }
+        if plan.get('profile', 'default') == 'single_scene_v1':
+            match = next((p for p in plan['pairs']
+                          if p['control_cell'] == control.get('validation_cell')
+                          and p['treatment_cell'] == treatment.get('validation_cell')), None)
+            if match is None:
+                raise StateConflictError('arms do not match a frozen single-scene pair')
+            pair_id = f"pair:{memory_id}:{match['pair_id']}"
+            payload['pair_id'] = pair_id
+            payload['profile'] = 'single_scene_v1'
+            with sqlite3.connect(self.store.path) as db:
+                try:
+                    db.execute('INSERT INTO memory_v2_scene_pairs(pair_id,memory_id,payload) VALUES (?,?,?)',
+                               (pair_id, memory_id, _encoded(payload)))
+                except sqlite3.IntegrityError as exc:
+                    row = db.execute('SELECT payload FROM memory_v2_scene_pairs WHERE pair_id=?', (pair_id,)).fetchone()
+                    if row is None or json.loads(row[0]) != payload:
+                        raise StateConflictError('conflicting single-scene pair') from exc
+            return payload
         with sqlite3.connect(self.store.path) as db:
             try:
                 db.execute(
@@ -643,6 +720,8 @@ class MemoryV2Manager:
 
     def impact_report(self, memory_id: str) -> dict[str, Any]:
         provenance = self.provenance(memory_id)
+        plan = self.get_plan(memory_id)
+        single = plan is not None and plan.get('profile', 'default') == 'single_scene_v1'
         pairs = self.list_pairs(memory_id)
         control_success = treatment_success = control_credits = treatment_credits = 0
         control_seconds = treatment_seconds = control_unsafe = treatment_unsafe = 0.0
@@ -652,12 +731,24 @@ class MemoryV2Manager:
         counterexamples = []
         safety_regressions = []
         validation_policy_hashes: set[str] = set()
+        signature_arms = []
+        validation_config_hashes: set[str] = set()
         for pair in pairs:
             control = self._trial(pair["control_attempt_id"])
             treatment = self._trial(pair["treatment_attempt_id"])
             if not control["policy_sha256"] or control["policy_sha256"] != treatment["policy_sha256"]:
                 raise StateConflictError("paired policy code differs")
             validation_policy_hashes.add(control["policy_sha256"])
+            if single:
+                validation_config_hashes.update((control['config_sha256'], treatment['config_sha256']))
+                signature_arms.append({
+                    'pair_id': pair['pair_id'],
+                    'control_signature_present': control['signature_present'],
+                    'treatment_signature_present': treatment['signature_present'],
+                    'control_stop_position': control['stop_position'],
+                    'treatment_stop_position': treatment['stop_position'],
+                    'treatment_not_earlier': treatment['stop_position'] >= control['stop_position'],
+                })
             if control["run"]["seed"] != pair["seed"] or treatment["run"]["seed"] != pair["seed"]:
                 raise StateConflictError("validation seed changed")
             if control["memory_ids"] or control["exposure"] != "none" or treatment["memory_ids"] != [memory_id] or treatment["exposure"] != "candidate_validation":
@@ -729,7 +820,7 @@ class MemoryV2Manager:
             if key not in blocked and key not in seen_scope:
                 validated_scope.append(variation)
                 seen_scope.add(key)
-        return {
+        report = {
             "memory_id": memory_id,
             "source_kind": provenance["source_kind"],
             "source_policy_sha256": provenance["source_policy_sha256"],
@@ -764,9 +855,24 @@ class MemoryV2Manager:
                 else None
             ),
         }
+        if single:
+            report.update(profile='single_scene_v1', cross_scene_eligible=False,
+                          failure_signature=provenance['failure_signature'],
+                          paired_runs=n, signature_arms=signature_arms,
+                          control_signature_count=sum(a['control_signature_present'] for a in signature_arms),
+                          treatment_signature_count=sum(a['treatment_signature_present'] for a in signature_arms),
+                          validation_config_hashes=sorted(validation_config_hashes),
+                          validated_scope=[{axis: plan['cases'][0][axis] for axis in axes}])
+        return report
 
     def list_pairs(self, memory_id: str) -> list[dict[str, Any]]:
         self.provenance(memory_id)
+        plan = self.get_plan(memory_id)
+        if plan and plan.get('profile', 'default') == 'single_scene_v1':
+            with sqlite3.connect(self.store.path) as db:
+                rows = db.execute('SELECT payload FROM memory_v2_scene_pairs WHERE memory_id=? ORDER BY pair_id',
+                                  (memory_id,)).fetchall()
+            return [json.loads(row[0]) for row in rows]
         with sqlite3.connect(self.store.path) as db:
             rows = db.execute(
                 "SELECT payload FROM memory_v2_pairs WHERE memory_id=? ORDER BY seed",
@@ -783,7 +889,30 @@ class MemoryV2Manager:
         "insufficient_treatment_successes": "insufficient treatment successes",
         "treatment_fraction_below_0.75": "treatment success fraction is below 0.75",
         "no_validated_scope": "no validated retrieval scope remains after counterexamples",
+        'control_signature_not_reproduced': 'target failure did not reproduce in at least 80% of controls',
+        'treatment_signature_remains': 'target failure remains in more than 20% of treatments',
+        'treatment_stopped_earlier': 'a treatment stopped before its paired control',
+        'mixed_validation_configuration': 'single-scene arms used different frozen configurations',
     }
+
+    def _single_scene_failures(self, report, plan):
+        n = report['paired_runs']
+        failures = []
+        if n < 5:
+            failures.append('insufficient_pairs')
+        if report['validation_policy_hashes'] != [plan['validation_policy_sha256']]:
+            failures.append('mixed_policy_versions')
+        if report['validation_config_hashes'] != [plan['validation_config_sha256']]:
+            failures.append('mixed_validation_configuration')
+        if report['safety_regressions'] or report['treatment_unsafe_attempts'] > report['control_unsafe_attempts']:
+            failures.append('safety_regression')
+        if report['control_signature_count'] < math.ceil(0.8 * n):
+            failures.append('control_signature_not_reproduced')
+        if report['treatment_signature_count'] > math.floor(0.2 * n):
+            failures.append('treatment_signature_remains')
+        if any(not arm['treatment_not_earlier'] for arm in report['signature_arms']):
+            failures.append('treatment_stopped_earlier')
+        return failures
 
     def _gate_failures(self, report: dict[str, Any], *, minimum_pairs: int) -> list[str]:
         """Failed promotion gates, in the order they have always been checked."""
@@ -808,6 +937,11 @@ class MemoryV2Manager:
 
     def _plan_complete(self, memory_id: str) -> dict[str, Any]:
         plan = self.get_plan(memory_id)
+        if plan and plan.get('profile', 'default') == 'single_scene_v1':
+            expected = {f"pair:{memory_id}:{p['pair_id']}" for p in plan['pairs']}
+            if {p['pair_id'] for p in self.list_pairs(memory_id)} != expected:
+                raise StateConflictError('all predefined single-scene pairs must be completed')
+            return plan
         if plan is None or {pair["seed"] for pair in self.list_pairs(memory_id)} != set(plan["seeds"]):
             raise StateConflictError("all predefined variation cases must be completed")
         return plan
@@ -815,18 +949,28 @@ class MemoryV2Manager:
     def validate_and_promote(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
         report = self.impact_report(memory_id)
         self.verify_source_evidence(memory_id)
-        self._plan_complete(memory_id)
+        plan = self._plan_complete(memory_id)
         memory = self.store.get_memory(memory_id)
         if memory is None or memory.status not in {
             MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED,
         }:
             raise StateConflictError("memory is not eligible for v2 validation")
-        failures = self._gate_failures(report, minimum_pairs=minimum_pairs)
+        single = plan.get('profile', 'default') == 'single_scene_v1'
+        failures = self._single_scene_failures(report, plan) if single else self._gate_failures(report, minimum_pairs=minimum_pairs)
         if failures:
             raise StateConflictError(self.GATE_MESSAGES[failures[0]])
         if memory.status is MemoryStatus.TRUSTED:
             return memory
         manager = MemoryManager(self.store)
+        if single:
+            if memory.status is MemoryStatus.CANDIDATE:
+                self.store.transition_memory(memory_id, MemoryStatus.VALIDATED,
+                    event_key=f'memory-validation:{memory_id}:single_scene_v1',
+                    confidence=report['control_signature_count'] / report['paired_runs'],
+                    validation_successes=report['paired_runs'] - report['treatment_signature_count'],
+                    validation_failures=report['treatment_signature_count'],
+                    reason='single_scene_v1_validation_passed')
+            return manager.promote(memory_id)
         if memory.status is MemoryStatus.CANDIDATE:
             manager.record_validation(
                 memory_id,
@@ -852,16 +996,25 @@ class MemoryV2Manager:
         if memory.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED}:
             raise StateConflictError("memory is not eligible for v2 validation")
         self.verify_source_evidence(memory_id)
-        self._plan_complete(memory_id)
+        plan = self._plan_complete(memory_id)
         report = self.impact_report(memory_id)
-        failures = self._gate_failures(report, minimum_pairs=minimum_pairs)
+        single = plan.get('profile', 'default') == 'single_scene_v1'
+        failures = self._single_scene_failures(report, plan) if single else self._gate_failures(report, minimum_pairs=minimum_pairs)
         decision = {
             "schema_version": "attentionbench.memory-validation-decision.v1",
-            "memory_id": memory_id, "decision": "rejected" if failures else "promoted",
+            "memory_id": memory_id, "profile": 'single_scene_v1' if single else 'default',
+            "decision": "rejected" if failures else "promoted",
             "failed_gates": failures,
             "failed_gate_messages": [self.GATE_MESSAGES[code] for code in failures],
             "minimum_pairs": minimum_pairs, "report": report, "decided_at": time.time(),
         }
+        if single:
+            decision.update(trust_scope='scene_scoped' if not failures else None,
+                            cross_scene_eligible=False,
+                            gate_thresholds={'minimum_pairs': 5, 'control_signature_fraction_min': 0.8,
+                                             'treatment_signature_fraction_max': 0.2,
+                                             'stop_position': 'each treatment >= paired control',
+                                             'safety': 'no per-pair or net regression'})
         if not failures:
             promoted = self.validate_and_promote(memory_id, minimum_pairs=minimum_pairs)
             self._record_decision(memory_id, decision)

@@ -51,6 +51,13 @@ class MemoryServiceClient:
     def get_memory(self, memory_id: str) -> MemoryRecord:
         return _memory(self._call("GET", f"/memories/{quote(memory_id, safe='')}"))
 
+    def list_dev_v2_memories(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        suffix = '' if status is None else '?status=' + quote(status, safe='')
+        return self._call('GET', '/dev-v2/memories' + suffix)['memories']
+
+    def get_dev_v2_memory_public(self, memory_id: str) -> dict[str, Any]:
+        return self._call('GET', f"/dev-v2/memories/{quote(memory_id, safe='')}")
+
     def provenance(self, memory_id: str) -> dict[str, Any]:
         return self._call("GET", f"/memories/{quote(memory_id, safe='')}/provenance")
 

@@ -40,6 +40,66 @@ within every control/treatment pair. Its digest may differ from the failed
 source policy (for example, after a repair); both digests and that distinction
 are reported rather than silently attributing the policy change to memory.
 
+### Validation profiles
+
+Plans without `profile` use the unchanged default rule: five **different**
+development seeds, real variation on all four scene/object/camera/task axes,
+no pairwise or net safety regression, no success regression, a measured success
+or successful-pair assistance gain, at least three treatment successes, a
+treatment success fraction of at least 0.75, and a supported scope without a
+counterexample. These memories support the existing multi-scene report.
+
+`single_scene_v1` is a separate Dev v2 rule. A source descriptor may declare
+`failure_signature: {"public_error_class": "RuntimeError: TimeoutError",
+"operation": "left_arm.move_delta"}`. Source import checks that this signature
+appears in the originating failed attempt's public feedback, then seals it in
+the candidate provenance and artifact. It cannot be changed by a plan or later
+trial. The optional objective Eval reason class is not used by this version.
+
+The plan declares `profile: "single_scene_v1"`, the exact source `failure_signature`,
+one source seed and case, at least five distinct `pairs` with `pair_id`,
+`control_cell`, and `treatment_cell`, plus `validation_policy_sha256` and
+`validation_config_sha256`. It retains the normal scope, policy ID and credits
+fields. Every arm needs a preregistered grant, a fresh isolated process, the
+verified scene contract, the same policy and config SHA, and independent
+validator evidence. Only treatment gets the candidate. For this profile, each
+independent verdict also supplies `failure_signature`, `signature_present`, and
+`stop_position`; the service recomputes both values from that arm's sealed
+public trace and rejects a disagreement.
+
+For five pairs, promotion requires the signature in at least four control arms
+and at most one treatment arm. With more pairs the limits are
+`ceil(0.8 * pairs)` and `floor(0.2 * pairs)`. No treatment may have more unsafe
+attempts than its paired control, and the treatment total may not exceed the
+control total. `stop_position` is the number of successful (`completed` or
+`succeeded`) SDK events in the complete public trace before termination; each
+treatment count must be at least its paired control count. This pairwise rule
+prevents a longer run elsewhere from hiding an early stop. `evaluate` records
+the profile, per-arm signature and stop counts, total counts, failed gates and
+the full impact report; a failed completed plan is `rejected`.
+
+A passing memory has `trust_scope: "scene_scoped"` (display name
+`scene_scoped_trusted`). Retrieval requires the exact task, seed, source scene
+and object contract, robot/controller, SDK/namespace, camera configuration and
+names, task variant and prompt, and perception mode. Revocation, expiry and
+rollback work as for other trusted memories. This rule only supports the claim
+that the targeted failure type disappeared in that exact scene. It does not
+show task outcome improvement or cross-scene generalization; exclude it from
+cross-scene aggregate claims. The decision and impact report mark
+`cross_scene_eligible: false` for downstream filtering.
+
+The read-only `GET /dev-v2/memories` and `GET /dev-v2/memories/{memory_id}`
+accept the online service key. Their **public allowlist** is memory ID,
+version, status, trust scope/display name, profile, the applicability summary
+(benchmark, suite, task, seed, scene/object/camera/task IDs, robot, controller,
+perception mode, camera names, task prompt, SDK SHA, namespace and planned
+case summaries), failure
+signature class/operation, validation summary (planned/completed pair counts,
+decision, failed gate codes and signature counts), and source label. Guidance,
+repair text, grant bodies, import descriptors, sealed evidence, and keys remain
+behind importer authorization. The existing generic `/memories` list continues
+to omit Dev v2 rows; the UI must call these new read-only routes to show them.
+
 The Service rejects a safety artifact whose `unsafe_attempts` disagrees with
 its violation list, or which has no monitor events; a claimed source label
 alone is not sufficient evidence. This is an integrity check on the recorded

@@ -255,7 +255,10 @@ class MemoryService:
 
     @evidence_operation
     def promote(self, memory_id: str) -> MemoryRecord:
-        memory = self.v2.validate_and_promote(memory_id)
+        plan = self.v2.get_plan(memory_id)
+        memory = (self.v2.finalize_validation(memory_id)
+                  if plan and plan.get('profile') == 'single_scene_v1'
+                  else self.v2.validate_and_promote(memory_id))
         self.artifacts.publish(memory_id)
         return memory
 
@@ -336,6 +339,61 @@ class MemoryService:
                 "use_count": len(self.store.list_memory_uses(memory.memory_id)),
             })
         return rows
+
+    def list_dev_v2_memories(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        """Explicit public allowlist; importer evidence never enters this projection."""
+        rows = []
+        for memory in self.store.list_memories():
+            if status is not None and memory.status.value != status:
+                continue
+            provenance = self.v2._provenance(memory.memory_id)
+            if not provenance or provenance.get('channel') != 'dev_v2':
+                continue
+            plan = self.v2.get_plan(memory.memory_id)
+            decision = self.v2.get_decision(memory.memory_id)
+            case = plan['cases'][0] if plan and plan.get('profile') == 'single_scene_v1' else None
+            trusted = memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
+            scope = ('scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
+            rows.append({
+                'memory_id': memory.memory_id, 'version': memory.version,
+                'status': memory.status.value, 'trust_scope': scope,
+                'trust_display': 'scene_scoped_trusted' if scope == 'scene_scoped' else None,
+                'profile': None if plan is None else plan.get('profile', 'default'),
+                'applicability_summary': {
+                    'benchmark': memory.applicability['benchmark'],
+                    'suite': memory.applicability['suite'],
+                    'task_id': memory.applicability['task_id'], 'seed': provenance['source_seed'],
+                    'scene_id': None if case is None else case['scene_id'],
+                    'object_set_id': None if case is None else case['object_set_id'],
+                    'robot': memory.applicability['robot'],
+                    'controller': memory.applicability['controller'],
+                    'perception_mode': memory.applicability['perception_mode'],
+                    'camera_config_id': None if case is None else case['camera_config_id'],
+                    'task_variant_id': None if case is None else case['task_variant_id'],
+                    'camera_names': None if case is None else case['camera_names'],
+                    'task_prompt': None if case is None else case['task_prompt'],
+                    'sdk_sha256': memory.applicability['sdk_sha256'],
+                    'namespace': memory.applicability['namespace'],
+                    'planned_cases': None if plan is None else plan['cases'],
+                },
+                'failure_signature_summary': provenance.get('failure_signature'),
+                'validation_summary': {
+                    'planned_pairs': None if plan is None else len(plan.get('pairs', plan['seeds'])),
+                    'completed_pairs': len(self.v2.list_pairs(memory.memory_id)),
+                    'decision': None if decision is None else decision['decision'],
+                    'failed_gates': [] if decision is None else decision['failed_gates'],
+                    'control_signature_count': None if decision is None else decision['report'].get('control_signature_count'),
+                    'treatment_signature_count': None if decision is None else decision['report'].get('treatment_signature_count'),
+                },
+                'source_label': provenance['source_kind'],
+            })
+        return rows
+
+    def get_dev_v2_memory_public(self, memory_id: str) -> dict[str, Any]:
+        row = next((item for item in self.list_dev_v2_memories() if item['memory_id'] == memory_id), None)
+        if row is None:
+            raise FileNotFoundError('unknown Dev v2 memory')
+        return row
 
     @evidence_operation
     def rollback(self, memory_id: str, *, actor: str, reason: str) -> MemoryRecord:

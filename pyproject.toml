@@ -9,7 +9,7 @@ description = "Evidence-gated AttentionBench memory authority and HTTP API"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-dependencies = ["fastapi>=0.100,<1", "pydantic>=2,<3", "uvicorn>=0.24,<1"]
+dependencies = ["fastapi>=0.100,<1", "pydantic>=2,<3", "uvicorn>=0.24,<1", "Pillow>=10,<13"]
 
 [tool.setuptools.packages.find]
 include = ["attention_memory_service*"]

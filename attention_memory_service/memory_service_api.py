@@ -204,6 +204,14 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     def imported_result(payload: ImportedResultInput):
         return guarded(service.record_dev_v2_result, **payload.model_dump())
 
+    @app.get('/dev-v2/memories', dependencies=[Depends(authorized)])
+    def dev_v2_memories(status: str | None = None):
+        return {'memories': guarded(service.list_dev_v2_memories, status=status)}
+
+    @app.get('/dev-v2/memories/{memory_id}', dependencies=[Depends(authorized)])
+    def dev_v2_memory(memory_id: str):
+        return guarded(service.get_dev_v2_memory_public, memory_id)
+
     def guarded(call, *args, **kwargs):
         try:
             return call(*args, **kwargs)

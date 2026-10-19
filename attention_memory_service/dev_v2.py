@@ -7,6 +7,9 @@ by the trusted execution/validation side. All reads recheck the pinned bytes.
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
+import io
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -29,6 +32,9 @@ SCOPE = ('benchmark', 'suite', 'task_id', 'robot', 'controller', 'perception_mod
 AXES = ('scene_id', 'object_set_id', 'camera_config_id', 'task_variant_id')
 PRIVATE = re.compile(r'reward|evaluator|native_success|_check_success|private|hidden|derived[_ ]diagnos|eval[_ ]diagnos', re.I)
 SHA = re.compile(r'[a-f0-9]{64}\Z')
+_VIEW_WORD = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af\U00020000-\U0002ebef]|[^\s\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af\U00020000-\U0002ebef]+')
+_CJK_WORD = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af\U00020000-\U0002ebef]\Z')
+_VIEW_ORACLE = re.compile(r'oracle|reward|score|native|simulator|evaluator|_check_success|private|hidden|diagnos', re.I)
 _OPERATION = ContextVar('dev_v2_evidence_operation', default=None)
 
 
@@ -95,6 +101,22 @@ def digest(data):
 def require(condition, message):
     if not condition:
         raise StateConflictError(message)
+
+
+def view_words(value):
+    return sum(1 for part in _VIEW_WORD.findall(value)
+               if _CJK_WORD.fullmatch(part) or any(char.isalnum() or char == '_' for char in part))
+
+
+def view_no_oracle(value):
+    if isinstance(value, dict):
+        require(all(isinstance(key, str) and not _VIEW_ORACLE.search(key) for key in value),
+                'request_view contains native evaluator/simulator oracle field')
+        for child in value.values():
+            view_no_oracle(child)
+    elif isinstance(value, list):
+        for child in value:
+            view_no_oracle(child)
 
 
 def public(value):
@@ -165,6 +187,38 @@ def public_trace_projection(trace):
         events.append(projected)
     return {'schema_version': 'attentionbench.dev-public-feedback.v1', 'execution_status': trace['status'],
             'public_error': str(trace.get('error') or '')[:1200], 'action_trace': events[-40:]}
+
+
+def signature_present(feedback, signature):
+    """Match a frozen failure type against one arm's public feedback only."""
+    error_class = signature['public_error_class']
+    operation = signature['operation']
+    error = feedback.get('public_error', '')
+    if not error.startswith(error_class) or error[len(error_class):len(error_class) + 1] not in {'', ':', ' ', '('}:
+        return False
+    return any(e.get('status') == 'failed' and
+               '.'.join(x for x in (e.get('source'), e.get('operation')) if x) == operation
+               for e in feedback.get('action_trace', []))
+
+
+def validate_signature(signature, feedback):
+    require(isinstance(signature, dict) and set(signature) == {'public_error_class', 'operation'}
+            and all(isinstance(v, str) and v.strip() and len(v) <= 120 for v in signature.values())
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:: [A-Za-z_][A-Za-z0-9_]*)*',
+                             signature['public_error_class']) is not None
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
+                             signature['operation']) is not None,
+            'public failure signature needs error class and operation')
+    public(signature)
+    require(signature_present(feedback, signature), 'candidate failure signature differs from source feedback')
+
+
+def stop_position(trace):
+    """Successful public SDK calls before termination, from the complete raw trace."""
+    operations = {'get_observation', 'find_objects', 'move_delta', 'open', 'close',
+                  'move_normalized', 'move_joints'}
+    return sum(e.get('operation') in operations and e.get('status') in {'completed', 'succeeded'}
+               for e in trace.get('sdk_events', []))
 
 
 class DevV2Evidence:
@@ -478,6 +532,115 @@ class DevV2Evidence:
         require(isinstance(v['permission_scope'], dict) and v['permission_scope'] == d['permission_scope'] and v['permission_scope'], 'permission scope not bound to trusted validation')
         return execution, d, bundle, artifacts, cell, v, safety_path
 
+    def _visual_advisor(self, catalog_id, config, bundle, advisor, model, help_value):
+        """Check the original visual request, response, frame bytes and ledger receipt."""
+        require(help_value.get('mode') == 'vision' and not help_value.get('rejected'), 'visual Advisor help must be answered in vision mode')
+        hint_ref = help_value.get('advisor_proxy')
+        require(isinstance(hint_ref, dict) and hint_ref == advisor.get('receipt', {}).get('advisor_answer'), 'visual Advisor help/ledger reference mismatch')
+        hint = self.ref(catalog_id, hint_ref)
+        view_ref = hint.get('request_view')
+        require(isinstance(view_ref, dict) and view_ref == advisor['receipt'].get('request_view'), 'visual Advisor request_view/ledger reference mismatch')
+        view = self.ref(catalog_id, view_ref)
+        view_no_oracle(view)
+        public(view)
+        require(hint.get('schema_version') == 'attentionbench.advisor-proxy.v3' and hint.get('kind') == 'hint'
+                and hint.get('request_type') == 'hint' and hint.get('status') == 'completed'
+                and hint.get('mode') == 'vision' and hint.get('requested') is True
+                and hint.get('cache_hit') is False and isinstance(hint.get('feedback'), str)
+                and hint['feedback'].strip() and hint['feedback'] == help_value.get('content'),
+                'completed original visual Advisor answer required')
+        proxy = config.get('advisor_proxy')
+        require(isinstance(proxy, dict) and proxy.get('enabled') is True and proxy.get('mode') == 'vision'
+                and isinstance(proxy.get('model'), str) and proxy['model'].strip()
+                and hint.get('model') == proxy['model'],
+                'visual Advisor model differs from configured Advisor model')
+        require(help_value.get('selected_moments') == hint.get('selected_moments')
+                and help_value.get('localization') == hint.get('localization'),
+                'visual Advisor selection/localization differs from help')
+        require(advisor['settled_at'] <= model['claimed_at'], 'visual Advisor answer settled after Dev model call')
+        require(isinstance(view, dict) and set(view) == {'schema_version', 'task', 'question', 'reasoning', 'request_kind',
+                'frames', 'steps', 'diff', 'eval_review', 'shown_video_seconds'}
+                and view['schema_version'] == 'attentionbench.request-view.v1', 'complete request_view v1 required')
+        require(isinstance(view['task'], dict) and set(view['task']) == {'task_id', 'task_prompt'}
+                and view['task'] == {'task_id': config['task_id'], 'task_prompt': config['task_prompt']}
+                and all(isinstance(view[k], str) for k in ('question', 'reasoning', 'diff'))
+                and view['question'].strip() and view['request_kind'] in {'targeted', 'generic'}
+                and isinstance(view['steps'], list)
+                and all(isinstance(s, dict) and set(s) == {'index', 'label', 'status', 'count', 'stop_reason'}
+                        and type(s['index']) is int and type(s['count']) is int and s['count'] > 0
+                        and all(isinstance(s[k], str) for k in ('label', 'status', 'stop_reason')) for s in view['steps'])
+                and isinstance(view['eval_review'], dict)
+                and set(view['eval_review']) == {'passed', 'reason', 'reference_suggestion'}
+                and type(view['eval_review']['passed']) is bool
+                and all(isinstance(view['eval_review'][k], str) for k in ('reason', 'reference_suggestion'))
+                and type(view['shown_video_seconds']) in (int, float)
+                and math.isfinite(view['shown_video_seconds']) and view['shown_video_seconds'] >= 0,
+                'request_view task/questions/steps/eval_review/video fields incomplete')
+        require(isinstance(view['frames'], list) and 0 < len(view['frames']) <= 10,
+                'request_view frames required')
+        require(isinstance(bundle.get('artifact_dir'), str) and bundle['artifact_dir'],
+                'visual frame episode path missing from failed execution')
+        episode = Path(bundle['artifact_dir'])
+        require(episode.is_absolute() and episode.is_relative_to(self.catalog(catalog_id)['root']),
+                'visual frame episode outside registered catalog')
+        frames = []
+        for frame in view['frames']:
+            require(isinstance(frame, dict) and set(frame) == {'view', 'sha256', 'filename', 'data_url'}
+                    and frame['view'] in {'overview', 'side', 'top', 'left_wrist', 'right_wrist'}
+                    and isinstance(frame['filename'], str) and frame['filename']
+                    and isinstance(frame['sha256'], str) and SHA.fullmatch(frame['sha256'])
+                    and isinstance(frame['data_url'], str) and frame['data_url'].startswith('data:image/jpeg;base64,')
+                    and len(frame['data_url']) > len('data:image/jpeg;base64,'),
+                    'request_view frame manifest incomplete')
+            relative = Path(frame['filename'])
+            require(not relative.is_absolute() and '..' not in relative.parts
+                    and (relative.parts[:1] == ('recording_frames',) and frame['view'] == 'overview'
+                         or relative.parts[:2] == ('recording_views', frame['view'])),
+                    'request_view frame path/view mismatch')
+            raw_frame = self.ref(catalog_id, {'uri': str(episode / relative), 'sha256': frame['sha256']}, raw=True)
+            # The archived data URL is a JPEG projection of the pinned frame,
+            # not the original frame bytes. Reproduce the producer's transform.
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(raw_frame)) as original:
+                    picture = original.convert('RGB')
+                    if picture.width > 768:
+                        picture = picture.resize((768, max(1, round(picture.height * 768 / picture.width))))
+                    projected = io.BytesIO()
+                    picture.save(projected, format='JPEG', quality=80)
+                shown = base64.b64decode(frame['data_url'].split(',', 1)[1], validate=True)
+            except (OSError, ValueError, binascii.Error) as exc:
+                raise StateConflictError('request_view frame image cannot be decoded') from exc
+            require(shown == projected.getvalue(), 'request_view image differs from pinned frame projection')
+            frames.append({k: frame[k] for k in ('filename', 'sha256', 'view')})
+        require(hint.get('frames') == frames and hint.get('views') == sorted({f['view'] for f in frames}),
+                'visual Advisor frames differ from request_view')
+        require(hint.get('question') == view['question'] and hint.get('shown_video_seconds') == view['shown_video_seconds'],
+                'visual Advisor question/video differs from request_view')
+        words = sum(view_words(x) for x in [view['question'], view['reasoning'], view['diff'],
+                    *(s['stop_reason'] for s in view['steps']), str(view['eval_review']['passed']),
+                    view['eval_review']['reason'], view['eval_review']['reference_suggestion']])
+        answer_words = view_words(hint['feedback'])
+        receipt = advisor['receipt']
+        require(all(type(hint.get(k)) in (int, float) and math.isfinite(hint[k]) for k in
+                    ('shown_words', 'answer_words', 'read_wps', 'write_wps', 'hint_human_seconds', 'logical_human_seconds'))
+                and hint['shown_words'] == words and hint['answer_words'] == answer_words
+                and hint['read_wps'] == 4.0 and hint['write_wps'] == 0.7
+                and math.isclose(hint['hint_human_seconds'], view['shown_video_seconds'] + words / 4.0 + answer_words / 0.7, rel_tol=1e-12)
+                and hint['logical_human_seconds'] == hint['hint_human_seconds']
+                and all(receipt.get(k) == hint[k] for k in ('shown_video_seconds', 'shown_words', 'answer_words', 'read_wps', 'write_wps'))
+                and advisor['actual'].get('hint_human_seconds') == hint['hint_human_seconds'],
+                'visual Advisor logical human time receipt disagrees with components')
+        usage = hint.get('usage')
+        require(isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in
+                    ('total_tokens', 'prompt_tokens', 'completion_tokens'))
+                and usage['total_tokens'] == usage['prompt_tokens'] + usage['completion_tokens']
+                and all(advisor['actual'].get(k) == usage[v] for k, v in
+                        [('provider_tokens', 'total_tokens'), ('input_tokens', 'prompt_tokens'), ('output_tokens', 'completion_tokens')])
+                and all(advisor['actual'].get(k) == 1 for k in ('advisor_calls', 'help_count', 'help_credits')),
+                'visual Advisor usage/committed cost receipt incomplete')
+        return hint['feedback'], view_ref, hint['model']
+
     def import_source(self, *, import_id, catalog_id, descriptor):
         d = self.read(catalog_id, descriptor)
         _, manifest, config, record, repair, cell = self._base(catalog_id, d)
@@ -486,29 +649,46 @@ class DevV2Evidence:
         with self._ledger(catalog_id, d) as db:
             advisor = self._job(db, d['advisor_job_id'], d['cell'], d['version'], 'advisor')
             model = self._job(db, d['model_job_id'], d['cell'], d['version'], 'model')
-            row = self._row(db, 'v2_planner_requests', 'id=?', (d['request_id'],))
-        ar, ao, ac = self._provider(catalog_id, advisor)
+            row = self._row(db, 'v2_planner_requests', 'id=?', (d['request_id'],)) if 'request_id' in d else None
         mr, mo, mc = self._provider(catalog_id, model)
         help_value = self.ref(catalog_id, record['help'])
-        require(help_value['provider'] == 'advisor' and not help_value.get('rejected') and help_value['content'] == ao['content'] and help_value['request'] == ac['request'] and help_value['response'] == ac['response'] and help_value['usage'] == ac['usage'], 'answered original Advisor guidance required')
-        require(isinstance(ao['content'], str) and ao['content'].strip(), 'nonempty answered guidance required')
-        require(row['binding'] == {'cell': d['cell'], 'version': d['version'], 'input_sha256': digest(json.dumps(ar['messages'], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()), 'source_sha256': failed['source']['sha256'], 'policy_id': cell['policy_id'], 'config_sha256': d['config']['sha256']}, 'Advisor request binding differs from original source/input/scope')
-        require(advisor['claimed_at'] <= row['created_at'] <= advisor['settled_at'] <= row['responded_at'] <= row['deadline_epoch'] and row['responded_at'] <= model['claimed_at'], 'Advisor response late or not available before actual adoption')
-        require(advisor['actual'].get('advisor_calls') == 1 and advisor['actual'].get('help_count') == 1 and advisor['actual'].get('help_credits') == 1 and model['actual'].get('dev_calls') == 1, 'committed assistance/model cost required')
-        require(row['cell'] == d['cell'] and row['version'] == d['version'] and row['request_type'] == 'advisor' and row['state'] == 'answered' and row['accepted'] is True and row['adopted'] is True and row['response'] == ac['response'] and row['adoption'] == {'model_input': mc['request'], 'result_source': record['source']}, 'answered/adopted request must bind actual generation')
+        provider = help_value.get('provider')
+        require(provider in {'advisor', 'human_proxy'}, 'unsupported Advisor provider')
+        if provider == 'advisor':
+            require(row is not None, 'original Advisor request row required')
+            ar, ao, ac = self._provider(catalog_id, advisor)
+            require(help_value['provider'] == 'advisor' and not help_value.get('rejected') and help_value['content'] == ao['content'] and help_value['request'] == ac['request'] and help_value['response'] == ac['response'] and help_value['usage'] == ac['usage'], 'answered original Advisor guidance required')
+            require(isinstance(ao['content'], str) and ao['content'].strip(), 'nonempty answered guidance required')
+            require(row['binding'] == {'cell': d['cell'], 'version': d['version'], 'input_sha256': digest(json.dumps(ar['messages'], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()), 'source_sha256': failed['source']['sha256'], 'policy_id': cell['policy_id'], 'config_sha256': d['config']['sha256']}, 'Advisor request binding differs from original source/input/scope')
+            require(advisor['claimed_at'] <= row['created_at'] <= advisor['settled_at'] <= row['responded_at'] <= row['deadline_epoch'] and row['responded_at'] <= model['claimed_at'], 'Advisor response late or not available before actual adoption')
+            require(advisor['actual'].get('advisor_calls') == 1 and advisor['actual'].get('help_count') == 1 and advisor['actual'].get('help_credits') == 1 and model['actual'].get('dev_calls') == 1, 'committed assistance/model cost required')
+            require(row['cell'] == d['cell'] and row['version'] == d['version'] and row['request_type'] == 'advisor' and row['state'] == 'answered' and row['accepted'] is True and row['adopted'] is True and row['response'] == ac['response'] and row['adoption'] == {'model_input': mc['request'], 'result_source': record['source']}, 'answered/adopted request must bind actual generation')
+            guidance, view_ref, advisor_model = ao['content'], None, None
+        else:
+            guidance, view_ref, advisor_model = self._visual_advisor(catalog_id, config, bundle, advisor, model, help_value)
+            require(model['actual'].get('dev_calls') == 1, 'committed Dev model cost required')
         require(record['model_input'] == mc['request'] and record['model_output'] == mc['response'], 'model input/output lineage mismatch')
         packet = json.loads(mr['messages'][-1]['content'])
-        advisor_packet = json.loads(ar['messages'][-1]['content'])
         expected_source = self.ref(failed['catalog_id'], failed['source'], raw=True).decode()
         expected_feedback = self.ref(failed['catalog_id'], failed['public_feedback'])
-        require(packet['previous_complete_source'] == expected_source and packet['public_feedback'] == expected_feedback and advisor_packet['previous_complete_source'] == expected_source and advisor_packet['public_feedback'] == expected_feedback, 'online help source/public failed trace mismatch')
-        require(packet['attention_control']['help']['provider'] == 'advisor' and packet['attention_control']['help']['content'] == ao['content'], 'guidance not actually present in generation input')
+        if provider == 'advisor':
+            advisor_packet = json.loads(ar['messages'][-1]['content'])
+            require(packet['previous_complete_source'] == expected_source and packet['public_feedback'] == expected_feedback and advisor_packet['previous_complete_source'] == expected_source and advisor_packet['public_feedback'] == expected_feedback, 'online help source/public failed trace mismatch')
+        else:
+            require(packet['previous_complete_source'] == expected_source and packet['public_feedback'] == expected_feedback,
+                    'online help source/public failed trace mismatch')
+        signature = d.get('failure_signature')
+        if signature is not None:
+            validate_signature(signature, expected_feedback)
+        require(packet['attention_control']['help']['provider'] == provider and packet['attention_control']['help']['content'] == guidance, 'guidance not actually present in generation input')
         generated = mo['content'].strip()
         if generated.startswith('```'):
             generated = re.sub(r'^```(?:json)?\s*|\s*```$', '', generated)
         require(json.loads(generated)['source'].encode() == repair, 'adopted source differs from actual model output')
-        public(ao['content']); public(repair.decode())
-        evidence = {'kind': 'source', 'catalog_id': catalog_id, 'descriptor': descriptor, 'failed_execution_import_id': d['failed_execution_import_id'], 'context': d['context'], 'request_id': d['request_id'], 'cell': d['cell'], 'version': d['version'], 'guidance': ao['content'], 'repair': repair.decode(), 'source_policy_sha256': failed['source']['sha256'], 'repair_sha256': record['source']['sha256'], 'source_policy_id': cell['policy_id'], 'source_seed': config['seed'], 'source_run_id': bundle['run_id'], 'source_attempt_id': bundle['attempt_id']}
+        public(guidance); public(repair.decode())
+        evidence = {'kind': 'source', 'catalog_id': catalog_id, 'descriptor': descriptor, 'failed_execution_import_id': d['failed_execution_import_id'], 'context': d['context'], 'request_id': d.get('request_id'), 'cell': d['cell'], 'version': d['version'], 'guidance': guidance, 'repair': repair.decode(), 'failure_signature': signature, 'source_policy_sha256': failed['source']['sha256'], 'repair_sha256': record['source']['sha256'], 'source_policy_id': cell['policy_id'], 'source_seed': config['seed'], 'source_run_id': bundle['run_id'], 'source_attempt_id': bundle['attempt_id']}
+        if provider == 'human_proxy':
+            evidence.update(provider=provider, request_view=view_ref, advisor_model=advisor_model, advisor_mode='vision')
         self._put('dev_v2_imports', import_id, evidence, kind='source')
         return evidence
 
@@ -522,7 +702,13 @@ class DevV2Evidence:
         require(type(created_at) in (int, float) and math.isfinite(created_at), 'finite candidate timestamp required')
         s = self.source(source_import_id)
         artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in SCOPE}}
+        if s['failure_signature'] is not None:
+            artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
+        if s.get('provider') == 'human_proxy':
+            provenance.update(provider='human_proxy', request_view=s['request_view'], advisor_model=s['advisor_model'], advisor_mode=s['advisor_mode'])
+        if s['failure_signature'] is not None:
+            provenance['failure_signature'] = s['failure_signature']
         candidate = MemoryRecord(memory_id=memory_id, version=1, source_trace_id=provenance['source_trace_id'], guidance=s['guidance'], candidate_repair=s['repair'], applicability=artifact['applicability'], evidence_refs=('dev-v2-source:' + source_import_id,), created_at=created_at)
         # Commit verified external provenance and candidate atomically. No legacy
         # trace row is invented to satisfy AttentionStore.create_memory.
@@ -554,6 +740,10 @@ class DevV2Evidence:
         require(exposure in {'none', 'candidate_validation'} and all(isinstance(x, str) and SHA.fullmatch(x) for x in (policy_sha256, config_sha256)), 'explicit exposure and code/config digests required')
         require(all(context[k] == memory.applicability[k] for k in SCOPE if k not in AXES), 'validation grant exact SDK/namespace/robot scope mismatch')
         require(any(case['seed'] == seed and all(case[k] == context[k] for k in (*AXES, 'camera_names', 'task_prompt')) for case in plan['cases']), 'validation grant outside frozen concrete case')
+        if plan.get('profile', 'default') == 'single_scene_v1':
+            arm = 'control_cell' if exposure == 'none' else 'treatment_cell'
+            require(any(pair[arm] == cell for pair in plan['pairs']), 'cell/exposure outside frozen single-scene pairs')
+            require(policy_sha256 == plan['validation_policy_sha256'] and config_sha256 == plan['validation_config_sha256'], 'single-scene policy/config differs from frozen plan')
         binding = dict(memory_id=memory_id, memory_version=memory.version, cell=cell, version=version, seed=seed,
                        context=context, policy_sha256=policy_sha256, config_sha256=config_sha256,
                        exposure=exposure, plan_sha256=digest(encoded(plan).encode()))
@@ -567,6 +757,8 @@ class DevV2Evidence:
                 return grant
             rows = db.execute('SELECT payload FROM dev_v2_validation_grants WHERE memory_id=?', (memory_id,)).fetchall()
             require(all(json.loads(row[0])['binding']['policy_sha256'] == policy_sha256 for row in rows), 'validation policy version is frozen across all cases')
+            if plan.get('profile', 'default') == 'single_scene_v1':
+                require(all(json.loads(row[0])['binding']['config_sha256'] == config_sha256 for row in rows), 'validation configuration is frozen across all single-scene arms')
             grant = {'schema_version': 'attentionbench.dev-v2-validation-grant.v1', 'grant_id': 'validation:' + uuid.uuid4().hex, 'issued_at': time.time(), 'binding': binding}
             db.execute('INSERT INTO dev_v2_validation_grants VALUES (?,?,?,?,?)', (grant['grant_id'], memory_id, cell, version, encoded(grant)))
         return grant
@@ -617,6 +809,16 @@ class DevV2Evidence:
         require(costs['credits'] == sum(j['actual'].get('help_credits', 0) for j in settled) and costs['tokens'] == sum(j['actual'].get('provider_tokens', 0) for j in settled), 'validation cost differs from original settled jobs')
         require(costs['seconds'] == artifacts['sandbox_receipt']['elapsed_seconds'], 'trial time differs from native receipt')
         trial = {'run_id': bundle['run_id'], 'run': {'suite': bundle['suite'], 'task_id': bundle['task_id'], 'seed': bundle['seed'], 'policy_id': cell['policy_id'], 'execution_target': 'simulator', 'developer_model': d['developer_model'], 'budget': d['budget']}, 'success': bundle['native_success'], 'attempt_status': 'succeeded' if bundle['native_success'] else 'failed', 'evaluator_authoritative': True, 'mode': execution['context']['perception_mode'], 'memory_ids': ids, 'exposure': exposure, 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'variation': {k: execution['context'][k] for k in (*AXES, 'camera_names', 'task_prompt')}, 'context': execution['context'], **costs}
+        if plan.get('profile', 'default') == 'single_scene_v1':
+            signature = manager.provenance(binding['memory_id'])['failure_signature']
+            feedback = public_trace_projection(artifacts['trace'])
+            present = signature_present(feedback, signature)
+            position = stop_position(artifacts['trace'])
+            require(verdict.get('failure_signature') == signature and
+                    verdict.get('signature_present') is present and
+                    type(verdict.get('stop_position')) is int and verdict['stop_position'] == position,
+                    'independent signature/stop-position verdict differs from original public trace')
+            trial.update(signature_present=present, stop_position=position, validation_cell=ed['cell'])
         # Shared comparison configuration is an actual preregistered file, with
         # no arm/seed/outcome fields. The per-episode config remains SHA-bound.
         comparison = self.ref(catalog_id, d['validation_config'])

@@ -3,7 +3,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from attention_memory_service.dev_v2 import digest, encoded
+from attention_memory_service.dev_v2 import digest, encoded, public_trace_projection
 
 
 class Fixture:
@@ -29,9 +29,11 @@ class Fixture:
         path.write_bytes((encoded(value) + '\n').encode() if not isinstance(value, str) else value.encode())
         return {'uri': str(path), 'sha256': digest(path.read_bytes())}
 
-    def make(self, name, seed=101, variant=0, success=False, code='def policy(sdk):\n    pass\n', exposure='none', memory_id=None):
+    def make(self, name, seed=101, variant=0, success=False, code='def policy(sdk):\n    pass\n', exposure='none', memory_id=None, failure=False, completed_calls=None, visual=False):
         directory = self.root / name; directory.mkdir()
         config = {'task_id': 'pick', 'seed': seed, 'robot': 'OpenArm365', 'controller': 'test_controller', 'perception_mode': 'sim_gt', 'scene_id': f'scene-{variant}', 'object_set_id': f'objects-{variant}', 'camera_names': [f'camera-{variant}'], 'task_prompt': f'pick cup variant {variant}', 'camera_width': 64, 'camera_height': 64, 'randomize_cameras': False, 'official_env': 'PickPlaceCounterToSink', 'layout_id': 11 + variant, 'style_id': 34, 'base_mode': 'fixed', 'evidence_kind': 'controlled_test', 'sdk_call_limit': 80, 'horizon': 2400, 'attempt_wall_seconds': 480}
+        if visual:
+            config['advisor_proxy'] = {'enabled': True, 'mode': 'vision', 'model': 'controlled_test_visual_advisor'}
         camera = {k: config[k] for k in ('camera_names', 'camera_width', 'camera_height', 'randomize_cameras')}
         ctx = {k: config[k] for k in ('task_id', 'robot', 'controller', 'perception_mode', 'scene_id', 'object_set_id', 'camera_names', 'task_prompt')}
         ctx.update(benchmark='AttentionBench', suite='robocasa365', namespace='controlled_test_only', sdk_sha256=self.sdk_sha, camera_config_id='robocasa365:' + digest(json.dumps(camera, sort_keys=True, ensure_ascii=False).encode()), task_variant_id=f"PickPlaceCounterToSink:layout{11+variant}:style34:fixed")
@@ -44,14 +46,22 @@ class Fixture:
         record = {'version': 1, 'formal_eligible': False, 'valid': True, 'source': source, 'manifest': mref, 'config_sha256': config_ref['sha256']}
         vref = self.write(directory / 'version.json', record)
         binding = {'run_id': 'run:' + name, 'attempt_id': 'attempt:' + name + ':0', 'suite': 'robocasa365', 'task_id': 'pick', 'seed': seed, 'policy_sha256': source['sha256'], 'config_sha256': config_ref['sha256']}
-        trace = self.write(directory / 'trace.json', {**binding, 'status': 'completed', 'evidence_kind': 'controlled_test'})
+        trace_value = {**binding, 'status': 'completed', 'evidence_kind': 'controlled_test'}
+        if failure or completed_calls is not None:
+            trace_value['sdk_events'] = [{'operation': 'get_observation', 'source': 'sensors', 'status': 'completed'} for _ in range(1 if completed_calls is None else completed_calls)]
+            if failure:
+                trace_value['error'] = 'RuntimeError: TimeoutError'
+                trace_value['sdk_events'].append({'operation': 'move_delta', 'source': 'left_arm', 'status': 'failed'})
+        trace = self.write(directory / 'trace.json', trace_value)
         native_value = {'run_id': binding['run_id'], 'attempt_id': binding['attempt_id'], 'status': 'completed', 'evaluated': True, 'native_success': success, 'evidence_kind': 'controlled_test'}
         native = self.write(directory / 'native.json', native_value)
         receipt = self.write(directory / 'sandbox.json', {**{k: binding[k] for k in ('run_id', 'attempt_id')}, 'sdk_call_budget': {'dispatched': 1}, 'control_steps': 1, 'elapsed_seconds': 1.0, 'evidence_kind': 'controlled_test'})
         safety = self.write(directory / 'safety.json', {**{k: binding[k] for k in ('run_id', 'attempt_id')}, 'evidence_kind': 'controlled_test'})
         bundle = {**binding, 'schema_version': 'attentionbench.formal-runner-result.v1', 'channel': 'dev_v2', 'formal_eligible': False, 'dev_version': 1, 'policy_id': 'full_trace_aware_attention_planner', 'config_lock': config_ref, 'status': 'completed', 'native_success': success, 'native_evaluator': native_value, 'infrastructure_failure': False, 'outcome_unknown': False, 'sandbox': {'process_isolated': True, 'sdk_rpc_only': True, 'deadline_enforced': True, 'action_cancellation_verified': True}, 'scene_condition': {'matched': True}, 'artifacts': {'trace': trace, 'native_result': native, 'sandbox_receipt': receipt, 'safety': safety}, 'evidence_kind': 'controlled_test'}
+        if visual:
+            bundle['artifact_dir'] = str(directory)
         bref = self.write(directory / 'bundle.json', bundle)
-        feedback = self.write(directory / 'feedback.json', {'schema_version': 'attentionbench.dev-public-feedback.v1', 'execution_status': 'completed', 'public_error': '', 'action_trace': [], 'evidence_kind': 'controlled_test'})
+        feedback = self.write(directory / 'feedback.json', {**public_trace_projection(trace_value), 'evidence_kind': 'controlled_test'})
         validation_input = self.write(directory / 'validation-input.json', {'memory_ids': [] if exposure == 'none' else [memory_id], 'exposure': exposure, 'context': ctx, 'policy_sha256': source['sha256'], 'config_sha256': config_ref['sha256']})
         cell = {'experiment_id': name, 'policy_id': bundle['policy_id'], 'budget': budget}
         job = {'job_id': name + '-execute', 'cell': name, 'version': 1, 'kind': 'execute', 'claimed_at': 1.0, 'settled_at': 2.0, 'actual': {'executions': 1, 'sdk_calls': 1, 'control_steps': 1, 'execution_seconds': 1.0}, 'receipt': {'bundle': bref, 'trace': trace, 'native_result': native, 'execution_status': 'completed', 'public_feedback': feedback}}
@@ -77,7 +87,7 @@ class Fixture:
         self.records[name] = value
         return value
 
-    def add_advice(self, failed):
+    def add_advice(self, failed, failure_signature=None):
         name = failed['name']; directory = self.root / name; d = failed['descriptor']; ledger = Path(d['ledger']['uri'])
         code = 'def policy(sdk):\n    # controlled_test repair\n    pass\n'
         source = self.write(directory / 'repair.py', code)
@@ -108,6 +118,8 @@ class Fixture:
         d['ledger']['sha256'] = digest(ledger.read_bytes())
         self.write(directory / 'execution.json', d)
         source_d = {**d, 'version': 2, 'version_record': vref, 'failed_execution_import_id': name, 'validator_id': 'validator-' + name, 'validation_descriptor': name + '/verdict.json', 'advisor_job_id': jobs[0]['job_id'], 'model_job_id': jobs[1]['job_id'], 'request_id': 'help-' + name}
+        if failure_signature is not None:
+            source_d['failure_signature'] = failure_signature
         self.write(directory / 'source.json', source_d)
         return source_d
 
