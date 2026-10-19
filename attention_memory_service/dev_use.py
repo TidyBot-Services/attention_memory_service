@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .core.models import MemoryStatus
 from .core.store import StateConflictError
+from .seeded_notes import flags, is_test_seeded
 
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -52,6 +53,7 @@ class DevMemoryUse:
         if memory is None:
             raise StateConflictError("memory is not trusted or applicable to Dev context")
         provenance = self.service.v2._provenance(memory_id)
+        marker = flags(provenance)
         if provenance and provenance.get('channel') == 'dev_v2':
             if type(memory_version) is not int or memory_version != memory.version:
                 raise StateConflictError('explicit exact trusted Memory version required')
@@ -97,6 +99,7 @@ class DevMemoryUse:
                 "evidence_refs": list(memory.evidence_refs),
                 "exposed_at": time.time(),
                 "result": None,
+                **marker,
             }
             db.execute(
                 "INSERT INTO memory_dev_exposures(grant_id, memory_id, development_id, payload) "
@@ -122,6 +125,8 @@ class DevMemoryUse:
         if grant_row:
             grant = json.loads(grant_row[0])
             provenance = self.service.v2._provenance(grant['memory_id'])
+            if is_test_seeded(provenance):
+                raise StateConflictError('test-seeded exposure is excluded from Dev results')
             if provenance and provenance.get('channel') == 'dev_v2':
                 raise StateConflictError('Dev v2 results require offline sealed bundle import')
         run = self.service.store.get_run(run_id)
@@ -185,7 +190,7 @@ class DevMemoryUse:
             raise StateConflictError("unknown Dev Memory grant")
         record = json.loads(row[0])
         provenance = self.service.v2._provenance(record['memory_id'])
-        if provenance and provenance.get('channel') == 'dev_v2':
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded'}:
             # New-channel reads release guidance again. Preserve the legacy
             # historical-read API; enforce live eligibility on Dev v2 grants.
             with sqlite3.connect(self.service.store.path) as db:

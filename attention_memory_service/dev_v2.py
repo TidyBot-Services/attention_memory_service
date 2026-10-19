@@ -879,6 +879,8 @@ class DevV2Evidence:
             row = db.execute('SELECT payload FROM memory_dev_exposures WHERE grant_id=?', (grant_id,)).fetchone()
         require(row is not None, 'unknown Dev Memory grant')
         grant = json.loads(row[0])
+        require(grant.get('excluded_from_results') is not True,
+                'test-seeded exposure is excluded from Dev results')
         result = self._result_evidence(grant, execution_import_id)
         with sqlite3.connect(self.store.path) as db:
             db.execute('BEGIN IMMEDIATE')

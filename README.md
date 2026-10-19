@@ -100,6 +100,40 @@ repair text, grant bodies, import descriptors, sealed evidence, and keys remain
 behind importer authorization. The existing generic `/memories` list continues
 to omit Dev v2 rows; the UI must call these new read-only routes to show them.
 
+### Importer-only test-seeded notes
+
+`POST /dev-v2/test-seeded-notes` exists to exercise a real Dev Memory read,
+disable, expiry, and rollback cycle before a candidate has passed validation.
+It requires both the service API key and the distinct offline importer key;
+the online key, even paired with the operator key, receives 403. This is **test-only**
+guidance, never a validation path or evidence of Memory effectiveness.
+
+The JSON body requires `actor`, `reason`, `memory_id`, `context`, and
+`guidance`; `repair` is optional. `context` contains the exact Dev v2 scope
+(`benchmark`, `suite`, `task_id`, `robot`, `controller`, `perception_mode`,
+`scene_id`, `object_set_id`, `camera_config_id`, `task_variant_id`,
+`sdk_sha256`, `namespace`) plus integer `seed`, ordered `camera_names`,
+`task_prompt`, and `scene_contract_ref: {"uri": "...", "sha256": "..."}`.
+Every field must match at retrieval, including the scene contract reference.
+The response contains `memory_id`, `version`, `status`,
+`source_kind: "seeded_for_tests"`, `source_label: "seeded for tests"`,
+`trust_scope: "test_seeded"`, `seeded_for_tests: true`, and
+`excluded_from_results: true`. Repeating the same `memory_id` and note content
+is idempotent; changing the content is a conflict. The first write records
+actor, reason, and server time in the audit event.
+
+These notes have a retrievable `trusted` lifecycle state but are **not**
+`scene_scoped_trusted` or multi-scene trusted. They have no validation plan,
+pairs, decision, or impact report. Promotion and evaluation reject them;
+default and `single_scene_v1` gates remain unchanged. Retrieval, use grants,
+Dev exposure grants, and use records carry the exclusion flags. Downstream
+run and report code must exclude every entry with `excluded_from_results=true`
+from evaluation, success, and effect statistics. Dev result recording also
+rejects these grants. The public Dev v2 catalogue shows the source label,
+scope and exclusion flag but only guidance length and SHA-256, never guidance
+or repair text. Operator disable/enable, expiry and rollback follow the normal
+lifecycle; expired and rolled-back notes cannot be enabled again.
+
 The Service rejects a safety artifact whose `unsafe_attempts` disagrees with
 its violation list, or which has no monitor events; a claimed source label
 alone is not sufficient evidence. This is an integrity check on the recorded

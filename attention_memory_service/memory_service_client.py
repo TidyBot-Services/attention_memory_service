@@ -15,6 +15,8 @@ from .core.store import StateConflictError
 
 def _memory(value: dict[str, Any]) -> MemoryRecord:
     payload = dict(value)
+    for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope'):
+        payload.pop(key, None)
     payload["status"] = MemoryStatus(payload["status"])
     payload["evidence_refs"] = tuple(payload["evidence_refs"])
     return MemoryRecord(**payload)
@@ -85,6 +87,9 @@ class MemoryServiceClient:
     def create_dev_v2_candidate(self, **payload):
         return _memory(self._call('POST', '/dev-v2/candidates', payload, importer=True))
 
+    def create_test_seeded_note(self, **payload) -> dict[str, Any]:
+        return self._call('POST', '/dev-v2/test-seeded-notes', payload, importer=True)
+
     def record_dev_v2_pair(self, **payload):
         return self._call('POST', '/dev-v2/pairs', payload, importer=True)
 
@@ -100,10 +105,12 @@ class MemoryServiceClient:
 
     def retrieve(self, context: dict[str, Any], *, now: float) -> list[MemoryRecord]:
         return [
-            _memory(item) for item in self._call(
-                "POST", "/retrieve", {"context": context, "now": now},
-            )
+            _memory(item) for item in self.retrieve_entries(context, now=now)
         ]
+
+    def retrieve_entries(self, context: dict[str, Any], *, now: float) -> list[dict[str, Any]]:
+        """Raw retrieval records retain test-seed/result-exclusion flags."""
+        return self._call('POST', '/retrieve', {'context': context, 'now': now})
 
     def authorize_use(
         self, context: dict[str, Any], *, memory_id: str,
@@ -141,6 +148,8 @@ class MemoryServiceClient:
 
     def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
         payload = self._call("POST", "/uses", use.artifact())
+        for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope'):
+            payload.pop(key, None)
         payload["evidence_refs"] = tuple(payload.get("evidence_refs", ()))
         return MemoryUseRecord(**payload)
 

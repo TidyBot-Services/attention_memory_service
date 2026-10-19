@@ -20,6 +20,7 @@ from .core.memory import MemoryManager
 from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord, RequestType
 from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
+from .seeded_notes import is_test_seeded, flags, TUPLE_KEYS
 
 
 def _digest(data: bytes) -> str:
@@ -124,6 +125,7 @@ class MemoryV2Manager:
                 "context": context,
                 "used_at": issued_at,
             }
+            grant.update(flags(self._provenance(memory_id)))
             db.execute(
                 "INSERT INTO memory_v2_use_grants(grant_id, memory_id, attempt_id, payload) "
                 "VALUES (?, ?, ?, ?)",
@@ -424,6 +426,13 @@ class MemoryV2Manager:
                     or value['artifact'].get('failure_signature') != source.get('failure_signature')):
                 raise StateConflictError("Dev v2 source/Memory binding changed")
             return value
+        if value.get('channel') == 'test_seeded':
+            if (not is_test_seeded(value)
+                    or memory.applicability != value['artifact']['applicability']
+                    or memory.source_trace_id != value['source_trace_id']
+                    or value['source_seed'] != memory.applicability['seed']):
+                raise StateConflictError('test-seeded provenance binding changed')
+            return value
         request = self.store.get_request(value["request_id"])
         response = self.store.get_response(value["response_id"])
         if (
@@ -525,11 +534,20 @@ class MemoryV2Manager:
         if context.get("perception_mode") not in {"sim_gt", "vision"}:
             raise ValueError("retrieval requires explicit perception mode")
         matches = MemoryManager(self.store).retrieve(context, now=now)
+        matches.extend(memory for memory in self.store.list_memories()
+                       if memory.status is MemoryStatus.TRUSTED
+                       and is_test_seeded(self._provenance(memory.memory_id))
+                       and memory not in matches)
         result = []
         for item in matches:
             if self._provenance(item.memory_id) is None:
                 continue
             provenance = self.provenance(item.memory_id)
+            if is_test_seeded(provenance):
+                if set(context) != TUPLE_KEYS or context != item.applicability:
+                    continue
+                result.append(item)
+                continue
             plan = self.get_plan(item.memory_id)
             if plan and plan.get('profile', 'default') == 'single_scene_v1':
                 from .dev_v2 import SCOPE
@@ -720,6 +738,8 @@ class MemoryV2Manager:
 
     def impact_report(self, memory_id: str) -> dict[str, Any]:
         provenance = self.provenance(memory_id)
+        if is_test_seeded(provenance):
+            raise StateConflictError('test-seeded notes are excluded from impact reports')
         plan = self.get_plan(memory_id)
         single = plan is not None and plan.get('profile', 'default') == 'single_scene_v1'
         pairs = self.list_pairs(memory_id)
@@ -988,6 +1008,8 @@ class MemoryV2Manager:
         The decision, its gates and the full impact report are kept so a rejected
         candidate stays explainable. An incomplete plan is not a verdict.
         """
+        if is_test_seeded(self._provenance(memory_id)):
+            raise StateConflictError('test-seeded notes cannot be evaluated')
         memory = self.store.get_memory(memory_id)
         if memory is None:
             raise StateConflictError("unknown memory")
@@ -1043,6 +1065,8 @@ class MemoryV2Manager:
     def verify_source_evidence(self, memory_id: str) -> None:
         """Fail closed if the candidate's original artifact bytes are gone."""
         provenance = self.provenance(memory_id)
+        if is_test_seeded(provenance):
+            raise StateConflictError('test-seeded notes are excluded from validation evidence')
         if provenance.get("channel") == "dev_v2":
             # provenance() reopens the sealed ledger and all original receipts.
             return

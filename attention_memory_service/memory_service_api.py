@@ -22,6 +22,7 @@ from .core.models import MemoryUseRecord
 from .core.store import StateConflictError
 from .identity import store_id
 from .memory_service import MemoryService
+from .seeded_notes import flags
 
 
 class CandidateInput(BaseModel):
@@ -129,6 +130,16 @@ class ValidationGrantInput(BaseModel):
     exposure: str
 
 
+class SeededNoteInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    actor: str
+    reason: str
+    memory_id: str
+    context: dict[str, Any]
+    guidance: str
+    repair: str = ''
+
+
 def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None,
                importer_key: str | None = None,
                dev_v2_catalogs: dict[str, Any] | None = None) -> FastAPI:
@@ -165,13 +176,14 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                                   x_memory_service_key: str | None = Header(default=None),
                                   x_memory_importer_key: str | None = Header(default=None)):
         provenance = service.v2._provenance(request.path_params['memory_id'])
-        if provenance and provenance.get('channel') == 'dev_v2':
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded'}:
             importer_authorized(x_memory_service_key, x_memory_importer_key)
 
     def online_memory(memory):
         value = memory.artifact()
         provenance = service.v2._provenance(memory.memory_id)
-        if provenance and provenance.get('channel') == 'dev_v2':
+        value.update(flags(provenance))
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded'}:
             for key in ('confidence', 'validation_successes', 'validation_failures', 'status_reason'):
                 value.pop(key, None)
         return value
@@ -195,6 +207,10 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     @app.post('/dev-v2/candidates', dependencies=[Depends(importer_authorized)])
     def imported_candidate(payload: ImportedCandidateInput):
         return guarded(service.create_dev_v2_candidate, **payload.model_dump()).artifact()
+
+    @app.post('/dev-v2/test-seeded-notes', dependencies=[Depends(importer_authorized)])
+    def test_seeded_note(payload: SeededNoteInput):
+        return guarded(service.create_test_seeded_note, **payload.model_dump())
 
     @app.post('/dev-v2/pairs', dependencies=[Depends(importer_authorized)])
     def imported_pair(payload: ImportedPairInput):
@@ -271,9 +287,10 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
 
     @app.post("/uses", dependencies=[Depends(authorized)])
     def use(payload: UseInput):
-        return guarded(
+        result = guarded(
             service.record_use, MemoryUseRecord(**payload.model_dump())
-        ).artifact()
+        )
+        return {**result.artifact(), **flags(service.v2._provenance(result.memory_id))}
 
     @app.post("/pairs", dependencies=[Depends(authorized)])
     def pair(payload: PairInput):

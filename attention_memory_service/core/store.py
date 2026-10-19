@@ -392,7 +392,8 @@ class AttentionStore:
         return [self._decode_memory(value) for value in self._list_payloads("memories")]
 
     def record_memory_use(
-        self, use: MemoryUseRecord, *, allow_revoked_after_retrieval: bool = False
+        self, use: MemoryUseRecord, *, allow_revoked_after_retrieval: bool = False,
+        markers: dict[str, Any] | None = None,
     ) -> MemoryUseRecord:
         memory = self.get_memory(use.memory_id)
         if memory is None:
@@ -411,7 +412,7 @@ class AttentionStore:
         if self.get_attempt(use.attempt_id)["run_id"] != use.run_id:
             raise StateConflictError("memory use run does not match its attempt")
         self._insert_immutable(
-            "memory_uses", use.use_id, use.artifact(), "memory.used"
+            "memory_uses", use.use_id, {**use.artifact(), **(markers or {})}, "memory.used"
         )
         return use
 
