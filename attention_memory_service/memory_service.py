@@ -384,6 +384,8 @@ class MemoryService:
             rows.append({
                 'memory_id': memory.memory_id, 'version': memory.version,
                 'title': provenance.get('title'),
+                'summary': provenance.get('summary'),
+                'group': provenance.get('group'),
                 'status': memory.status.value, 'trust_scope': scope,
                 'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped' else None,
                 'profile': None if plan is None else plan.get('profile', 'default'),

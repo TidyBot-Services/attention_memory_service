@@ -59,6 +59,52 @@ def test_candidate_without_title_has_null_public_title(source_setup):
     assert service.get_dev_v2_memory_public('m1')['title'] is None
 
 
+def test_candidate_summary_group_from_sealed_descriptor(tmp_path):
+    f = Fixture(tmp_path)
+    failed = f.make('failed')
+    descriptor = f.add_advice(failed)
+    descriptor.update(summary='  Moves the arm in small steps  ',
+                      group='  ReCoVeR   Phase-2  ')
+    f.write(f.root / 'failed/source.json', descriptor)
+    service = MemoryService(tmp_path / 'authority.sqlite', dev_v2_catalogs=f.seal())
+    service.import_dev_v2_execution(import_id='failed', catalog_id='failed', descriptor='failed/execution.json')
+    source = service.import_dev_v2_source(import_id='source', catalog_id='failed', descriptor='failed/source.json')
+    expected = {'summary': 'Moves the arm in small steps', 'group': 'ReCoVeR Phase-2'}
+    assert {key: source[key] for key in expected} == expected
+    service.create_dev_v2_candidate(memory_id='labeled', source_import_id='source', created_at=1.0)
+    assert {key: service.v2.provenance('labeled')[key] for key in expected} == expected
+    for row in (service.list_dev_v2_memories()[0], service.get_dev_v2_memory_public('labeled')):
+        assert {key: row[key] for key in expected} == expected
+        assert source['guidance'] not in str(row) and source['repair'] not in str(row)
+    assert service.create_dev_v2_candidate(memory_id='labeled', source_import_id='source',
+                                           created_at=1.0).memory_id == 'labeled'
+
+
+def test_candidate_without_summary_group_has_null_public_fields(source_setup):
+    _, service, source, _ = candidate(source_setup)
+    for field in ('summary', 'group'):
+        assert field not in source
+        assert field not in service.v2.provenance('m1')
+        assert service.get_dev_v2_memory_public('m1')[field] is None
+
+
+@pytest.mark.parametrize('field, value', [
+    ('summary', ' '), ('summary', 'x' * 81), ('summary', 'has\nnewline'),
+    ('summary', 'https://example.com'), ('summary', '<markup>'),
+    ('group', ' '), ('group', 'x' * 25), ('group', 'has\nnewline'),
+    ('group', 'A_B'), ('group', '<markup>'),
+])
+def test_candidate_descriptor_rejects_invalid_summary_group(tmp_path, field, value):
+    f = Fixture(tmp_path)
+    failed = f.make('failed')
+    descriptor = f.add_advice(failed)
+    descriptor[field] = value
+    f.write(f.root / 'failed/source.json', descriptor)
+    service = MemoryService(tmp_path / 'authority.sqlite', dev_v2_catalogs=f.seal())
+    with pytest.raises(ValueError, match=field):
+        service.import_dev_v2_source(import_id='source', catalog_id='failed', descriptor='failed/source.json')
+
+
 @pytest.mark.parametrize('title', [' ', 'x' * 81, 'has\nnewline', 'https://example.com',
                                       '../path', 'sk-' + 'a' * 24, 'oracle check'])
 def test_candidate_descriptor_rejects_invalid_title(tmp_path, title):

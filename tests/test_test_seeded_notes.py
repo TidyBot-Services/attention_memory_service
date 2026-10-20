@@ -11,6 +11,7 @@ from attention_memory_service.core.models import MemoryUseRecord
 from attention_memory_service.dev_v2 import SCOPE
 from attention_memory_service.memory_service import MemoryService
 from attention_memory_service.memory_service_api import SeededNoteInput, create_app
+from attention_memory_service.memory_service_client import MemoryServiceClient
 from tests.test_sync_legacy_routes import sync_request
 from tests.test_store import populated_store
 
@@ -88,6 +89,117 @@ def test_seeded_title_is_public_trimmed_and_part_of_idempotence(tmp_path):
     assert svc.create_test_seeded_note(**untitled)['memory_id'] == 'seed-2'
     assert svc.get_dev_v2_memory_public('seed-2')['title'] is None
     assert 'title' not in svc.v2.provenance('seed-2')
+
+
+def test_seeded_summary_and_group_are_public_and_part_of_idempotence(tmp_path):
+    svc = service(tmp_path)
+    req = {**payload(), 'summary': '  Moves the arm in small steps  ',
+           'group': '  ReCoVeR   Phase-2  '}
+    svc.create_test_seeded_note(**req)
+    expected = {'summary': 'Moves the arm in small steps', 'group': 'ReCoVeR Phase-2'}
+    assert {key: svc.v2.provenance('seed-1')[key] for key in expected} == expected
+    for row in (svc.list_dev_v2_memories()[0], svc.get_dev_v2_memory_public('seed-1')):
+        assert {key: row[key] for key in expected} == expected
+        assert req['guidance'] not in str(row) and req['repair'] not in str(row)
+    assert expected['group'].casefold() == 'recover phase-2'.casefold()
+    assert svc.create_test_seeded_note(**{**req, **expected})['memory_id'] == 'seed-1'
+    for changed in ({'summary': 'Different description'}, {'group': 'Approach'},
+                    {'group': 'recover phase-2'}, {'summary': None}, {'group': None}):
+        with pytest.raises(StateConflictError, match='different content'):
+            svc.create_test_seeded_note(**{**req, **changed})
+    old = {**payload(), 'memory_id': 'seed-2'}
+    svc.create_test_seeded_note(**old)
+    assert svc.create_test_seeded_note(**old)['memory_id'] == 'seed-2'
+    assert {'summary': None, 'group': None} == {
+        key: svc.get_dev_v2_memory_public('seed-2')[key] for key in expected}
+    assert not {'summary', 'group'} & svc.v2.provenance('seed-2').keys()
+
+
+def test_seeded_old_request_fingerprint_canary(tmp_path):
+    svc = service(tmp_path)
+    svc.create_test_seeded_note(**payload())
+    # This digest was produced by the request format at commit 8b58265.
+    assert svc.v2.provenance('seed-1')['request_sha256'] == (
+        '102949d2e58ba655d9caea1970b4978252dcb3fdd42d2f97938a7a259d09fb2f')
+    titled = {**payload(), 'memory_id': 'seed-2', 'title': 'Take small steps'}
+    svc.create_test_seeded_note(**titled)
+    assert svc.v2.provenance('seed-2')['request_sha256'] == (
+        '30ac7e08d063feade31a33ac30c7ff55dd9742e3114a3dbb89d7c38d3436cb2d')
+    reopened = service(tmp_path)
+    assert reopened.create_test_seeded_note(**payload())['memory_id'] == 'seed-1'
+    assert reopened.create_test_seeded_note(**titled)['memory_id'] == 'seed-2'
+
+
+@pytest.mark.parametrize('field, value, message', [
+    ('summary', ' ', '1–80'), ('summary', 'x' * 81, '1–80'),
+    ('summary', 'First\nsecond', 'newline'), ('summary', 'A\x00B', 'control'),
+    ('summary', 'See https://example.com', 'URL'), ('summary', '../path', 'path'),
+    ('summary', 'sk-' + 'a' * 24, 'key-like'), ('summary', 'oracle check', 'oracle'),
+    ('summary', '<b>markup</b>', 'plain text'),
+    ('group', ' ', '1–24'), ('group', 'x' * 25, '1–24'),
+    ('group', 'First\nsecond', 'newline'), ('group', 'A\x00B', 'control'),
+    ('group', 'A\tB', 'control'), ('group', 'A_B', 'letters'),
+    ('group', 'A/B', 'letters'), ('group', 'A.B', 'letters'),
+    ('group', '<b>', 'letters'),
+])
+def test_seeded_summary_and_group_validation(tmp_path, field, value, message):
+    with pytest.raises(ValidationError, match=message):
+        SeededNoteInput.model_validate({**payload(), field: value})
+    with pytest.raises(ValueError, match=message):
+        service(tmp_path).create_test_seeded_note(**{**payload(), field: value})
+
+
+@pytest.mark.parametrize('field, value', [
+    ('summary', 'x'), ('summary', 'Small step ' * 7 + 'arm'),
+    ('group', 'x'), ('group', 'x' * 24), ('group', 'Approach-2'),
+])
+def test_seeded_summary_and_group_valid_boundaries(tmp_path, field, value):
+    assert getattr(SeededNoteInput.model_validate({**payload(), field: value}), field) == value
+    assert service(tmp_path).create_test_seeded_note(**{**payload(), field: value})['memory_id'] == 'seed-1'
+
+
+@pytest.mark.parametrize('field', ['summary', 'group'])
+def test_seeded_explicit_null_is_rejected_by_http_input(field):
+    with pytest.raises(ValidationError, match=f'{field} must be a string'):
+        SeededNoteInput.model_validate({**payload(), field: None})
+
+
+def test_seeded_summary_group_http_and_importer_only(tmp_path):
+    app = create_app(tmp_path / 'memory.sqlite', api_key=API, importer_key=IMPORTER)
+    req = {**payload(), 'summary': '  Moves the arm in small steps  ',
+           'group': '  ReCoVeR   Phase-2  '}
+    status, _ = sync_request(app, '/dev-v2/test-seeded-notes', method='POST',
+                             payload=req, key=API)
+    assert status == 403
+    status, _ = sync_request(app, '/dev-v2/test-seeded-notes', method='POST',
+                             payload=req, key=API, importer_key=IMPORTER)
+    assert status == 200
+    for path in ('/dev-v2/memories', '/dev-v2/memories/seed-1'):
+        status, result = sync_request(app, path, key=API)
+        assert status == 200
+        row = result['memories'][0] if 'memories' in result else result
+        assert row['summary'] == 'Moves the arm in small steps'
+        assert row['group'] == 'ReCoVeR Phase-2'
+        assert req['guidance'] not in str(row) and req['repair'] not in str(row)
+    for field in ('summary', 'group'):
+        with pytest.raises(ValidationError, match=f'{field} must be a string'):
+            sync_request(app, '/dev-v2/test-seeded-notes', method='POST',
+                         payload={**req, field: None}, key=API,
+                         importer_key=IMPORTER)
+
+
+def test_client_passes_summary_group_to_importer_endpoint(monkeypatch):
+    client = MemoryServiceClient('http://127.0.0.1:8768', api_key=API, importer_key=IMPORTER)
+    observed = []
+
+    def call(method, path, body=None, *, importer=False):
+        observed.append((method, path, body, importer))
+        return body
+
+    monkeypatch.setattr(client, '_call', call)
+    req = {**payload(), 'summary': 'Moves the arm in small steps', 'group': 'Recover'}
+    assert client.create_test_seeded_note(**req) == req
+    assert observed == [('POST', '/dev-v2/test-seeded-notes', req, True)]
 
 
 @pytest.mark.parametrize('title, message', [

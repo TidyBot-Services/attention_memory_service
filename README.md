@@ -90,7 +90,7 @@ cross-scene aggregate claims. The decision and impact report mark
 
 The read-only `GET /dev-v2/memories` and `GET /dev-v2/memories/{memory_id}`
 accept the online service key. Their **public allowlist** is memory ID, optional
-`title` (or `null` for existing/untitled notes),
+`title`, `summary`, and `group` (each `null` when absent),
 version, status, trust scope/display name, profile, the applicability summary
 (benchmark, suite, task, seed, scene/object/camera/task IDs, robot, controller,
 perception mode, camera names, task prompt, SDK SHA, namespace and planned
@@ -100,18 +100,21 @@ decision, failed gate codes and signature counts), and source label. Guidance,
 repair text, grant bodies, import descriptors, sealed evidence, and keys remain
 behind importer authorization. The existing generic `/memories` list continues
 to omit Dev v2 rows; the UI must call these new read-only routes to show them.
-The UI can display `title` as a short, human-readable heading and keep the
-technical `memory_id` in the detail view. The title field does not copy
-guidance, repair, grants, import descriptors, private evidence, or keys. It is
-only read from an explicitly supplied field; guidance is never used to generate one.
+The UI can display `title` as a short, human-readable heading, `summary` as a
+short description, and `group` as a label, while keeping the technical
+`memory_id` in the detail view. These fields do not copy
+guidance, repair, grants, import descriptors, private evidence, or keys. They are
+only read from explicitly supplied fields; guidance is never used to generate them.
 
-An optional `title` can be supplied in the test-seeded JSON body or in the
+Optional `title`, `summary`, and `group` can be supplied in the test-seeded JSON body or in the
 sealed source descriptor imported by `/dev-v2/sources` before candidate creation.
-It is trimmed and must be 1–80 characters of plain text, with no newline,
+`title` and `summary` are trimmed and must each be 1–80 characters of plain text, with no newline,
 control character, URL, path, key-like text, or native evaluator/oracle term.
-The normalized title is stored in provenance. Invalid titles are rejected with
-an explicit error. Omitting it leaves the public title `null`; existing notes
-are not assigned one retroactively.
+`group` is trimmed, has internal spaces collapsed, and must be 1–24 characters
+of letters, digits, spaces, or hyphens. Group labels retain their supplied case;
+UIs should compare them case-insensitively when grouping. The normalized fields
+are stored in provenance. Invalid values are rejected with explicit errors.
+Omitted fields read back as `null`; existing notes are not assigned values retroactively.
 
 ### Importer-only test-seeded notes
 
@@ -132,7 +135,7 @@ The response contains `memory_id`, `version`, `status`,
 `source_kind: "seeded_for_tests"`, `source_label: "seeded for tests"`,
 `trust_scope: "test_seeded"`, `seeded_for_tests: true`, and
 `excluded_from_results: true`. Repeating the same `memory_id` and note content,
-including its normalized title, is idempotent; changing the title or other
+including its normalized title, summary, and group, is idempotent; changing any of those fields or other
 content is a conflict. The first write records
 actor, reason, and server time in the audit event.
 

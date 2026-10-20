@@ -10,7 +10,7 @@ import time
 from .core.models import MemoryRecord, MemoryStatus
 from .core.store import StateConflictError
 from .dev_v2 import SCOPE, SHA
-from .note_title import validate_title
+from .note_title import validate_group, validate_summary, validate_title
 
 TUPLE_KEYS = frozenset((*SCOPE, 'seed', 'camera_names', 'task_prompt', 'scene_contract_ref'))
 
@@ -28,9 +28,14 @@ def flags(provenance):
     return {}
 
 
-def create(service, *, actor, reason, memory_id, context, guidance, repair='', title=None):
+def create(service, *, actor, reason, memory_id, context, guidance, repair='',
+           title=None, summary=None, group=None):
     if title is not None:
         title = validate_title(title)
+    if summary is not None:
+        summary = validate_summary(summary)
+    if group is not None:
+        group = validate_group(group)
     for name, value in (('actor', actor), ('reason', reason), ('memory_id', memory_id),
                         ('guidance', guidance)):
         if not isinstance(value, str) or not value.strip():
@@ -63,6 +68,10 @@ def create(service, *, actor, reason, memory_id, context, guidance, repair='', t
     requested = {'context': context, 'guidance': guidance, 'repair': repair}
     if title is not None:
         requested['title'] = title
+    if summary is not None:
+        requested['summary'] = summary
+    if group is not None:
+        requested['group'] = group
     stored_repair = repair or 'No repair specified for test seed.'
     encoded = lambda value: json.dumps(value, sort_keys=True, ensure_ascii=False,
                                        separators=(',', ':'), allow_nan=False)
@@ -86,6 +95,8 @@ def create(service, *, actor, reason, memory_id, context, guidance, repair='', t
                       'seeded_for_tests': True, 'source_trace_id': trace,
                       'source_seed': context['seed'], 'request_sha256': fingerprint,
                       **({'title': title} if title is not None else {}),
+                      **({'summary': summary} if summary is not None else {}),
+                      **({'group': group} if group is not None else {}),
                       'artifact': artifact,
                       'artifact_sha256': hashlib.sha256(encoded(artifact).encode()).hexdigest()}
         memory = MemoryRecord(memory_id=memory_id, version=1, source_trace_id=trace,

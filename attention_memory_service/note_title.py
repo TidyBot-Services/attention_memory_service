@@ -1,4 +1,4 @@
-"""Validation for the short, public display title of a Dev v2 note."""
+"""Validation for short, public display text on Dev v2 notes."""
 
 import re
 import unicodedata
@@ -16,24 +16,48 @@ _SECRET = re.compile(
     r'\b(?:[a-f0-9]{32,}|[A-Za-z0-9+/]{40,}={0,2})\b', re.I)
 
 
-def validate_title(value: str) -> str:
+def _validate_display_text(value: str, field: str) -> str:
     if not isinstance(value, str):
-        raise ValueError('title must be a string')
+        raise ValueError(f'{field} must be a string')
     if '\n' in value or '\r' in value:
-        raise ValueError('title must not contain a newline')
+        raise ValueError(f'{field} must not contain a newline')
     if any(unicodedata.category(char).startswith('C') for char in value):
-        raise ValueError('title must not contain control characters')
-    title = value.strip()
-    if not 1 <= len(title) <= 80:
-        raise ValueError('title must contain 1–80 characters after trimming')
-    if '<' in title or '>' in title:
-        raise ValueError('title must be plain text')
-    if _URL.search(title):
-        raise ValueError('title must not contain a URL')
-    if '/' in title or '\\' in title:
-        raise ValueError('title must not contain a path')
-    if _SECRET.search(title):
-        raise ValueError('title must not contain key-like text')
-    if _ORACLE.search(title):
-        raise ValueError('title must not contain native evaluator or oracle terms')
-    return title
+        raise ValueError(f'{field} must not contain control characters')
+    normalized = value.strip()
+    if not 1 <= len(normalized) <= 80:
+        raise ValueError(f'{field} must contain 1–80 characters after trimming')
+    if '<' in normalized or '>' in normalized:
+        raise ValueError(f'{field} must be plain text')
+    if _URL.search(normalized):
+        raise ValueError(f'{field} must not contain a URL')
+    if '/' in normalized or '\\' in normalized:
+        raise ValueError(f'{field} must not contain a path')
+    if _SECRET.search(normalized):
+        raise ValueError(f'{field} must not contain key-like text')
+    if _ORACLE.search(normalized):
+        raise ValueError(f'{field} must not contain native evaluator or oracle terms')
+    return normalized
+
+
+def validate_title(value: str) -> str:
+    return _validate_display_text(value, 'title')
+
+
+def validate_summary(value: str) -> str:
+    return _validate_display_text(value, 'summary')
+
+
+def validate_group(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError('group must be a string')
+    if '\n' in value or '\r' in value:
+        raise ValueError('group must not contain a newline')
+    if any(unicodedata.category(char).startswith('C') for char in value):
+        raise ValueError('group must not contain control characters')
+    group = ' '.join(part for part in value.strip().split(' ') if part)
+    if not 1 <= len(group) <= 24:
+        raise ValueError('group must contain 1–24 characters after trimming')
+    if any(char != ' ' and char != '-' and not (char.isalpha() or char.isdecimal())
+           for char in group):
+        raise ValueError('group must contain only letters, digits, spaces and hyphens')
+    return group

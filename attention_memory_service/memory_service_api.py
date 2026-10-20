@@ -23,7 +23,7 @@ from .core.store import StateConflictError
 from .identity import store_id
 from .memory_service import MemoryService
 from .seeded_notes import flags
-from .note_title import validate_title
+from .note_title import validate_group, validate_summary, validate_title
 
 
 class CandidateInput(BaseModel):
@@ -140,18 +140,32 @@ class SeededNoteInput(BaseModel):
     guidance: str
     repair: str = ''
     title: str | None = None
+    summary: str | None = None
+    group: str | None = None
 
     @model_validator(mode='before')
     @classmethod
-    def title_is_string_when_present(cls, value):
-        if isinstance(value, dict) and 'title' in value and value['title'] is None:
-            raise ValueError('title must be a string')
+    def display_fields_are_strings_when_present(cls, value):
+        if isinstance(value, dict):
+            for field in ('title', 'summary', 'group'):
+                if field in value and value[field] is None:
+                    raise ValueError(f'{field} must be a string')
         return value
 
     @field_validator('title')
     @classmethod
     def check_title(cls, value):
         return validate_title(value) if value is not None else None
+
+    @field_validator('summary')
+    @classmethod
+    def check_summary(cls, value):
+        return validate_summary(value) if value is not None else None
+
+    @field_validator('group')
+    @classmethod
+    def check_group(cls, value):
+        return validate_group(value) if value is not None else None
 
 
 def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None,
