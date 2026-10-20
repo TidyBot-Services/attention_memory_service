@@ -72,6 +72,55 @@ def test_seeded_creation_scope_audit_and_validation_isolation(tmp_path):
     assert svc.list_pairs('seed-1') == []
 
 
+def test_seeded_title_is_public_trimmed_and_part_of_idempotence(tmp_path):
+    svc = service(tmp_path)
+    req = {**payload(), 'title': '  Take small, retried arm steps  '}
+    svc.create_test_seeded_note(**req)
+    assert svc.v2.provenance('seed-1')['title'] == 'Take small, retried arm steps'
+    assert svc.get_dev_v2_memory_public('seed-1')['title'] == 'Take small, retried arm steps'
+    assert svc.create_test_seeded_note(**{**req, 'title': 'Take small, retried arm steps'})['memory_id'] == 'seed-1'
+    with pytest.raises(StateConflictError, match='different content'):
+        svc.create_test_seeded_note(**{**req, 'title': 'A different title'})
+    with pytest.raises(StateConflictError, match='different content'):
+        svc.create_test_seeded_note(**{k: v for k, v in req.items() if k != 'title'})
+    untitled = {**payload(), 'memory_id': 'seed-2'}
+    svc.create_test_seeded_note(**untitled)
+    assert svc.create_test_seeded_note(**untitled)['memory_id'] == 'seed-2'
+    assert svc.get_dev_v2_memory_public('seed-2')['title'] is None
+    assert 'title' not in svc.v2.provenance('seed-2')
+
+
+@pytest.mark.parametrize('title, message', [
+    ('   ', '1–80'), ('x' * 81, '1–80'), ('First\nsecond', 'newline'),
+    ('A\x00B', 'control'), ('See https://example.com', 'URL'),
+    ('See docs/guide', 'path'), ('C:\\private\\key', 'path'),
+    ('sk-' + 'a' * 24, 'key-like'), ('api_key=topsecret', 'key-like'),
+    ('AKIA' + 'A' * 16, 'key-like'), ('oracle result', 'oracle'),
+    ('native evaluator score', 'oracle'), ('原生评估器得分', 'oracle'),
+    ('<b>markup</b>', 'plain text'),
+])
+def test_seeded_title_validation(tmp_path, title, message):
+    with pytest.raises(ValidationError, match=message):
+        SeededNoteInput.model_validate({**payload(), 'title': title})
+    with pytest.raises(ValueError, match=message):
+        service(tmp_path).create_test_seeded_note(**{**payload(), 'title': title})
+
+
+def test_seeded_title_http_directory_and_detail_do_not_leak(tmp_path):
+    app = create_app(tmp_path / 'memory.sqlite', api_key=API, importer_key=IMPORTER)
+    req = {**payload(), 'title': '  Take small, retried arm steps  '}
+    status, _ = sync_request(app, '/dev-v2/test-seeded-notes', method='POST',
+                             payload=req, key=API, importer_key=IMPORTER)
+    assert status == 200
+    for path in ('/dev-v2/memories', '/dev-v2/memories/seed-1'):
+        status, result = sync_request(app, path, key=API)
+        assert status == 200
+        row = result['memories'][0] if 'memories' in result else result
+        assert row['title'] == 'Take small, retried arm steps'
+        assert req['guidance'] not in str(row) and req['repair'] not in str(row)
+        assert not {'artifact', 'request_sha256', 'source_trace_id', 'grant', 'descriptor'} & row.keys()
+
+
 def test_seeded_grants_catalog_and_revocation(tmp_path):
     svc = service(tmp_path); req = payload(); svc.create_test_seeded_note(**req)
     grant = svc.authorize_use(req['context'], memory_id='seed-1', attempt_id='fake-attempt', now=1)

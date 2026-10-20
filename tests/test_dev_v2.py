@@ -33,6 +33,45 @@ def candidate(source_setup):
     return f, service, s, m
 
 
+def test_candidate_title_from_sealed_descriptor_and_public_projection(tmp_path):
+    f = Fixture(tmp_path)
+    failed = f.make('failed')
+    descriptor = f.add_advice(failed)
+    descriptor['title'] = '  Take small, retried arm steps  '
+    f.write(f.root / 'failed/source.json', descriptor)
+    service = MemoryService(tmp_path / 'authority.sqlite', dev_v2_catalogs=f.seal())
+    service.import_dev_v2_execution(import_id='failed', catalog_id='failed', descriptor='failed/execution.json')
+    source = service.import_dev_v2_source(import_id='source', catalog_id='failed', descriptor='failed/source.json')
+    assert source['title'] == 'Take small, retried arm steps'
+    service.create_dev_v2_candidate(memory_id='titled', source_import_id='source', created_at=1.0)
+    assert service.v2.provenance('titled')['title'] == source['title']
+    for row in (service.list_dev_v2_memories()[0], service.get_dev_v2_memory_public('titled')):
+        assert row['title'] == source['title']
+        assert source['guidance'] not in str(row) and source['repair'] not in str(row)
+        assert not {'guidance', 'repair', 'artifact', 'descriptor', 'grant', 'raw_evidence_refs'} & row.keys()
+    assert service.create_dev_v2_candidate(memory_id='titled', source_import_id='source', created_at=1.0).memory_id == 'titled'
+
+
+def test_candidate_without_title_has_null_public_title(source_setup):
+    _, service, source, _ = candidate(source_setup)
+    assert 'title' not in source
+    assert 'title' not in service.v2.provenance('m1')
+    assert service.get_dev_v2_memory_public('m1')['title'] is None
+
+
+@pytest.mark.parametrize('title', [' ', 'x' * 81, 'has\nnewline', 'https://example.com',
+                                      '../path', 'sk-' + 'a' * 24, 'oracle check'])
+def test_candidate_descriptor_rejects_invalid_title(tmp_path, title):
+    f = Fixture(tmp_path)
+    failed = f.make('failed')
+    descriptor = f.add_advice(failed)
+    descriptor['title'] = title
+    f.write(f.root / 'failed/source.json', descriptor)
+    service = MemoryService(tmp_path / 'authority.sqlite', dev_v2_catalogs=f.seal())
+    with pytest.raises(ValueError, match='title'):
+        service.import_dev_v2_source(import_id='source', catalog_id='failed', descriptor='failed/source.json')
+
+
 def route(app, path, method='POST'):
     return next(r for r in app.routes if r.path == path and method in r.methods)
 

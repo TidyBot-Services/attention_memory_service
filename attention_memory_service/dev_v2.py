@@ -25,6 +25,7 @@ from typing import Any
 
 from .core.models import MemoryRecord
 from .core.store import StateConflictError
+from .note_title import validate_title
 
 SCOPE = ('benchmark', 'suite', 'task_id', 'robot', 'controller', 'perception_mode',
          'scene_id', 'object_set_id', 'camera_config_id', 'task_variant_id',
@@ -643,6 +644,7 @@ class DevV2Evidence:
 
     def import_source(self, *, import_id, catalog_id, descriptor):
         d = self.read(catalog_id, descriptor)
+        title = validate_title(d['title']) if 'title' in d else None
         _, manifest, config, record, repair, cell = self._base(catalog_id, d)
         failed, fd, bundle, artifacts, _, verdict, _ = self.verdict(d['failed_execution_import_id'], d['validator_id'], d['validation_descriptor'], for_validation=False)
         require(bundle['native_success'] is False and failed['cell'] == d['cell'] and failed['version'] == d['version'] - 1 and failed['context'] == d['context'], 'source must be previous independent native-confirmed failed attempt in exact scope')
@@ -687,6 +689,8 @@ class DevV2Evidence:
         require(json.loads(generated)['source'].encode() == repair, 'adopted source differs from actual model output')
         public(guidance); public(repair.decode())
         evidence = {'kind': 'source', 'catalog_id': catalog_id, 'descriptor': descriptor, 'failed_execution_import_id': d['failed_execution_import_id'], 'context': d['context'], 'request_id': d.get('request_id'), 'cell': d['cell'], 'version': d['version'], 'guidance': guidance, 'repair': repair.decode(), 'failure_signature': signature, 'source_policy_sha256': failed['source']['sha256'], 'repair_sha256': record['source']['sha256'], 'source_policy_id': cell['policy_id'], 'source_seed': config['seed'], 'source_run_id': bundle['run_id'], 'source_attempt_id': bundle['attempt_id']}
+        if title is not None:
+            evidence['title'] = title
         if provider == 'human_proxy':
             evidence.update(provider=provider, request_view=view_ref, advisor_model=advisor_model, advisor_mode='vision')
         self._put('dev_v2_imports', import_id, evidence, kind='source')
@@ -705,6 +709,8 @@ class DevV2Evidence:
         if s['failure_signature'] is not None:
             artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
+        if 'title' in s:
+            provenance['title'] = s['title']
         if s.get('provider') == 'human_proxy':
             provenance.update(provider='human_proxy', request_view=s['request_view'], advisor_model=s['advisor_model'], advisor_mode=s['advisor_mode'])
         if s['failure_signature'] is not None:

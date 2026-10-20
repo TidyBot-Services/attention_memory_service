@@ -16,13 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, StrictInt
+from pydantic import BaseModel, StrictInt, field_validator, model_validator
 
 from .core.models import MemoryUseRecord
 from .core.store import StateConflictError
 from .identity import store_id
 from .memory_service import MemoryService
 from .seeded_notes import flags
+from .note_title import validate_title
 
 
 class CandidateInput(BaseModel):
@@ -138,6 +139,19 @@ class SeededNoteInput(BaseModel):
     context: dict[str, Any]
     guidance: str
     repair: str = ''
+    title: str | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def title_is_string_when_present(cls, value):
+        if isinstance(value, dict) and 'title' in value and value['title'] is None:
+            raise ValueError('title must be a string')
+        return value
+
+    @field_validator('title')
+    @classmethod
+    def check_title(cls, value):
+        return validate_title(value) if value is not None else None
 
 
 def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None,

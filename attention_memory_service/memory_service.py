@@ -383,6 +383,7 @@ class MemoryService:
             scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
             rows.append({
                 'memory_id': memory.memory_id, 'version': memory.version,
+                'title': provenance.get('title'),
                 'status': memory.status.value, 'trust_scope': scope,
                 'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped' else None,
                 'profile': None if plan is None else plan.get('profile', 'default'),
