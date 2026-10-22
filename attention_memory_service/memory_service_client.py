@@ -15,7 +15,8 @@ from .core.store import StateConflictError
 
 def _memory(value: dict[str, Any]) -> MemoryRecord:
     payload = dict(value)
-    for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope'):
+    for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope', 'unvalidated',
+                'match_level', 'trusted_here', 'source_seed'):
         payload.pop(key, None)
     payload["status"] = MemoryStatus(payload["status"])
     payload["evidence_refs"] = tuple(payload["evidence_refs"])
@@ -53,7 +54,11 @@ class MemoryServiceClient:
     def get_memory(self, memory_id: str) -> MemoryRecord:
         return _memory(self._call("GET", f"/memories/{quote(memory_id, safe='')}"))
 
-    def list_dev_v2_memories(self, *, status: str | None = None) -> list[dict[str, Any]]:
+    def list_dev_v2_memories(self, *, status: str | None = None,
+                             context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        if context is not None:
+            return self._call('POST', '/dev-v2/memories/query',
+                              {'status': status, 'context': context})['memories']
         suffix = '' if status is None else '?status=' + quote(status, safe='')
         return self._call('GET', '/dev-v2/memories' + suffix)['memories']
 
@@ -90,6 +95,12 @@ class MemoryServiceClient:
     def create_test_seeded_note(self, **payload) -> dict[str, Any]:
         return self._call('POST', '/dev-v2/test-seeded-notes', payload, importer=True)
 
+    def create_provisional_note(self, **payload) -> dict[str, Any]:
+        return self._call('POST', '/dev-v2/provisional-notes', payload, importer=True)
+
+    def record_provisional_outcome(self, **payload) -> dict[str, Any]:
+        return self._call('POST', '/dev-v2/provisional-outcomes', payload, importer=True)
+
     def record_dev_v2_pair(self, **payload):
         return self._call('POST', '/dev-v2/pairs', payload, importer=True)
 
@@ -108,9 +119,14 @@ class MemoryServiceClient:
             _memory(item) for item in self.retrieve_entries(context, now=now)
         ]
 
-    def retrieve_entries(self, context: dict[str, Any], *, now: float) -> list[dict[str, Any]]:
-        """Raw retrieval records retain test-seed/result-exclusion flags."""
-        return self._call('POST', '/retrieve', {'context': context, 'now': now})
+    def retrieve_entries(self, context: dict[str, Any], *, now: float,
+                         match_levels: list[str] | None = None) -> list[dict[str, Any]]:
+        """Raw retrieval records retain test-seed/result-exclusion flags and,
+        per record, ``match_level``/``trusted_here``/``source_seed``."""
+        payload = {'context': context, 'now': now}
+        if match_levels is not None:
+            payload['match_levels'] = list(match_levels)
+        return self._call('POST', '/retrieve', payload)
 
     def authorize_use(
         self, context: dict[str, Any], *, memory_id: str,
@@ -148,7 +164,7 @@ class MemoryServiceClient:
 
     def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
         payload = self._call("POST", "/uses", use.artifact())
-        for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope'):
+        for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope', 'unvalidated'):
             payload.pop(key, None)
         payload["evidence_refs"] = tuple(payload.get("evidence_refs", ()))
         return MemoryUseRecord(**payload)

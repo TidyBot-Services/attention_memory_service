@@ -17,8 +17,8 @@ SIGNATURE = {'public_error_class': 'RuntimeError: TimeoutError', 'operation': 'l
 
 
 def setup_scene(tmp_path, *, controls=(True,) * 5, treatments=(False,) * 5,
-                control_calls=(1,) * 5, treatment_calls=(1,) * 5):
-    f = Fixture(tmp_path)
+                control_calls=(1,) * 5, treatment_calls=(1,) * 5, interface=False):
+    f = Fixture(tmp_path, interface=interface)
     failed = f.make('failed', failure=True)
     f.add_advice(failed, SIGNATURE)
     for i in range(len(controls)):
@@ -79,7 +79,8 @@ def import_pairs(f, service, count=5, *, unsafe_treatment=None):
 
 @pytest.mark.parametrize('controls,treatments,ccalls,tcalls,unsafe,expected', [
     ((True,) * 5, (False,) * 5, (1,) * 5, (1,) * 5, None, None),
-    ((True,) * 3 + (False,) * 2, (False,) * 5, (1,) * 5, (1,) * 5, None, 'control_signature_not_reproduced'),
+    ((True,) * 3 + (False,) * 2, (True,) + (False,) * 4, (1,) * 5, (1,) * 5, None, None),
+    ((True,) * 2 + (False,) * 3, (False,) * 5, (1,) * 5, (1,) * 5, None, 'control_signature_not_reproduced'),
     ((True,) * 5, (True,) * 2 + (False,) * 3, (1,) * 5, (1,) * 5, None, 'treatment_signature_remains'),
     ((True,) * 5, (False,) * 5, (1,) * 5, (1,) * 5, 0, 'safety_regression'),
     ((True,) * 5, (False,) * 5, (2,) * 5, (1,) * 5, None, 'treatment_stopped_earlier'),
@@ -173,3 +174,93 @@ def test_validator_signature_result_must_match_public_trace(tmp_path):
     with pytest.raises(StateConflictError, match='signature/stop-position verdict'):
         service.import_dev_v2_trial(import_id='trial-c0', catalog_id='validator-c0',
                                     descriptor='c0/trial.json')
+
+
+def test_single_scene_gate_records_three_of_five_control_threshold(tmp_path):
+    f, service, plan = setup_scene(tmp_path, controls=(True,) * 3 + (False,) * 2,
+                                   treatments=(True,) + (False,) * 4)
+    service.record_plan('m1', plan)
+    import_pairs(f, service)
+    assert service.evaluate('m1').status.value == 'trusted'
+    decision = service.decision('m1')
+    assert decision['gate_thresholds']['control_signature_fraction_min'] == 0.6
+    assert decision['gate_thresholds']['treatment_signature_fraction_max'] == 0.2
+
+
+@pytest.mark.parametrize('interface', [False, True])
+def test_trusted_note_is_reference_on_other_scene_of_same_task(tmp_path, interface):
+    f, service, plan = setup_scene(tmp_path, interface=interface)
+    service.record_plan('m1', plan)
+    r = f.records['c0']
+    # Validation grants keep their exact binding, implementation hash included.
+    with pytest.raises(StateConflictError):
+        service.authorize_dev_v2_validation(
+            memory_id='m1', cell='c0', version=1, seed=101, context={**r['context'], 'sdk_sha256': 'f' * 64},
+            policy_sha256=r['record']['source']['sha256'],
+            config_sha256=r['descriptor']['config']['sha256'], exposure='none')
+    import_pairs(f, service)
+    assert service.evaluate('m1').status.value == 'trusted'
+    assert ('sdk_interface_sha256' in service.store.get_memory('m1').applicability) is interface
+    here = {**f.records['failed']['context'], 'seed': 101}
+    other = {**here, 'seed': 102, 'scene_id': 'scene-9', 'camera_names': ['camera-9'],
+             'camera_config_id': 'robocasa365:' + 'e' * 64}
+    assert service.retrieve(other, now=time.time()) == []
+    assert [(m.memory_id, level) for m, level in service.retrieve_levels(
+        other, now=time.time(), levels=('same_scene', 'same_task'))] == [('m1', 'same_task')]
+    for key, value in (('task_id', 'other'), ('robot', 'other'), ('task_prompt', 'other'),
+                       ('controller', 'other'), ('perception_mode', 'vision')):
+        assert service.retrieve_levels({**other, key: value}, now=time.time(),
+                                       levels=('same_scene', 'same_task')) == [], key
+    dev = service.authorize_dev_use(memory_id='m1', memory_version=1, development_id='other:v1',
+                                    context=other, source_policy_sha256='c' * 64, now=time.time())
+    assert (dev['match_level'], dev['trusted_here'], dev['excluded_from_results'], dev['source_seed']) == (
+        'same_task', False, True, 101)
+    assert service.get_dev_use(dev['grant_id'])['grant_id'] == dev['grant_id']
+    with pytest.raises(StateConflictError, match='excluded from Dev results'):
+        service.record_dev_result(grant_id=dev['grant_id'], run_id='r', result_policy_sha256='d' * 64,
+                                  artifact_uri='x', artifact_sha256='e' * 64)
+    same = service.authorize_dev_use(memory_id='m1', memory_version=1, development_id='here:v1',
+                                     context=here, source_policy_sha256='c' * 64, now=time.time())
+    assert (same['match_level'], same['trusted_here']) == ('same_scene', True)
+    assert 'excluded_from_results' not in same
+    row = service.list_dev_v2_memories(context=other)[0]
+    assert (row['match_level'], row['trusted_here'], row['source_seed']) == ('same_task', False, 101)
+    row = service.list_dev_v2_memories(context=here)[0]
+    assert (row['match_level'], row['trusted_here']) == ('same_scene', True)
+    assert service.list_dev_v2_memories()[0]['match_level'] is None
+    app = create_app(service.store.path, api_key='controlled-online-key')
+    assert sync_request(app, '/retrieve', method='POST', payload={'context': other, 'now': 1},
+                        key='controlled-online-key')[1] == []
+    status, rows = sync_request(app, '/retrieve', method='POST', key='controlled-online-key',
+                                payload={'context': other, 'now': 1, 'match_levels': ['same_scene', 'same_task']})
+    assert status == 200 and [(x['memory_id'], x['match_level'], x['trusted_here'], x['excluded_from_results'])
+                              for x in rows] == [('m1', 'same_task', False, True)]
+    status, rows = sync_request(app, '/dev-v2/memories/query', method='POST', key='controlled-online-key',
+                                payload={'context': other})
+    assert status == 200 and rows['memories'][0]['match_level'] == 'same_task'
+    # SDK identity: an implementation-only change keeps interface-matched notes
+    # readable; legacy notes (no interface field) keep the exact implementation match.
+    rebuilt = {**here, 'sdk_sha256': 'f' * 64}
+    assert [m.memory_id for m in service.retrieve(rebuilt, now=time.time())] == (['m1'] if interface else [])
+    assert len(service.retrieve_levels({**other, 'sdk_sha256': 'f' * 64}, now=time.time(),
+                                       levels=('same_task',))) == (1 if interface else 0)
+    if interface:
+        changed = {**here, 'sdk_interface_sha256': '0' * 64}
+        assert service.retrieve(changed, now=time.time()) == []
+        assert service.retrieve_levels({**other, 'sdk_interface_sha256': '0' * 64}, now=time.time(),
+                                       levels=('same_scene', 'same_task')) == []
+    service.disable('m1', actor='test', reason='test')
+    assert service.retrieve_levels(other, now=time.time(), levels=('same_task',)) == []
+
+
+def test_trusted_interface_digest_must_match_sdk_contract(tmp_path):
+    f = Fixture(tmp_path, interface=True)
+    failed = f.make('failed', failure=True)
+    f.add_advice(failed, SIGNATURE)
+    failed['descriptor']['context']['sdk_interface_sha256'] = '0' * 64
+    failed['context']['sdk_interface_sha256'] = '0' * 64
+    f.write(f.root / 'failed/execution.json', failed['descriptor'])
+    service = MemoryService(tmp_path / 'authority.sqlite',
+                            dev_v2_catalogs={k: v for k, v in f.seal().items() if k == 'failed'})
+    with pytest.raises(StateConflictError, match='interface identity'):
+        service.import_dev_v2_execution(import_id='failed', catalog_id='failed', descriptor='failed/execution.json')

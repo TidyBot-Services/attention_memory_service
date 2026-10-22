@@ -63,10 +63,12 @@ class MemoryManager:
 
     def enable(self, memory_id: str, *, reason: str = "human_reenabled",
                actor: str | None = None) -> MemoryRecord:
-        cycle = self.store.count_memory_events(memory_id, "memory.trusted")
+        provisional = self.store.count_memory_events(memory_id, 'memory.provisional_created') > 0
+        target = MemoryStatus.PROVISIONAL if provisional else MemoryStatus.TRUSTED
+        cycle = self.store.count_memory_events(memory_id, f'memory.{target.value}')
         return self.store.transition_memory(
             memory_id,
-            MemoryStatus.TRUSTED,
+            target,
             event_key=f"memory-enable:{memory_id}:{cycle}",
             reason=reason,
             actor=actor,
@@ -85,7 +87,7 @@ class MemoryManager:
         expired = []
         for memory in self.store.list_memories():
             if (
-                memory.status is MemoryStatus.TRUSTED
+                memory.status in {MemoryStatus.TRUSTED, MemoryStatus.PROVISIONAL}
                 and memory.expires_at is not None
                 and memory.expires_at <= now
             ):
@@ -93,7 +95,7 @@ class MemoryManager:
                     self.store.transition_memory(
                         memory.memory_id,
                         MemoryStatus.EXPIRED,
-                        event_key=f"memory-expire:{memory.memory_id}",
+                        event_key=f"memory-expire:{memory.memory_id}:{self.store.count_memory_events(memory.memory_id, 'memory.expired')}",
                         reason="expiry_reached",
                     )
                 )

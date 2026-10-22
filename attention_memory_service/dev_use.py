@@ -18,7 +18,8 @@ from pathlib import Path
 
 from .core.models import MemoryStatus
 from .core.store import StateConflictError
-from .seeded_notes import flags, is_test_seeded
+from .seeded_notes import flags, is_test_seeded, is_provisional
+from .applicability import SAME_SCENE, SAME_TASK, marker as level_marker
 
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -35,6 +36,18 @@ class DevMemoryUse:
                 "UNIQUE(memory_id, development_id))"
             )
 
+    def _find(self, memory_id, context, now):
+        """Exact match first; otherwise a same-task reference, else nothing."""
+        for item in self.service.retrieve(context, now=now):
+            if item.memory_id == memory_id:
+                return item, SAME_SCENE
+        if 'sdk_sha256' not in context:
+            return None, None  # Legacy contexts have no layered levels.
+        for item, level in self.service.retrieve_levels(context, now=now, levels=(SAME_TASK,)):
+            if item.memory_id == memory_id:
+                return item, level
+        return None, None
+
     def authorize(
         self, *, memory_id: str, development_id: str, context: dict[str, Any],
         source_policy_sha256: str, now: float, memory_version: int | None = None,
@@ -48,8 +61,9 @@ class DevMemoryUse:
         # The existing retrieval guard checks exact validated variation,
         # provenance, trusted status and expiry.  Recheck status atomically
         # before the guidance leaves the Service.
-        memory = next((item for item in self.service.retrieve(context, now=now)
-                       if item.memory_id == memory_id), None)
+        # Dev exposure may read every level; trust stays same-scene only and
+        # anything not trusted here is excluded from results.
+        memory, level = self._find(memory_id, context, now)
         if memory is None:
             raise StateConflictError("memory is not trusted or applicable to Dev context")
         provenance = self.service.v2._provenance(memory_id)
@@ -71,11 +85,16 @@ class DevMemoryUse:
             if row is None:
                 raise StateConflictError("unknown memory")
             current = json.loads(row[0])
-            if (current["status"] != MemoryStatus.TRUSTED.value
+            if (current["status"] != (MemoryStatus.PROVISIONAL.value if is_provisional(provenance) else MemoryStatus.TRUSTED.value)
                     or current["version"] != memory.version
                     or current.get("expires_at") is not None
                     and current["expires_at"] <= time.time()):
                 raise StateConflictError("memory was revoked or expired before Dev exposure")
+            # Trust is same-scene only; everything else is a labelled reference.
+            marker = {**marker, **level_marker(level, level == SAME_SCENE and current["status"] == MemoryStatus.TRUSTED.value)}
+            if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
+                marker.update(source_seed=provenance.get('source_seed'),
+                              note_sdk_sha256=memory.applicability.get('sdk_sha256'))
             row = db.execute(
                 "SELECT payload FROM memory_dev_exposures WHERE memory_id=? AND development_id=?",
                 (memory_id, development_id),
@@ -83,7 +102,8 @@ class DevMemoryUse:
             if row is not None:
                 old = json.loads(row[0])
                 if (old["context"] != context or old["source_policy_sha256"] != source_policy_sha256
-                        or old["memory_version"] != memory.version):
+                        or old["memory_version"] != memory.version
+                        or old.get("match_level", SAME_SCENE) != level):
                     raise StateConflictError("development ID already binds different Memory evidence")
                 return _online_grant(old)
             record = {
@@ -125,6 +145,10 @@ class DevMemoryUse:
         if grant_row:
             grant = json.loads(grant_row[0])
             provenance = self.service.v2._provenance(grant['memory_id'])
+            if is_provisional(provenance):
+                raise StateConflictError('provisional exposure is excluded from Dev results')
+            if grant.get('trusted_here') is False:
+                raise StateConflictError('reference exposure is excluded from Dev results')
             if is_test_seeded(provenance):
                 raise StateConflictError('test-seeded exposure is excluded from Dev results')
             if provenance and provenance.get('channel') == 'dev_v2':
@@ -190,18 +214,20 @@ class DevMemoryUse:
             raise StateConflictError("unknown Dev Memory grant")
         record = json.loads(row[0])
         provenance = self.service.v2._provenance(record['memory_id'])
-        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded'}:
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
             # New-channel reads release guidance again. Preserve the legacy
             # historical-read API; enforce live eligibility on Dev v2 grants.
             with sqlite3.connect(self.service.store.path) as db:
                 memory = db.execute('SELECT payload FROM memories WHERE id=?',
                                     (record['memory_id'],)).fetchone()
             current = {} if memory is None else json.loads(memory[0])
-            if (current.get('status') != 'trusted'
+            if (current.get('status') != ('provisional' if is_provisional(provenance) else 'trusted')
                     or current.get('version') != record['memory_version']
                     or current.get('expires_at') is not None and current['expires_at'] <= time.time()):
                 raise StateConflictError('Dev Memory grant was revoked, expired or changed version')
-            if not any(m.memory_id == record['memory_id'] and m.version == record['memory_version'] for m in self.service.retrieve(record['context'], now=time.time())):
+            found, level = self._find(record['memory_id'], record['context'], time.time())
+            if (found is None or found.version != record['memory_version']
+                    or level != record.get('match_level', SAME_SCENE)):
                 raise StateConflictError('Dev v2 grant no longer has verified exact scope')
         result = record.get("result")
         if result is not None and result.get('schema_version') == 'attentionbench.dev-v2-memory-result.v1':

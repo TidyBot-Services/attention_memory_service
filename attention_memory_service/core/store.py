@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
@@ -56,9 +57,10 @@ MEMORY_TRANSITIONS = {
         MemoryStatus.EXPIRED,
         MemoryStatus.ROLLED_BACK,
     },
-    MemoryStatus.DISABLED: {MemoryStatus.TRUSTED, MemoryStatus.ROLLED_BACK},
+    MemoryStatus.PROVISIONAL: {MemoryStatus.DISABLED, MemoryStatus.EXPIRED, MemoryStatus.ROLLED_BACK},
+    MemoryStatus.DISABLED: {MemoryStatus.TRUSTED, MemoryStatus.PROVISIONAL, MemoryStatus.ROLLED_BACK},
     MemoryStatus.REJECTED: set(),
-    MemoryStatus.EXPIRED: set(),
+    MemoryStatus.EXPIRED: {MemoryStatus.PROVISIONAL, MemoryStatus.ROLLED_BACK},
     MemoryStatus.ROLLED_BACK: set(),
 }
 RUN_TRANSITIONS = {
@@ -315,7 +317,11 @@ class AttentionStore:
             if row is None:
                 raise StateConflictError("unknown memory")
             current = self._decode_memory(json.loads(row[0]))
-            if current.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED}:
+            provisional = connection.execute(
+                "SELECT 1 FROM events WHERE entity_id=? AND event_type='memory.provisional_created'",
+                (memory_id,)).fetchone() is not None
+            if current.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED, MemoryStatus.PROVISIONAL} and not (
+                    provisional and current.status in {MemoryStatus.DISABLED, MemoryStatus.EXPIRED}):
                 raise StateConflictError("expiry can only change on active memory")
             updated = replace(current, expires_at=expires_at)
             connection.execute(
@@ -356,6 +362,16 @@ class AttentionStore:
             if row is None:
                 raise StateConflictError(f"memory {memory_id!r} does not exist")
             current = self._decode_memory(json.loads(row[0]))
+            provisional = connection.execute(
+                "SELECT 1 FROM events WHERE entity_id=? AND event_type='memory.provisional_created'",
+                (memory_id,)).fetchone() is not None
+            if provisional and status in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED, MemoryStatus.REJECTED}:
+                raise StateConflictError('provisional notes cannot enter validation or promotion')
+            if status is MemoryStatus.PROVISIONAL:
+                if not provisional or current.expires_at is None or current.expires_at <= time.time():
+                    raise StateConflictError('provisional note expired; set_expiry before enabling')
+            if current.status is MemoryStatus.EXPIRED and not provisional:
+                raise StateConflictError('expired memory cannot be revived')
             if status not in MEMORY_TRANSITIONS[current.status]:
                 raise StateConflictError(
                     f"illegal memory transition {current.status.value} -> {status.value}"

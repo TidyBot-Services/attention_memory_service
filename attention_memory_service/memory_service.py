@@ -20,8 +20,10 @@ from .core.store import AttentionStore, StateConflictError
 from .dev_use import DevMemoryUse
 from .dev_v2 import evidence_operation
 from .memory_artifacts import MemoryArtifactStore
-from .memory_v2 import MemoryV2Manager
-from .seeded_notes import create as create_test_seeded, flags, is_test_seeded
+from .memory_v2 import MemoryV2Manager, trusted_here
+from .applicability import LEVELS, SAME_SCENE, marker
+from . import provisional_notes
+from .seeded_notes import create as create_test_seeded, flags, is_test_seeded, is_provisional
 
 
 class MemoryService:
@@ -37,12 +39,26 @@ class MemoryService:
             self.store, artifact_root or self.store.path.parent,
         )
         self.dev_use = DevMemoryUse(self)
+        provisional_notes.initialize(self.store)
         from .dev_v2 import DevV2Evidence
         self.dev_v2 = DevV2Evidence(self.store, dev_v2_catalogs)
 
     def _publish_if_validated_source(self, memory_id: str) -> None:
-        if not is_test_seeded(self.v2._provenance(memory_id)):
+        if not flags(self.v2._provenance(memory_id)):
             self.artifacts.publish(memory_id)
+
+    def _refuse_provisional(self, memory_id):
+        if is_provisional(self.v2._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation, promotion or results')
+
+    def create_provisional_note(self, **payload) -> dict[str, Any]:
+        memory = provisional_notes.create(self, **payload)
+        return {'memory_id': memory.memory_id, 'version': memory.version,
+                'status': memory.status.value, 'expires_at': memory.expires_at,
+                'source_kind': 'advisor_proxy', **flags(self.v2.provenance(memory.memory_id))}
+
+    def record_provisional_outcome(self, **payload) -> dict[str, Any]:
+        return provisional_notes.record_outcome(self, **payload)
 
     def create_test_seeded_note(self, **payload) -> dict[str, Any]:
         memory = create_test_seeded(self, **payload)
@@ -64,10 +80,12 @@ class MemoryService:
 
     @evidence_operation
     def authorize_dev_v2_validation(self, **payload) -> dict[str, Any]:
+        self._refuse_provisional(payload['memory_id'])
         return self.dev_v2.authorize_validation(**payload)
 
     @evidence_operation
     def create_dev_v2_candidate(self, **payload) -> MemoryRecord:
+        self._refuse_provisional(payload['memory_id'])
         memory = self.dev_v2.create_candidate(**payload)
         self.artifacts.publish(memory.memory_id)
         return memory
@@ -79,6 +97,7 @@ class MemoryService:
     @evidence_operation
     def record_dev_v2_pair(self, *, memory_id: str, control_import_id: str,
                           treatment_import_id: str) -> dict[str, Any]:
+        self._refuse_provisional(memory_id)
         trials = []
         for import_id in (control_import_id, treatment_import_id):
             old = self.dev_v2.get(import_id)
@@ -172,16 +191,26 @@ class MemoryService:
         # eligibility use only the server wall clock: future queries cannot
         # expire any scope, and past queries cannot revive expired guidance.
         # Pass the same trusted clock through v2 to its core expiry sweep.
+        return [memory for memory, _ in self.retrieve_levels(context, now=now, levels=(SAME_SCENE,))]
+
+    @evidence_operation
+    def retrieve_levels(self, context: dict[str, Any], *, now: float,
+                        levels=(SAME_SCENE,)) -> list[tuple[MemoryRecord, str]]:
+        """Layered retrieval; callers opt in to the reference-only same_task level."""
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+            raise ValueError("retrieval time must be finite")
         effective_now = time.time()
         for expired in MemoryManager(self.store).expire_due(now=effective_now):
             self._publish_if_validated_source(expired.memory_id)
-        return self.v2.retrieve(context, now=effective_now)
+        return self.v2.retrieve_levels(context, now=effective_now, levels=tuple(levels))
 
     @evidence_operation
     def authorize_use(
         self, context: dict[str, Any], *, memory_id: str,
         attempt_id: str, now: float,
     ) -> dict[str, Any]:
+        # Attempt-bound grants feed validation/use evidence: never provisional.
+        self._refuse_provisional(memory_id)
         memory = next(
             (item for item in self.retrieve(context, now=now) if item.memory_id == memory_id),
             None,
@@ -215,6 +244,10 @@ class MemoryService:
         artifact_uri: str, artifact_sha256: str,
     ) -> dict[str, Any]:
         grant = self.dev_use.get(grant_id)
+        if grant.get('unvalidated'):
+            raise StateConflictError('provisional exposure is excluded from Dev results')
+        if grant.get('trusted_here') is False:
+            raise StateConflictError('reference exposure is excluded from Dev results')
         if grant.get('seeded_for_tests'):
             raise StateConflictError('test-seeded exposure is excluded from Dev results')
         return self.dev_use.record_result(
@@ -225,6 +258,7 @@ class MemoryService:
 
     @evidence_operation
     def record_use(self, use: MemoryUseRecord) -> MemoryUseRecord:
+        self._refuse_provisional(use.memory_id)
         self.v2.provenance(use.memory_id)
         self.v2.verify_use(use)
         # A memory may be revoked after the policy already retrieved it. The
@@ -264,6 +298,7 @@ class MemoryService:
 
     @evidence_operation
     def impact_report(self, memory_id: str) -> dict[str, Any]:
+        self._refuse_provisional(memory_id)
         if is_test_seeded(self.v2._provenance(memory_id)):
             raise StateConflictError('test-seeded notes are excluded from impact reports')
         return self.v2.impact_report(memory_id)
@@ -274,6 +309,7 @@ class MemoryService:
 
     @evidence_operation
     def promote(self, memory_id: str) -> MemoryRecord:
+        self._refuse_provisional(memory_id)
         if is_test_seeded(self.v2._provenance(memory_id)):
             raise StateConflictError('test-seeded notes cannot be promoted')
         plan = self.v2.get_plan(memory_id)
@@ -301,7 +337,9 @@ class MemoryService:
         if not actor.strip() or not reason.strip():
             raise ValueError("human re-enable requires actor and reason")
         current = self.store.get_memory(memory_id)
-        if current is not None and current.status.value == "trusted":
+        if current is not None and current.status.value in {"trusted", "provisional"}:
+            if current.status.value == "provisional" and current.expires_at <= time.time():
+                raise StateConflictError("provisional note expired; set_expiry before enabling")
             return current  # idempotent retry
         memory = MemoryManager(self.store).enable(memory_id, reason=reason, actor=actor)
         self._publish_if_validated_source(memory_id)
@@ -309,6 +347,7 @@ class MemoryService:
 
     def evaluate(self, memory_id: str) -> MemoryRecord:
         """Decide a fully validated candidate: trusted, or rejected with the failed gates."""
+        self._refuse_provisional(memory_id)
         if is_test_seeded(self.v2._provenance(memory_id)):
             raise StateConflictError('test-seeded notes cannot be evaluated')
         memory = self.v2.finalize_validation(memory_id)
@@ -335,7 +374,7 @@ class MemoryService:
             if status is not None and memory.status.value != status:
                 continue
             provenance = self.v2._provenance(memory.memory_id)
-            if provenance is None or provenance.get("channel") in {'dev_v2', 'test_seeded'}:
+            if provenance is None or provenance.get("channel") in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
                 continue
             plan = self.v2.get_plan(memory.memory_id)
             pairs = self.v2.list_pairs(memory.memory_id)
@@ -364,20 +403,31 @@ class MemoryService:
             })
         return rows
 
-    def list_dev_v2_memories(self, *, status: str | None = None) -> list[dict[str, Any]]:
-        """Explicit public allowlist; importer evidence never enters this projection."""
+    def list_dev_v2_memories(self, *, status: str | None = None,
+                             context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Explicit public allowlist; importer evidence never enters this projection.
+
+        With a Dev context, each row also says at which level it would be read
+        there (``match_level``) and whether it is trusted there; without one
+        both are None.
+        """
+        levels = None
+        if context is not None:
+            levels = {memory.memory_id: level for memory, level in
+                      self.retrieve_levels(context, now=time.time(), levels=LEVELS)}
         rows = []
         for memory in self.store.list_memories():
             if status is not None and memory.status.value != status:
                 continue
             provenance = self.v2._provenance(memory.memory_id)
-            if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded'}:
+            if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
                 continue
             plan = self.v2.get_plan(memory.memory_id)
             decision = self.v2.get_decision(memory.memory_id)
             seeded = is_test_seeded(provenance)
+            provisional = is_provisional(provenance)
             case = plan['cases'][0] if plan and plan.get('profile') == 'single_scene_v1' else None
-            if seeded:
+            if seeded or provisional:
                 case = memory.applicability
             trusted = memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
             scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
@@ -402,13 +452,14 @@ class MemoryService:
                     'task_variant_id': None if case is None else case['task_variant_id'],
                     'camera_names': None if case is None else case['camera_names'],
                     'task_prompt': None if case is None else case['task_prompt'],
-                    'scene_contract_ref': memory.applicability.get('scene_contract_ref') if seeded else None,
+                    'scene_contract_ref': memory.applicability.get('scene_contract_ref') if seeded or provisional else None,
                     'sdk_sha256': memory.applicability['sdk_sha256'],
+                    'sdk_interface_sha256': memory.applicability.get('sdk_interface_sha256'),
                     'namespace': memory.applicability['namespace'],
                     'planned_cases': None if plan is None else plan['cases'],
                 },
                 'failure_signature_summary': provenance.get('failure_signature'),
-                'validation_summary': None if seeded else {
+                'validation_summary': None if seeded or provisional else {
                     'planned_pairs': None if plan is None else len(plan.get('pairs', plan['seeds'])),
                     'completed_pairs': len(self.v2.list_pairs(memory.memory_id)),
                     'decision': None if decision is None else decision['decision'],
@@ -417,10 +468,16 @@ class MemoryService:
                     'treatment_signature_count': None if decision is None else decision['report'].get('treatment_signature_count'),
                 },
                 'source_label': 'seeded for tests' if seeded else provenance['source_kind'],
-                'excluded_from_results': seeded,
+                'excluded_from_results': seeded or provisional,
                 'seeded_for_tests': seeded,
+                'source_seed': provenance['source_seed'],
+                'match_level': None if levels is None else levels.get(memory.memory_id),
+                'trusted_here': None if levels is None else (
+                    memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id])),
                 'guidance_length': len(memory.guidance) if seeded else None,
                 'guidance_sha256': hashlib.sha256(memory.guidance.encode()).hexdigest() if seeded else None,
+                **({'expires_at': memory.expires_at, 'uses': provisional_notes.uses_summary(self.store, memory.memory_id),
+                    **flags(provenance)} if provisional else {}),
             })
         return rows
 
@@ -452,6 +509,7 @@ class MemoryService:
 
     @evidence_operation
     def export_package(self, memory_id: str) -> Path:
+        self._refuse_provisional(memory_id)
         if is_test_seeded(self.v2._provenance(memory_id)):
             raise StateConflictError('test-seeded notes have no validation package')
         return self.artifacts.publish(memory_id)

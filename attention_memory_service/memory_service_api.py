@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, StrictInt, field_validator, model_validator
+from pydantic import Field, BaseModel, StrictInt, field_validator, model_validator
 
 from .core.models import MemoryUseRecord
 from .core.store import StateConflictError
+from .applicability import marker
+from .memory_v2 import trusted_here
 from .identity import store_id
 from .memory_service import MemoryService
 from .seeded_notes import flags
@@ -40,6 +42,12 @@ class CandidateInput(BaseModel):
 class RetrieveInput(BaseModel):
     context: dict[str, Any]
     now: float
+
+
+class LayeredRetrieveInput(RetrieveInput):
+    model_config = {'extra': 'forbid'}
+    # Default stays exact; the Dev prompt path opts in to same_task references.
+    match_levels: list[str] = ['same_scene']
 
 
 class UseGrantInput(RetrieveInput):
@@ -168,6 +176,36 @@ class SeededNoteInput(BaseModel):
         return validate_group(value) if value is not None else None
 
 
+class ProvisionalNoteInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    actor: str
+    memory_id: str
+    context: dict[str, Any]
+    guidance: str
+    failure_signature: dict[str, Any]
+    origin: dict[str, Any]
+    origin_public_feedback_text: str
+    help_public_feedback_text: str
+    title: str | None = None
+    summary: str | None = None
+    group: str | None = None
+    ttl_days: float = Field(default=14, strict=True, gt=0, le=14)
+
+
+class MemoryQueryInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    status: str | None = None
+    context: dict[str, Any]
+
+
+class ProvisionalOutcomeInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    grant_id: str
+    development_id: str
+    public_feedback_text: str
+    public_feedback_sha256: str
+
+
 def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None,
                importer_key: str | None = None,
                dev_v2_catalogs: dict[str, Any] | None = None) -> FastAPI:
@@ -204,14 +242,14 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                                   x_memory_service_key: str | None = Header(default=None),
                                   x_memory_importer_key: str | None = Header(default=None)):
         provenance = service.v2._provenance(request.path_params['memory_id'])
-        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded'}:
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
             importer_authorized(x_memory_service_key, x_memory_importer_key)
 
     def online_memory(memory):
         value = memory.artifact()
         provenance = service.v2._provenance(memory.memory_id)
         value.update(flags(provenance))
-        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded'}:
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
             for key in ('confidence', 'validation_successes', 'validation_failures', 'status_reason'):
                 value.pop(key, None)
         return value
@@ -240,6 +278,14 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     def test_seeded_note(payload: SeededNoteInput):
         return guarded(service.create_test_seeded_note, **payload.model_dump())
 
+    @app.post('/dev-v2/provisional-notes', dependencies=[Depends(importer_authorized)])
+    def provisional_note(payload: ProvisionalNoteInput):
+        return guarded(service.create_provisional_note, **payload.model_dump())
+
+    @app.post('/dev-v2/provisional-outcomes', dependencies=[Depends(importer_authorized)])
+    def provisional_outcome(payload: ProvisionalOutcomeInput):
+        return guarded(service.record_provisional_outcome, **payload.model_dump())
+
     @app.post('/dev-v2/pairs', dependencies=[Depends(importer_authorized)])
     def imported_pair(payload: ImportedPairInput):
         return guarded(service.record_dev_v2_pair, **payload.model_dump())
@@ -251,6 +297,11 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     @app.get('/dev-v2/memories', dependencies=[Depends(authorized)])
     def dev_v2_memories(status: str | None = None):
         return {'memories': guarded(service.list_dev_v2_memories, status=status)}
+
+    @app.post('/dev-v2/memories/query', dependencies=[Depends(authorized)])
+    def dev_v2_memories_query(payload: MemoryQueryInput):
+        return {'memories': guarded(service.list_dev_v2_memories, status=payload.status,
+                                    context=payload.context)}
 
     @app.get('/dev-v2/memories/{memory_id}', dependencies=[Depends(authorized)])
     def dev_v2_memory(memory_id: str):
@@ -288,10 +339,15 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
         return guarded(service.create_candidate, **payload.model_dump()).artifact()
 
     @app.post("/retrieve", dependencies=[Depends(authorized)])
-    def retrieve(payload: RetrieveInput):
-        return [online_memory(item) for item in guarded(
-            service.retrieve, payload.context, now=payload.now,
-        )]
+    def retrieve(payload: LayeredRetrieveInput):
+        rows = []
+        for item, level in guarded(service.retrieve_levels, payload.context, now=payload.now,
+                                   levels=tuple(getattr(payload, 'match_levels', ['same_scene']))):
+            value = online_memory(item)
+            provenance = service.v2._provenance(item.memory_id) or {}
+            value.update(marker(level, trusted_here(item, level)), source_seed=provenance.get('source_seed'))
+            rows.append(value)
+        return rows
 
     @app.post("/use-grants", dependencies=[Depends(authorized)])
     def use_grant(payload: UseGrantInput):

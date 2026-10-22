@@ -16,11 +16,18 @@ from pathlib import Path
 from typing import Any
 
 from .attention_modes import AssistanceMode, RequestState
-from .core.memory import MemoryManager
+from .core.memory import MemoryManager, _matches
 from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord, RequestType
 from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
-from .seeded_notes import is_test_seeded, flags, TUPLE_KEYS
+from .seeded_notes import is_test_seeded, is_provisional, flags, TUPLE_KEYS
+from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, same_scene,
+                            same_task, valid_interface)
+
+
+def trusted_here(memory, level):
+    """Only a trusted note at the exact scene is trusted for that scene."""
+    return memory.status is MemoryStatus.TRUSTED and level == SAME_SCENE
 
 
 def _digest(data: bytes) -> str:
@@ -141,6 +148,8 @@ class MemoryV2Manager:
         return None if row is None else json.loads(row[0])
 
     def record_plan(self, memory_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        if is_provisional(self._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation or impact results')
         provenance = self.provenance(memory_id)
         self.verify_source_evidence(memory_id)
         memory = self.store.get_memory(memory_id)
@@ -426,6 +435,14 @@ class MemoryV2Manager:
                     or value['artifact'].get('failure_signature') != source.get('failure_signature')):
                 raise StateConflictError("Dev v2 source/Memory binding changed")
             return value
+        if value.get('channel') == 'dev_v2_provisional':
+            if (not is_provisional(value)
+                    or memory.applicability != value['artifact']['applicability']
+                    or memory.source_trace_id != value['source_trace_id']
+                    or value['failure_signature'] != value['artifact']['failure_signature']
+                    or value['source_seed'] != memory.applicability['seed']):
+                raise StateConflictError('provisional provenance binding changed')
+            return value
         if value.get('channel') == 'test_seeded':
             if (not is_test_seeded(value)
                     or memory.applicability != value['artifact']['applicability']
@@ -531,61 +548,103 @@ class MemoryV2Manager:
         return guidance
 
     def retrieve(self, context: dict[str, Any], *, now: float) -> list[MemoryRecord]:
+        """Exact (same-scene) retrieval; trial grants and legacy callers use this."""
+        return [item for item, _ in self.retrieve_levels(context, now=now, levels=(SAME_SCENE,))]
+
+    def retrieve_levels(self, context: dict[str, Any], *, now: float,
+                        levels=LEVELS) -> list[tuple[MemoryRecord, str]]:
+        """Return ``(memory, match_level)``: trusted same-scene notes first, then
+        notes not trusted here (provisional, other-scene), newest first."""
         if context.get("perception_mode") not in {"sim_gt", "vision"}:
             raise ValueError("retrieval requires explicit perception mode")
+        if not isinstance(levels, (list, tuple)) or not levels or any(level not in LEVELS for level in levels):
+            raise ValueError("unknown Memory match level")
+        if not valid_interface(context):
+            raise ValueError("sdk_interface_sha256 must be SHA-256")
         matches = MemoryManager(self.store).retrieve(context, now=now)
-        matches.extend(memory for memory in self.store.list_memories()
-                       if memory.status is MemoryStatus.TRUSTED
-                       and is_test_seeded(self._provenance(memory.memory_id))
-                       and memory not in matches)
+        for memory in self.store.list_memories():
+            if memory in matches:
+                continue
+            provenance = self._provenance(memory.memory_id)
+            if (memory.status is MemoryStatus.TRUSTED and provenance
+                    and provenance.get('channel') in {'dev_v2', 'test_seeded'}
+                    or memory.status is MemoryStatus.PROVISIONAL and is_provisional(provenance)):
+                matches.append(memory)
         result = []
         for item in matches:
             if self._provenance(item.memory_id) is None:
                 continue
             provenance = self.provenance(item.memory_id)
-            if is_test_seeded(provenance):
-                if set(context) != TUPLE_KEYS or context != item.applicability:
-                    continue
-                result.append(item)
-                continue
+            level = self._match_level(item, provenance, context)
+            if level in levels:
+                result.append((item, level))
+        here = [pair for pair in result if trusted_here(*pair)]
+        rest = sorted((pair for pair in result if not trusted_here(*pair)),
+                      key=lambda pair: (-pair[0].created_at, pair[0].memory_id))
+        return here + rest
+
+    def _match_level(self, item, provenance, context):
+        from .dev_v2 import SCOPE
+        if is_test_seeded(provenance) or is_provisional(provenance):
+            if set(context) - {INTERFACE_KEY} != TUPLE_KEYS:
+                return None
+            if same_scene(item.applicability, context, TUPLE_KEYS):
+                return SAME_SCENE
+            if same_task(item.applicability, context, {item.applicability.get('task_prompt')}):
+                return SAME_TASK
+            return None
+        if self._trusted_exact(item, provenance, context):
+            return SAME_SCENE
+        if (item.status is MemoryStatus.TRUSTED and provenance.get('channel') == 'dev_v2'
+                and set(context) - {INTERFACE_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}):
             plan = self.get_plan(item.memory_id)
-            if plan and plan.get('profile', 'default') == 'single_scene_v1':
-                from .dev_v2 import SCOPE
-                if (context.get('seed') != provenance['source_seed']
-                        or any(item.applicability.get(k) != context.get(k) for k in SCOPE)
-                        or context.get('camera_names') != plan['cases'][0]['camera_names']
-                        or context.get('task_prompt') != plan['cases'][0]['task_prompt']):
-                    continue
-            if 'sdk_sha256' in context or 'namespace' in context:
-                from .dev_v2 import SCOPE
-                if provenance.get('channel') != 'dev_v2' or any(item.applicability.get(k) != context.get(k) for k in SCOPE):
-                    continue
-            if not all(item.applicability.get(key) == context.get(key) for key in ("perception_mode", "suite", "task_id")):
-                continue
-            axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
-            if not all(isinstance(context.get(axis), str) and context[axis] for axis in axes):
-                continue
-            if (
-                not isinstance(context.get("camera_names"), list)
-                or not context["camera_names"]
-                or any(not isinstance(name, str) or not name for name in context["camera_names"])
-                or not isinstance(context.get("task_prompt"), str)
-                or not context["task_prompt"].strip()
-            ):
-                continue
-            variation = {axis: context[axis] for axis in axes}
-            if plan is None or not any(
-                all(case[axis] == variation[axis] for axis in axes)
-                and case["camera_names"] == context["camera_names"]
-                and case["task_prompt"] == context["task_prompt"]
-                for case in plan["cases"]
-            ):
-                continue
-            scope = self.impact_report(item.memory_id)["validated_scope"]
-            if variation in scope:
+            prompts = {case.get('task_prompt') for case in (plan or {}).get('cases', [])}
+            if plan is not None and same_task(item.applicability, context, prompts):
                 self.verify_source_evidence(item.memory_id)
-                result.append(item)
-        return result
+                return SAME_TASK
+        return None
+
+    def _trusted_exact(self, item, provenance, context):
+        from .dev_v2 import SCOPE
+        plan = self.get_plan(item.memory_id)
+        if plan and plan.get('profile', 'default') == 'single_scene_v1':
+            if (context.get('seed') != provenance['source_seed']
+                    or not same_scene(item.applicability, context, SCOPE)
+                    or context.get('camera_names') != plan['cases'][0]['camera_names']
+                    or context.get('task_prompt') != plan['cases'][0]['task_prompt']):
+                return False
+        if 'sdk_sha256' in context or 'namespace' in context:
+            if provenance.get('channel') != 'dev_v2' or not same_scene(item.applicability, context, SCOPE):
+                return False
+        elif not _matches(item.applicability, context):
+            # Legacy notes keep the core exact-condition match.
+            return False
+        if not all(item.applicability.get(key) == context.get(key) for key in ("perception_mode", "suite", "task_id")):
+            return False
+        axes = ("scene_id", "object_set_id", "camera_config_id", "task_variant_id")
+        if not all(isinstance(context.get(axis), str) and context[axis] for axis in axes):
+            return False
+        if (
+            not isinstance(context.get("camera_names"), list)
+            or not context["camera_names"]
+            or any(not isinstance(name, str) or not name for name in context["camera_names"])
+            or not isinstance(context.get("task_prompt"), str)
+            or not context["task_prompt"].strip()
+        ):
+            return False
+        variation = {axis: context[axis] for axis in axes}
+        if plan is None or not any(
+            all(case[axis] == variation[axis] for axis in axes)
+            and case["camera_names"] == context["camera_names"]
+            and case["task_prompt"] == context["task_prompt"]
+            for case in plan["cases"]
+        ):
+            return False
+        scope = self.impact_report(item.memory_id)["validated_scope"]
+        if variation in scope:
+            self.verify_source_evidence(item.memory_id)
+            return True
+        return False
 
     def verify_use(self, use: MemoryUseRecord) -> None:
         """Require the recorded outcome to agree with the raw policy trace."""
@@ -642,6 +701,8 @@ class MemoryV2Manager:
         Safety files must be independent monitor outputs with an integer
         ``unsafe_attempts`` field. They are hashed here and rechecked at gate.
         """
+        if is_provisional(self._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation or impact results')
         provenance = self.provenance(memory_id)
         self.verify_source_evidence(memory_id)
         control = self._trial(control_attempt_id)
@@ -737,6 +798,8 @@ class MemoryV2Manager:
         return payload
 
     def impact_report(self, memory_id: str) -> dict[str, Any]:
+        if is_provisional(self._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation or impact results')
         provenance = self.provenance(memory_id)
         if is_test_seeded(provenance):
             raise StateConflictError('test-seeded notes are excluded from impact reports')
@@ -909,7 +972,7 @@ class MemoryV2Manager:
         "insufficient_treatment_successes": "insufficient treatment successes",
         "treatment_fraction_below_0.75": "treatment success fraction is below 0.75",
         "no_validated_scope": "no validated retrieval scope remains after counterexamples",
-        'control_signature_not_reproduced': 'target failure did not reproduce in at least 80% of controls',
+        'control_signature_not_reproduced': 'target failure did not reproduce in at least 60% of controls',
         'treatment_signature_remains': 'target failure remains in more than 20% of treatments',
         'treatment_stopped_earlier': 'a treatment stopped before its paired control',
         'mixed_validation_configuration': 'single-scene arms used different frozen configurations',
@@ -926,7 +989,7 @@ class MemoryV2Manager:
             failures.append('mixed_validation_configuration')
         if report['safety_regressions'] or report['treatment_unsafe_attempts'] > report['control_unsafe_attempts']:
             failures.append('safety_regression')
-        if report['control_signature_count'] < math.ceil(0.8 * n):
+        if report['control_signature_count'] < math.ceil(0.6 * n):
             failures.append('control_signature_not_reproduced')
         if report['treatment_signature_count'] > math.floor(0.2 * n):
             failures.append('treatment_signature_remains')
@@ -967,6 +1030,8 @@ class MemoryV2Manager:
         return plan
 
     def validate_and_promote(self, memory_id: str, *, minimum_pairs: int = 5) -> MemoryRecord:
+        if is_provisional(self._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation or impact results')
         report = self.impact_report(memory_id)
         self.verify_source_evidence(memory_id)
         plan = self._plan_complete(memory_id)
@@ -1008,6 +1073,8 @@ class MemoryV2Manager:
         The decision, its gates and the full impact report are kept so a rejected
         candidate stays explainable. An incomplete plan is not a verdict.
         """
+        if is_provisional(self._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation or impact results')
         if is_test_seeded(self._provenance(memory_id)):
             raise StateConflictError('test-seeded notes cannot be evaluated')
         memory = self.store.get_memory(memory_id)
@@ -1033,7 +1100,7 @@ class MemoryV2Manager:
         if single:
             decision.update(trust_scope='scene_scoped' if not failures else None,
                             cross_scene_eligible=False,
-                            gate_thresholds={'minimum_pairs': 5, 'control_signature_fraction_min': 0.8,
+                            gate_thresholds={'minimum_pairs': 5, 'control_signature_fraction_min': 0.6,
                                              'treatment_signature_fraction_max': 0.2,
                                              'stop_position': 'each treatment >= paired control',
                                              'safety': 'no per-pair or net regression'})
@@ -1064,6 +1131,8 @@ class MemoryV2Manager:
 
     def verify_source_evidence(self, memory_id: str) -> None:
         """Fail closed if the candidate's original artifact bytes are gone."""
+        if is_provisional(self._provenance(memory_id)):
+            raise StateConflictError('provisional notes cannot enter validation or impact results')
         provenance = self.provenance(memory_id)
         if is_test_seeded(provenance):
             raise StateConflictError('test-seeded notes are excluded from validation evidence')

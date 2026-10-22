@@ -21,29 +21,32 @@ def is_test_seeded(provenance):
                 and provenance.get('excluded_from_results') is True)
 
 
+def is_provisional(provenance):
+    return bool(provenance and provenance.get('channel') == 'dev_v2_provisional'
+                and provenance.get('trust_scope') == 'provisional'
+                and provenance.get('unvalidated') is True
+                and provenance.get('excluded_from_results') is True)
+
+
 def flags(provenance):
+    if is_provisional(provenance):
+        return {'unvalidated': True, 'excluded_from_results': True,
+                'trust_scope': 'provisional'}
     if is_test_seeded(provenance):
         return {'seeded_for_tests': True, 'excluded_from_results': True,
                 'trust_scope': 'test_seeded'}
     return {}
 
 
-def create(service, *, actor, reason, memory_id, context, guidance, repair='',
-           title=None, summary=None, group=None):
-    if title is not None:
-        title = validate_title(title)
-    if summary is not None:
-        summary = validate_summary(summary)
-    if group is not None:
-        group = validate_group(group)
-    for name, value in (('actor', actor), ('reason', reason), ('memory_id', memory_id),
-                        ('guidance', guidance)):
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f'{name} is required')
-    if not isinstance(repair, str):
-        raise ValueError('repair must be text')
-    if not isinstance(context, dict) or set(context) != TUPLE_KEYS:
+def validate_context(context):
+    # sdk_interface_sha256 is optional only for notes seeded before it existed;
+    # see applicability.py for the matching rule.
+    if not isinstance(context, dict) or set(context) - {'sdk_interface_sha256'} != TUPLE_KEYS:
         raise ValueError('test seed requires the complete exact single-scene tuple')
+    if 'sdk_interface_sha256' in context and (
+            not isinstance(context['sdk_interface_sha256'], str)
+            or not SHA.fullmatch(context['sdk_interface_sha256'])):
+        raise ValueError('sdk_interface_sha256 must be SHA-256')
     if type(context['seed']) is not int:
         raise ValueError('seed must be an integer')
     if any(not isinstance(context[k], str) or not context[k].strip()
@@ -63,6 +66,23 @@ def create(service, *, actor, reason, memory_id, context, guidance, repair='',
             or not isinstance(ref['uri'], str) or not ref['uri'].strip()
             or not isinstance(ref['sha256'], str) or not SHA.fullmatch(ref['sha256'])):
         raise ValueError('scene contract reference needs uri and SHA-256')
+
+
+def create(service, *, actor, reason, memory_id, context, guidance, repair='',
+           title=None, summary=None, group=None):
+    if title is not None:
+        title = validate_title(title)
+    if summary is not None:
+        summary = validate_summary(summary)
+    if group is not None:
+        group = validate_group(group)
+    for name, value in (('actor', actor), ('reason', reason), ('memory_id', memory_id),
+                        ('guidance', guidance)):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f'{name} is required')
+    if not isinstance(repair, str):
+        raise ValueError('repair must be text')
+    validate_context(context)
     if any(type(value) is not str for value in (actor, reason, memory_id, guidance)):
         raise ValueError('invalid text')
     requested = {'context': context, 'guidance': guidance, 'repair': repair}

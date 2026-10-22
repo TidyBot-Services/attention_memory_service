@@ -127,6 +127,8 @@ def public(value):
 def scope(value):
     require(isinstance(value, dict) and all(isinstance(value.get(k), str) and value[k].strip() for k in SCOPE), 'complete exact Dev v2 scope required')
     require(SHA.fullmatch(value['sdk_sha256']) is not None, 'SDK digest required')
+    require('sdk_interface_sha256' not in value or isinstance(value['sdk_interface_sha256'], str)
+            and SHA.fullmatch(value['sdk_interface_sha256']) is not None, 'SDK interface digest must be SHA-256')
     require(value['perception_mode'] in {'sim_gt', 'vision'}, 'invalid perception mode')
     require(isinstance(value.get('camera_names'), list) and value['camera_names'] and all(isinstance(x, str) and x for x in value['camera_names']), 'concrete camera_names required')
     require(isinstance(value.get('task_prompt'), str) and value['task_prompt'].strip(), 'concrete task_prompt required')
@@ -415,6 +417,8 @@ class DevV2Evidence:
             self.verify_file(catalog_id, {'uri': name, 'sha256': sha})
         sdk = d['sdk_identity']
         require(digest(json.dumps(sdk, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()) == d['context']['sdk_sha256'], 'SDK identity does not match exact context digest')
+        from .applicability import interface_digest
+        require('sdk_interface_sha256' not in d['context'] or interface_digest(sdk) == d['context']['sdk_interface_sha256'], 'SDK interface identity does not match contract and prompt')
         require(sdk['planner_lock'] == lock['planner_lock']['sha256'] and sdk['robot_model_identity'] == lock['model_sources'], 'SDK identity lock mismatch')
         expected_files = {str(Path(n).relative_to(lock['source_root'])): sha for n, sha in lock['files'].items()
                           if Path(n).is_relative_to(lock['source_root']) and any(part in Path(n).parts for part in ('openarm365', 'openarm365_dev', 'openarm365_dev_v2', 'curobo_v2')) and '/tests/' not in n}
@@ -709,9 +713,11 @@ class DevV2Evidence:
         return self.import_source(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])
 
     def create_candidate(self, *, memory_id, source_import_id, created_at):
+        require(not self.store.count_memory_events(memory_id, 'memory.provisional_created'),
+                'provisional notes cannot become candidates; create a new evidence-backed candidate')
         require(type(created_at) in (int, float) and math.isfinite(created_at), 'finite candidate timestamp required')
         s = self.source(source_import_id)
-        artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in SCOPE}}
+        artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in (*SCOPE, 'sdk_interface_sha256') if k in s['context']}}
         if s['failure_signature'] is not None:
             artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
@@ -755,6 +761,7 @@ class DevV2Evidence:
         require(type(version) is int and version > 0 and isinstance(cell, str) and cell and type(seed) is int, 'exact cell/version/seed required')
         require(exposure in {'none', 'candidate_validation'} and all(isinstance(x, str) and SHA.fullmatch(x) for x in (policy_sha256, config_sha256)), 'explicit exposure and code/config digests required')
         require(all(context[k] == memory.applicability[k] for k in SCOPE if k not in AXES), 'validation grant exact SDK/namespace/robot scope mismatch')
+        require('sdk_interface_sha256' not in memory.applicability or context.get('sdk_interface_sha256') == memory.applicability['sdk_interface_sha256'], 'validation grant exact SDK interface mismatch')
         require(any(case['seed'] == seed and all(case[k] == context[k] for k in (*AXES, 'camera_names', 'task_prompt')) for case in plan['cases']), 'validation grant outside frozen concrete case')
         if plan.get('profile', 'default') == 'single_scene_v1':
             arm = 'control_cell' if exposure == 'none' else 'treatment_cell'
@@ -895,6 +902,8 @@ class DevV2Evidence:
             row = db.execute('SELECT payload FROM memory_dev_exposures WHERE grant_id=?', (grant_id,)).fetchone()
         require(row is not None, 'unknown Dev Memory grant')
         grant = json.loads(row[0])
+        require(grant.get('trust_scope') != 'provisional',
+                'provisional exposure is excluded from Dev results')
         require(grant.get('excluded_from_results') is not True,
                 'test-seeded exposure is excluded from Dev results')
         result = self._result_evidence(grant, execution_import_id)

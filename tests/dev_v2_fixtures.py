@@ -7,7 +7,8 @@ from attention_memory_service.dev_v2 import digest, encoded, public_trace_projec
 
 
 class Fixture:
-    def __init__(self, tmp):
+    def __init__(self, tmp, interface=False):
+        self.interface = interface
         self.root = tmp / 'executor'; self.root.mkdir()
         self.validator = tmp / 'validator'; self.validator.mkdir()
         self.catalogs = {}
@@ -37,6 +38,9 @@ class Fixture:
         camera = {k: config[k] for k in ('camera_names', 'camera_width', 'camera_height', 'randomize_cameras')}
         ctx = {k: config[k] for k in ('task_id', 'robot', 'controller', 'perception_mode', 'scene_id', 'object_set_id', 'camera_names', 'task_prompt')}
         ctx.update(benchmark='AttentionBench', suite='robocasa365', namespace='controlled_test_only', sdk_sha256=self.sdk_sha, camera_config_id='robocasa365:' + digest(json.dumps(camera, sort_keys=True, ensure_ascii=False).encode()), task_variant_id=f"PickPlaceCounterToSink:layout{11+variant}:style34:fixed")
+        if self.interface:
+            from attention_memory_service.applicability import interface_digest
+            ctx['sdk_interface_sha256'] = interface_digest(self.sdk)
         budget = {'assistance_credits': 1}
         config_ref = self.write(directory / 'config.json', config)
         source = self.write(directory / 'policy.py', code)

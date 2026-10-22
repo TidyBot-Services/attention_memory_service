@@ -47,6 +47,7 @@ class MemoryStatus(str, Enum):
     CANDIDATE = "candidate"
     VALIDATED = "validated"
     TRUSTED = "trusted"
+    PROVISIONAL = "provisional"
     REJECTED = "rejected"
     DISABLED = "disabled"
     EXPIRED = "expired"

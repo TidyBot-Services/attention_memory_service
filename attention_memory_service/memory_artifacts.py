@@ -50,6 +50,8 @@ class MemoryArtifactStore:
         if memory is None:
             raise StateConflictError("unknown memory")
         provenance = self.v2.provenance(memory_id)
+        if provenance.get('channel') == 'dev_v2_provisional':
+            raise StateConflictError('provisional notes have no validated source package')
         directory = self.directory(memory_id)
         directory.mkdir(parents=True, exist_ok=True)
         if not directory.resolve().is_relative_to(self.root):
@@ -86,6 +88,8 @@ class MemoryArtifactStore:
         if memory is None or manifest.get("core_record_sha256") != _sha256(_json(memory.artifact())):
             raise StateConflictError("memory package is stale relative to SQLite")
         provenance = self.v2.provenance(memory_id)
+        if provenance.get('channel') == 'dev_v2_provisional':
+            raise StateConflictError('provisional notes have no validated source package')
         if any((
             manifest.get("schema_version") != "attentionbench.memory-package.v2",
             manifest.get("version") != memory.version,
