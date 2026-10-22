@@ -21,7 +21,7 @@ from .dev_use import DevMemoryUse
 from .dev_v2 import evidence_operation
 from .memory_artifacts import MemoryArtifactStore
 from .memory_v2 import MemoryV2Manager, trusted_here
-from .applicability import LEVELS, SAME_SCENE, marker
+from .applicability import LAYER, LEVELS, SAME_SCENE, marker
 from . import provisional_notes
 from .seeded_notes import create as create_test_seeded, flags, is_test_seeded, is_provisional
 
@@ -433,6 +433,11 @@ class MemoryService:
             scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
             rows.append({
                 'memory_id': memory.memory_id, 'version': memory.version,
+                'layer': 'scene',
+                'from_provisional': provenance.get('from_provisional'),
+                **({'read_layer': LAYER.get(levels.get(memory.memory_id))} if levels is not None else {}),
+                **({'origin_summary': {k: provenance['origin'][k] for k in ('experiment_id', 'help_version', 'policy_id')},
+                    'from_run_note': provenance.get('from_run_note')} if provisional else {}),
                 'title': provenance.get('title'),
                 'summary': provenance.get('summary'),
                 'group': provenance.get('group'),

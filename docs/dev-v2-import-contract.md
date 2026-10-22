@@ -375,3 +375,26 @@ the shared 16 Dev / 8 Advisor / 32 native / 400000 token / 7200 second ledger. D
 not reset its ID/deadline, erase unknown holds, self-approve robot motion, change
 scene/safety/scoring requirements, or treat a script exit0 as three-feature
 end-to-end acceptance.
+
+### Nested Memory layers (plan 0d fourth revision)
+
+Stored Service notes live in `scene`; run-local notes live in `run`. Retrieval
+rows and Dev-use grants carry the read `layer` (`scene`, `task`, or `family`)
+and `source_task_id`. Catalogue rows carry stored `layer` and, when queried
+with a context, `read_layer`. Old records are interpreted without rewriting.
+`same_family` is an explicit opt-in reference, never trusted here; task families
+are defined only in `attention_memory_service/families.py`. Exact retrieval and
+validation defaults are unchanged.
+
+A provisional import may supply `from_run_note` with exactly `experiment_id`,
+`cell`, integer `version` (equal to origin `help_version`), and `run_note_id`.
+The identifiers must match the origin; the id is `r-` plus the first 24 hex
+characters of SHA-256 of `experiment_id:cell:version`. The link is stored in
+provenance. Omitting it preserves the old request fingerprint.
+
+A new evidence-backed candidate may supply `from_provisional`, an existing
+`p-` plus 24 hex note id with provisional provenance and the same task and
+source seed. It records lineage only and adds no validation authority. Omitting
+it leaves candidate provenance unchanged. Public catalogue lineage contains only
+`origin_summary` (experiment, helped version, policy), `from_run_note`, and
+`from_provisional`; guidance and private evidence are not exposed.

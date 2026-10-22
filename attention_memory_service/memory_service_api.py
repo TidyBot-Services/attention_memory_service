@@ -112,6 +112,7 @@ class ImportedCandidateInput(BaseModel):
     memory_id: str
     source_import_id: str
     created_at: float
+    from_provisional: str | None = None
 
 
 class ImportedPairInput(BaseModel):
@@ -184,6 +185,7 @@ class ProvisionalNoteInput(BaseModel):
     guidance: str
     failure_signature: dict[str, Any]
     origin: dict[str, Any]
+    from_run_note: dict | None = None
     origin_public_feedback_text: str
     help_public_feedback_text: str
     title: str | None = None
@@ -345,7 +347,8 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                                    levels=tuple(getattr(payload, 'match_levels', ['same_scene']))):
             value = online_memory(item)
             provenance = service.v2._provenance(item.memory_id) or {}
-            value.update(marker(level, trusted_here(item, level)), source_seed=provenance.get('source_seed'))
+            value.update(marker(level, trusted_here(item, level)), source_seed=provenance.get('source_seed'),
+                         source_task_id=item.applicability.get('task_id'))
             rows.append(value)
         return rows
 
