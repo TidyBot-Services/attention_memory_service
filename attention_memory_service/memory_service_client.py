@@ -14,10 +14,9 @@ from .core.store import StateConflictError
 
 
 def _memory(value: dict[str, Any]) -> MemoryRecord:
-    payload = dict(value)
-    for key in ('seeded_for_tests', 'excluded_from_results', 'trust_scope', 'unvalidated',
-                'match_level', 'trusted_here', 'source_seed'):
-        payload.pop(key, None)
+    from dataclasses import fields
+    allowed = {field.name for field in fields(MemoryRecord)}
+    payload = {key: item for key, item in value.items() if key in allowed}
     payload["status"] = MemoryStatus(payload["status"])
     payload["evidence_refs"] = tuple(payload["evidence_refs"])
     return MemoryRecord(**payload)

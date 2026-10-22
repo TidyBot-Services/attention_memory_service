@@ -46,7 +46,7 @@ def progress(value):
 
 def create(service, *, actor, memory_id, context, guidance, failure_signature, origin,
            origin_public_feedback_text, help_public_feedback_text,
-           title=None, summary=None, group=None, ttl_days=14):
+           title=None, summary=None, group=None, ttl_days=14, from_run_note=None):
     for name, value in (('actor', actor), ('memory_id', memory_id), ('guidance', guidance)):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'{name} is required')
@@ -92,6 +92,17 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
                      origin_public_feedback_text=origin_public_feedback_text,
                      help_public_feedback_text=help_public_feedback_text, ttl_days=ttl_days,
                      title=title, summary=summary, group=group)
+    if from_run_note is not None:
+        if (not isinstance(from_run_note, dict)
+                or set(from_run_note) != {'experiment_id', 'cell', 'version', 'run_note_id'}
+                or from_run_note['experiment_id'] != origin['experiment_id']
+                or from_run_note['cell'] != origin['cell']
+                or type(from_run_note['version']) is not int
+                or from_run_note['version'] != origin['help_version']
+                or from_run_note['run_note_id'] != 'r-' + digest(
+                    f"{origin['experiment_id']}:{origin['cell']}:{origin['help_version']}".encode())[:24]):
+            raise ValueError('invalid from_run_note binding')
+        requested['from_run_note'] = from_run_note
     fingerprint = digest(encoded(requested).encode())
     trace = f'provisional:{memory_id}'
     with sqlite3.connect(service.store.path) as db:
@@ -108,7 +119,8 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
         provenance = dict(schema_version='attentionbench.memory-provenance.v2',
                           channel='dev_v2_provisional', source_kind='advisor_proxy',
                           trust_scope='provisional', unvalidated=True, excluded_from_results=True,
-                          attested_by='offline_importer', origin=origin,
+                          attested_by='offline_importer', origin=origin, layer='scene',
+                          **({'from_run_note': from_run_note} if from_run_note is not None else {}),
                           failure_signature=failure_signature, origin_progress=origin_progress,
                           help_progress=help_progress, source_trace_id=trace, source_seed=context['seed'],
                           request_sha256=fingerprint, artifact=artifact,

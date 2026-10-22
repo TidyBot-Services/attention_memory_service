@@ -21,7 +21,7 @@ from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord, RequestTyp
 from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
 from .seeded_notes import is_test_seeded, is_provisional, flags, TUPLE_KEYS
-from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, same_scene,
+from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, SAME_FAMILY, same_family, same_scene,
                             same_task, valid_interface)
 
 
@@ -552,7 +552,7 @@ class MemoryV2Manager:
         return [item for item, _ in self.retrieve_levels(context, now=now, levels=(SAME_SCENE,))]
 
     def retrieve_levels(self, context: dict[str, Any], *, now: float,
-                        levels=LEVELS) -> list[tuple[MemoryRecord, str]]:
+                        levels=(SAME_SCENE, SAME_TASK)) -> list[tuple[MemoryRecord, str]]:
         """Return ``(memory, match_level)``: trusted same-scene notes first, then
         notes not trusted here (provisional, other-scene), newest first."""
         if context.get("perception_mode") not in {"sim_gt", "vision"}:
@@ -592,6 +592,8 @@ class MemoryV2Manager:
                 return SAME_SCENE
             if same_task(item.applicability, context, {item.applicability.get('task_prompt')}):
                 return SAME_TASK
+            if same_family(item.applicability, context):
+                return SAME_FAMILY
             return None
         if self._trusted_exact(item, provenance, context):
             return SAME_SCENE
@@ -602,6 +604,9 @@ class MemoryV2Manager:
             if plan is not None and same_task(item.applicability, context, prompts):
                 self.verify_source_evidence(item.memory_id)
                 return SAME_TASK
+            if plan is not None and same_family(item.applicability, context):
+                self.verify_source_evidence(item.memory_id)
+                return SAME_FAMILY
         return None
 
     def _trusted_exact(self, item, provenance, context):

@@ -712,7 +712,7 @@ class DevV2Evidence:
         require(old['kind'] == 'source', 'source import required')
         return self.import_source(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])
 
-    def create_candidate(self, *, memory_id, source_import_id, created_at):
+    def create_candidate(self, *, memory_id, source_import_id, created_at, from_provisional=None):
         require(not self.store.count_memory_events(memory_id, 'memory.provisional_created'),
                 'provisional notes cannot become candidates; create a new evidence-backed candidate')
         require(type(created_at) in (int, float) and math.isfinite(created_at), 'finite candidate timestamp required')
@@ -721,6 +721,19 @@ class DevV2Evidence:
         if s['failure_signature'] is not None:
             artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
+        if from_provisional is not None:
+            from .seeded_notes import is_provisional
+            require(isinstance(from_provisional, str) and re.fullmatch(r'p-[0-9a-f]{24}', from_provisional),
+                    'invalid from_provisional id')
+            with sqlite3.connect(self.store.path) as db:
+                linked = db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?',
+                                    (from_provisional,)).fetchone()
+            prior = json.loads(linked[0]) if linked else None
+            note = self.store.get_memory(from_provisional) if linked else None
+            require(is_provisional(prior) and note is not None
+                    and note.applicability.get('task_id') == s['context']['task_id']
+                    and prior.get('source_seed') == s['source_seed'], 'from_provisional scope mismatch')
+            provenance['from_provisional'] = from_provisional
         if 'title' in s:
             provenance['title'] = s['title']
         if 'summary' in s:

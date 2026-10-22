@@ -19,7 +19,7 @@ from pathlib import Path
 from .core.models import MemoryStatus
 from .core.store import StateConflictError
 from .seeded_notes import flags, is_test_seeded, is_provisional
-from .applicability import SAME_SCENE, SAME_TASK, marker as level_marker
+from .applicability import SAME_SCENE, SAME_TASK, SAME_FAMILY, layer_of, marker as level_marker
 
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -43,7 +43,7 @@ class DevMemoryUse:
                 return item, SAME_SCENE
         if 'sdk_sha256' not in context:
             return None, None  # Legacy contexts have no layered levels.
-        for item, level in self.service.retrieve_levels(context, now=now, levels=(SAME_TASK,)):
+        for item, level in self.service.retrieve_levels(context, now=now, levels=(SAME_TASK, SAME_FAMILY)):
             if item.memory_id == memory_id:
                 return item, level
         return None, None
@@ -91,7 +91,8 @@ class DevMemoryUse:
                     and current["expires_at"] <= time.time()):
                 raise StateConflictError("memory was revoked or expired before Dev exposure")
             # Trust is same-scene only; everything else is a labelled reference.
-            marker = {**marker, **level_marker(level, level == SAME_SCENE and current["status"] == MemoryStatus.TRUSTED.value)}
+            marker = {**marker, **level_marker(level, level == SAME_SCENE and current["status"] == MemoryStatus.TRUSTED.value),
+                      'source_task_id': current.get('applicability', context).get('task_id')}
             if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
                 marker.update(source_seed=provenance.get('source_seed'),
                               note_sdk_sha256=memory.applicability.get('sdk_sha256'))
@@ -105,6 +106,7 @@ class DevMemoryUse:
                         or old["memory_version"] != memory.version
                         or old.get("match_level", SAME_SCENE) != level):
                     raise StateConflictError("development ID already binds different Memory evidence")
+                old.setdefault('source_task_id', current.get('applicability', context).get('task_id'))
                 return _online_grant(old)
             record = {
                 "schema_version": "attentionbench.dev-memory-exposure.v1",
@@ -241,11 +243,17 @@ class DevMemoryUse:
                     or hashlib.sha256(artifact.read_bytes()).hexdigest()
                     != result["artifact_sha256"]):
                 raise StateConflictError("Dev result artifact changed after recording")
-        return record
+        if 'source_task_id' not in record:
+            # Layered grants have just rechecked their source note. Legacy
+            # grants were exact-task reads and retain their original context.
+            record['source_task_id'] = (found.applicability if provenance and provenance.get('channel')
+                in {'dev_v2', 'test_seeded', 'dev_v2_provisional'} else record['context']).get('task_id')
+        return _online_grant(record)
 
 
 def _online_grant(record):
     record = dict(record)
+    record.setdefault('layer', layer_of(record.get('match_level')))
     result = record.get('result')
     if result and result.get('schema_version') == 'attentionbench.dev-v2-memory-result.v1':
         record['result'] = {k: result[k] for k in ('schema_version', 'execution_import_id', 'run_id',
