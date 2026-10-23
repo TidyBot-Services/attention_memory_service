@@ -15,8 +15,10 @@ from contextvars import ContextVar
 from functools import wraps
 import json
 import math
+import os
 import re
 import sqlite3
+import stat
 import time
 import tempfile
 import uuid
@@ -51,13 +53,17 @@ def evidence_operation(function):
     def wrapped(*args, **kwargs):
         if _OPERATION.get() is not None:
             return function(*args, **kwargs)
-        state = {'memo': {}, 'files': {}, 'directories': {}}
+        state = {'memo': {}, 'files': {}, 'directories': {}, 'links': {}}
         token = _OPERATION.set(state)
         try:
             result = function(*args, **kwargs)
-            for catalog, name, canonical, identity in state['files'].values():
-                path = DevV2Evidence._path(catalog, name)
+            for resolver, catalog, name, canonical, identity in list(state['files'].values()):
+                path = resolver(catalog, name)
                 require(path == canonical and _identity(path) == identity, 'evidence changed during authority operation')
+            for name, (identity, target) in state['links'].items():
+                path = Path(name)
+                require(_identity(path, follow=False) == identity and os.readlink(path) == target,
+                        'source link changed during authority operation')
             for folder, expected in state['directories'].items():
                 require(_source_set(folder) == expected, 'SDK source file set changed during authority operation')
             return result
@@ -66,8 +72,8 @@ def evidence_operation(function):
     return wrapped
 
 
-def _identity(path):
-    stat = path.stat()
+def _identity(path, *, follow=True):
+    stat = path.stat() if follow else path.lstat()
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
@@ -288,28 +294,68 @@ class DevV2Evidence:
         require(root.is_absolute() and root.resolve() == root and root.is_dir(), 'catalog needs a canonical existing root')
         scope(catalog['context'])
         require(isinstance(catalog.get('files'), dict) and catalog['files'], 'sealed file list required')
+        links = catalog.get('links', {})
+        require(isinstance(links, dict) and (not links or catalog['role'] == 'source')
+                and set(links) <= set(catalog['files']) and not set(links) & set(catalog.get('symlinks', {})),
+                'links require source role, sealed names and no legacy symlink ambiguity')
         for name, sha in catalog['files'].items():
             require(isinstance(sha, str) and SHA.fullmatch(sha), 'catalog digest required')
-            self.verify_file_for_catalog(catalog, name, sha)
+            self.verify_file_for_catalog(catalog, name, sha, catalog_id=catalog_id)
         self._put('dev_v2_catalogs', catalog_id, catalog)
 
-    def verify_file_for_catalog(self, catalog, name, sha):
-        path = self._path(catalog, name)
+    def verify_file_for_catalog(self, catalog, name, sha, *, catalog_id=None):
+        path = self._path(catalog, name, pending=(catalog_id, catalog))
         identity = _identity(path)
         hasher = hashlib.sha256()
         with path.open('rb') as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b''):
                 hasher.update(block)
         require(hasher.hexdigest() == sha, 'registered evidence digest changed')
-        require(self._path(catalog, name) == path and _identity(path) == identity,
+        require(self._path(catalog, name, pending=(catalog_id, catalog)) == path and _identity(path) == identity,
                 'evidence changed during registration')
+        if _OPERATION.get() is not None:
+            _OPERATION.get()['files'][('registration', str(self.store.path), catalog_id, name)] = (
+                self._path, catalog, name, path, identity)
 
-    @staticmethod
-    def _path(catalog, name):
+    def _path(self, catalog, name, *, pending=None, seen=(), hops=0, chain=False):
+        require(isinstance(name, str) and name, 'unsafe evidence path')
         relative = Path(name)
         require(isinstance(name, str) and name and not relative.is_absolute() and '..' not in relative.parts, 'unsafe evidence path')
         root = Path(catalog['root'])
         path = root / relative
+        if name in catalog.get('links', {}):
+            require(catalog['role'] == 'source', 'only source catalogs may declare links')
+            require(str(path) not in seen and hops < 8, 'source link cycle or more than 8 hops')
+            # Only the final component may be a declared link; never follow an
+            # unpinned directory symlink on the way to it.
+            require(path.parent.resolve() == path.parent and not any(p.is_symlink() for p in path.parents),
+                    'source link parent must be canonical')
+            require(path.is_symlink() and stat.S_ISLNK(path.lstat().st_mode), 'declared source link must be a symlink')
+            pin = catalog['links'][name]
+            require(isinstance(pin, dict) and set(pin) == {'target', 'target_catalog', 'target_name'}
+                    and all(isinstance(v, str) and v for v in pin.values()), 'exact source link pin required')
+            target_name = Path(pin['target_name'])
+            require(not target_name.is_absolute() and '..' not in target_name.parts, 'unsafe source link target name')
+            target = Path(pin['target'])
+            require(target.is_absolute() and '..' not in target.parts and str(target) == pin['target'],
+                    'source link target must be an exact absolute path')
+            raw = os.readlink(path)
+            hop = Path(os.path.normpath(raw if os.path.isabs(raw) else str(path.parent / raw)))
+            require(hop == target, 'source link hop differs from pin')
+            destination = pending[1] if pending and pin['target_catalog'] == pending[0] else self.catalog(pin['target_catalog'], 'source')
+            require(destination['role'] == 'source' and target == Path(destination['root']) / target_name,
+                    'source link target outside target catalog root')
+            sha = catalog['files'].get(name)
+            require(isinstance(sha, str) and SHA.fullmatch(sha)
+                    and destination['files'].get(pin['target_name']) == sha, 'source link target must be sealed at exact digest')
+            if _OPERATION.get() is not None:
+                _OPERATION.get()['links'].setdefault(str(path), (_identity(path, follow=False), raw))
+            return self._path(destination, pin['target_name'], pending=pending, seen=(*seen, str(path)),
+                              hops=hops + 1, chain=True)
+        if chain:
+            require(path.resolve() == path and not any(p.is_symlink() for p in (*path.parents, path)),
+                    'every source link hop must be explicitly pinned')
+            require(path.is_file() and stat.S_ISREG(path.lstat().st_mode), 'source link must end at a regular file')
         require(path.resolve().is_relative_to(root), 'evidence escapes registered root')
         canonical = path.resolve()
         if any(p.is_symlink() for p in (*path.parents, path)):
@@ -347,7 +393,7 @@ class DevV2Evidence:
         require(digest(data) == catalog['files'][name], 'registered evidence digest changed')
         if state is not None:
             state['memo'][key] = data
-            state['files'][key] = (catalog, name, path, identity)
+            state['files'][key] = (self._path, catalog, name, path, identity)
         return data if raw else json.loads(data)
 
     def ref(self, catalog_id, ref, *, raw=False):
@@ -378,7 +424,7 @@ class DevV2Evidence:
                 sha.update(block)
         require(sha.hexdigest() == ref['sha256'], 'locked source digest changed')
         if state is not None:
-            state['files'][key] = (catalog, relative, canonical, identity)
+            state['files'][key] = (self._path, catalog, relative, canonical, identity)
 
     def scene_contract(self, executor_id, ref):
         """Resolve an exact sealed ref from executor, contract or source evidence."""

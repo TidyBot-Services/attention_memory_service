@@ -143,6 +143,16 @@ exact digests and no extra or missing implementation files. Files in a contract 
 validator catalog cannot substitute for source evidence. All roles retain the same
 path, symlink and digest checks.
 
+Source catalogs can explicitly pin cross-root symlink chains with `links`:
+`{"python": {"target": "/ABS/other/bin/python", "target_catalog": "other-source", "target_name": "python"}}`.
+Each hop must match the actual one-hop link target and an exact sealed name in a
+source catalog, with the same digest through to the final regular file. Register
+target catalogs first (a link may also target a name in its own catalog). Chains
+are limited to eight hops; cycles, implicit hops and directory symlinks are refused.
+Registration and subsequent reads check the pins and bytes. Each source root still
+needs its configured allowlist entry; role overlap rules are unchanged. See the
+[import contract](docs/dev-v2-import-contract.md) for the complete declaration.
+
 Scene contract v1 retains its 1e-6 comparator and quaternion-sign equivalence.
 V2 (`attentionbench.public-scene-contract.v2`) requires an integer config seed and
 its `tasks[task_id].seeds[str(seed)]` entry. The service recomputes raw and normalized

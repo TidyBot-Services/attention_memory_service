@@ -71,7 +71,8 @@ overlapping contract catalog.
 Every file read must be explicitly listed and match its digest. Absolute paths,
 `..`, missing files, changed bytes and unregistered targets are rejected.
 Symlinks require an explicit mapping **and** the resolved target separately pinned
-at the same digest inside the same root. No outside-root symlink is permitted.
+at the same digest inside the same root. Outside-root symlinks require the explicit
+source-only `links` declaration below; legacy `symlinks` cannot authorize them.
 A Dev identity lock includes transitive upstream/source/model/asset/interpreter
 files outside its checkout. Register those originals with role `source`, using
 the same complete context, sealed `files` list, optional pinned `symlinks`, and
@@ -80,6 +81,42 @@ Startup and importer-only online registration both accept this fourth role;
 online registration additionally requires a `"source": ["/ABS/original-sources"]`
 allowlist. Its roots must be disjoint from executor, validator **and contract**
 roots. Older configurations omitting `source` remain valid.
+
+For a locked interpreter or other source symlink, seal every hop explicitly:
+
+```json
+{
+  "role": "source",
+  "root": "/ABS/service_env/bin",
+  "context": "<same complete context object as above>",
+  "files": {"python": "<SHA-256 of the final regular file>"},
+  "links": {
+    "python": {
+      "target": "/ABS/maniskill/bin/python",
+      "target_catalog": "maniskill-source",
+      "target_name": "python"
+    }
+  }
+}
+```
+
+The target source catalog must already be registered. It must seal `target_name`
+at the same digest and its root joined with that name must equal `target` exactly.
+If that name is another symlink, its own catalog must declare the next hop in
+`links`; the chain must end at a sealed regular file. A same-catalog hop is allowed
+(for example `python` to `python3.11`), including during registration. Register
+catalogs in target-before-link order, including in startup JSON. Each chain
+directory needs a permitted source root for online registration.
+
+`lstat` must identify each declared link as a symlink; its actual `readlink` target,
+resolved one hop relative to the link's directory, must match the absolute pin.
+The maximum is eight hops. Cycles, undeclared hops, directory symlinks, unsafe
+relative names, missing or non-source target catalogs, and digest mismatches are
+refused. A name cannot use both `links` and legacy `symlinks`. Registration verifies
+the entire chain and bytes, reads recheck them, and authority operations recheck
+link identity before returning. Retargeting a link invalidates its evidence even
+when the replacement ultimately reaches the same bytes. Existing role separation,
+registration allowlists and all non-link path restrictions remain unchanged.
 
 Keep historical lock/manifest paths and bytes unchanged. A locked file resolves
 only inside its executor catalog or an explicitly registered source catalog at
