@@ -67,9 +67,24 @@ independent verdict also supplies `failure_signature`, `signature_present`, and
 `stop_position`; the service recomputes both values from that arm's sealed
 public trace and rejects a disagreement.
 
-For five pairs, promotion requires the signature in at least four control arms
+An opt-in plan mode, `arm_generation: "dev_from_origin"`, instead freezes
+`origin_source_sha256` (the note's sealed origin source), `validation_config_sha256`
+and `dev_model: {"provider": "codex", "model": "<model id>"}`. Each arm has Dev
+generate its own next policy from that origin. The grant binds that arm's generated
+SHA plus the origin, model and current candidate guidance hash/version. Control's
+Dev prompt contains no notes; treatment contains only the exact candidate guidance.
+The service checks the executor's sealed parent, model request/response, settled
+job, generated source and `attentionbench.dev-memory-exposure.v1` receipt against
+the grant and executed bundle. The receipt schema and required version-record
+fields are in the [import contract](docs/dev-v2-import-contract.md#dev-generated-arms-from-a-frozen-origin).
+Reports list per-pair control/treatment SHAs in `generated_policy_hashes`;
+`mixed_policy_versions` in this mode means differing origins or Dev models.
+Config, safety, signature and stop-position gates stay unchanged. Plans without
+`arm_generation` retain the frozen executed-policy behavior above.
+
+For five pairs, promotion requires the signature in at least three control arms
 and at most one treatment arm. With more pairs the limits are
-`ceil(0.8 * pairs)` and `floor(0.2 * pairs)`. No treatment may have more unsafe
+`ceil(0.6 * pairs)` and `floor(0.2 * pairs)`. No treatment may have more unsafe
 attempts than its paired control, and the treatment total may not exceed the
 control total. `stop_position` is the number of successful (`completed` or
 `succeeded`) SDK events in the complete public trace before termination; each
@@ -87,6 +102,118 @@ that the targeted failure type disappeared in that exact scene. It does not
 show task outcome improvement or cross-scene generalization; exclude it from
 cross-scene aggregate claims. The decision and impact report mark
 `cross_scene_eligible: false` for downstream filtering.
+
+### Automatic validation service hooks
+
+Evidence catalogs can be registered at startup, plus the importer-only registration
+endpoint restricted to configured roots. Set `--dev-v2-registration-roots /abs/roots.json`
+to a JSON object such as
+`{"executor":["/abs/experiments"],"validator":["/abs/validator"],"contract":["/abs/contracts"],"source":["/abs/original-sources"]}`.
+The same object is accepted as `dev_v2_registration_roots` by `create_app` and
+`MemoryService`. Roots must be canonical existing absolute directories and disjoint
+across roles, including between `source` and `contract`. The `contract` and `source`
+lists are optional (omitting one permits no online registration for that role).
+Registration is disabled (403) when the whole option is omitted.
+
+| Route | Authorization | Result |
+| --- | --- | --- |
+| `POST /dev-v2/catalogs` | Service key and offline importer key | Accepts `{catalog_id, catalog}` using the startup catalog shape. Root must be equal to or inside a configured root for its role. |
+| `POST /dev-v2/failed-checks` | Service key and offline importer key | Records a sealed failed independent check and closes a single-scene batch without accepting a trial. |
+| `GET /dev-v2/validation-queue` | Service key | `{items: [...]}` with memory ID, version, title, uses, failure_gone, created_at, source_summary and layer. |
+| `GET /dev-v2/memory-events?after=0` | Service key | `{events: [...]}` ordered by `seq`, with memory_id, title, event, plain reason and server time. Use the last sequence as the next cursor. |
+
+Both registration paths verify every sealed file's existence and SHA-256 immediately,
+and later evidence reads still recheck bytes. Existing path and pinned-symlink rules
+remain enforced. Identical registration is idempotent; conflicting IDs return 409.
+Online registration writes an importer audit event with the catalog ID, role, root
+and server timestamp. The operator key does not authorize registration.
+
+The `contract` catalog role is supported at startup and through the same endpoint.
+It uses the same context, sealed file list and path rules, with a root disjoint from
+executor and validator catalogs. A config's `scene_contract` reference must resolve
+inside its executor catalog or a registered `contract` or `source` catalog at the
+exact sealed digest. A contract inside the SDK source directory can share its
+source catalog's sealed list; no overlapping contract catalog is needed or allowed.
+Unregistered files and validator-only contract files are refused.
+
+The `source` role separately pins original SDK/model files outside the experiment
+root. Identity locks keep their original paths: each locked file and complete SDK
+source set must be in the executor catalog or a registered source catalog, with
+exact digests and no extra or missing implementation files. Files in a contract or
+validator catalog cannot substitute for source evidence. All roles retain the same
+path, symlink and digest checks.
+
+Scene contract v1 retains its 1e-6 comparator and quaternion-sign equivalence.
+V2 (`attentionbench.public-scene-contract.v2`) requires an integer config seed and
+its `tasks[task_id].seeds[str(seed)]` entry. The service recomputes raw and normalized
+SHA-256 from each sealed full state; normalization rounds finite numbers to six
+decimal places using Python `round`, then canonical JSON (sorted keys, compact
+separators, ASCII escaping). Booleans are refused. Each original/replay receipt's
+hashes and `matched` must agree with those computations; matching uses only the
+seed entry's normalized hash. Both independent replays must match for validation.
+V2 replay artifacts contain `{state, validation}` like the original scene receipt;
+v1 replay artifacts retain their bare state shape. See the
+[import contract](docs/dev-v2-import-contract.md) and literal cross-repo fingerprint
+vectors in `tests/test_scene_contract.py`.
+
+The queue ranks recorded observational outcomes by failure_gone descending, uses
+descending, then oldest created_at (memory ID breaks ties). Unused, test-seeded,
+non-provisional, expired, disabled and withdrawn notes are excluded, as are notes
+already linked to a validation candidate or with a current plan/decision. These
+counts choose work; they never promote a note. The worker still imports a separate
+sealed-source candidate with `from_provisional` and freezes its validation plan.
+
+A failed independent check uses `record_dev_v2_failed_check` with `memory_id`,
+`validation_grant_id`, `execution_import_id`, `catalog_id` and `descriptor` (the
+original independent verdict in the validator catalog). All native, permission,
+source-identity, binding and digest checks still apply. If only treatment safety
+fails, the candidate is immediately rejected with `safety_regression`, even with
+missing pairs. Any scene-reproduction failure, or control safety failure, closes
+the batch as `inconclusive`: the candidate stays unpromoted and unrejected, and its
+linked provisional note remains available. Both outcomes appear in memory-events.
+An inconclusive source re-enters the queue only after a new use is exposed and its
+outcome recorded after the decision; a delayed report of an earlier use does not
+qualify. A fresh candidate/plan handles the next check. Closed candidates cannot
+receive new grants, trials or pairs, or be promoted. Failed arms never count as
+accepted trials or pairs. Identical retries are idempotent; conflicting records
+return 409. All-true checks must use normal trial import.
+
+Completed `single_scene_v1` validation emits `promoted` or `rejected` notices with
+plain reasons. Controls must have grant exposure `none`; treatments must have
+`candidate_validation` for exactly the memory under test, including the control
+grant's memory binding. Thresholds and all safety, permission, scene and digest
+gates remain unchanged.
+
+When a checked candidate has `from_provisional`, the candidate status, decision,
+source-note shutdown and lifecycle audit commit in one transaction. A passing
+candidate turns the source note Off with reason
+`replaced by its checked version <candidate id>` and a `superseded` notice; a
+rejected candidate turns it Off with reason `rejected after automatic check`
+and a `rejected` notice for the source too. The source remains in listings with
+`decision_link` (candidate memory ID, decision, plain reason and decision time).
+It is excluded from retrieval at every level and from the validation queue.
+Existing operator disable, expiry or withdrawal is preserved. Operators can
+explicitly turn a disabled source back on as provisional, with the usual audit
+and expiry checks; its decision link and queue exclusion remain. Decision retries
+and later demotion of the candidate never revive or re-disable the source.
+
+The importer-only `POST /dev-v2/provisional-outcomes` also accepts observational
+outcomes for scene-trusted Dev grants. Sealed `/dev-v2/results` records feed this
+same outcome path automatically. When three or more of the last five recorded
+uses of the current memory version show the target signature, the service
+atomically demotes the note to provisional and emits one `demoted` event with
+reason `target failure in 3 of last 5 uses`, the five use IDs and actor
+`system:auto-demotion`. It waits for five outcomes and orders them by server record
+time, with insertion order breaking clock ties. Retries do not duplicate outcomes
+or demotion events.
+
+Demotion clears active scene trust, increments the note version to revoke old
+grants, and applies the provisional read/exclusion rules and a maximum 14-day
+expiry. Old decisions and sealed provenance remain available for audit. The note
+re-enters the queue and can be validated through a fresh evidence-backed candidate
+linked by `from_provisional`; old validation evidence cannot promote it again.
+Disable, expiry and withdrawal still apply. The main-repo worker owns scheduling,
+budgets and freeze controls; these endpoints do not launch runs.
 
 The read-only `GET /dev-v2/memories` and `GET /dev-v2/memories/{memory_id}`
 accept the online service key. Their **public allowlist** is memory ID, optional

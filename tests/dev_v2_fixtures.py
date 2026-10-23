@@ -30,11 +30,13 @@ class Fixture:
         path.write_bytes((encoded(value) + '\n').encode() if not isinstance(value, str) else value.encode())
         return {'uri': str(path), 'sha256': digest(path.read_bytes())}
 
-    def make(self, name, seed=101, variant=0, success=False, code='def policy(sdk):\n    pass\n', exposure='none', memory_id=None, failure=False, completed_calls=None, visual=False):
+    def make(self, name, seed=101, variant=0, success=False, code='def policy(sdk):\n    pass\n', exposure='none', memory_id=None, failure=False, completed_calls=None, visual=False, scene=None):
         directory = self.root / name; directory.mkdir()
         config = {'task_id': 'pick', 'seed': seed, 'robot': 'OpenArm365', 'controller': 'test_controller', 'perception_mode': 'sim_gt', 'scene_id': f'scene-{variant}', 'object_set_id': f'objects-{variant}', 'camera_names': [f'camera-{variant}'], 'task_prompt': f'pick cup variant {variant}', 'camera_width': 64, 'camera_height': 64, 'randomize_cameras': False, 'official_env': 'PickPlaceCounterToSink', 'layout_id': 11 + variant, 'style_id': 34, 'base_mode': 'fixed', 'evidence_kind': 'controlled_test', 'sdk_call_limit': 80, 'horizon': 2400, 'attempt_wall_seconds': 480}
         if visual:
             config['advisor_proxy'] = {'enabled': True, 'mode': 'vision', 'model': 'controlled_test_visual_advisor'}
+        if scene is not None:
+            config['scene_contract'] = scene['contract']
         camera = {k: config[k] for k in ('camera_names', 'camera_width', 'camera_height', 'randomize_cameras')}
         ctx = {k: config[k] for k in ('task_id', 'robot', 'controller', 'perception_mode', 'scene_id', 'object_set_id', 'camera_names', 'task_prompt')}
         ctx.update(benchmark='AttentionBench', suite='robocasa365', namespace='controlled_test_only', sdk_sha256=self.sdk_sha, camera_config_id='robocasa365:' + digest(json.dumps(camera, sort_keys=True, ensure_ascii=False).encode()), task_variant_id=f"PickPlaceCounterToSink:layout{11+variant}:style34:fixed")
@@ -64,6 +66,8 @@ class Fixture:
         bundle = {**binding, 'schema_version': 'attentionbench.formal-runner-result.v1', 'channel': 'dev_v2', 'formal_eligible': False, 'dev_version': 1, 'policy_id': 'full_trace_aware_attention_planner', 'config_lock': config_ref, 'status': 'completed', 'native_success': success, 'native_evaluator': native_value, 'infrastructure_failure': False, 'outcome_unknown': False, 'sandbox': {'process_isolated': True, 'sdk_rpc_only': True, 'deadline_enforced': True, 'action_cancellation_verified': True}, 'scene_condition': {'matched': True}, 'artifacts': {'trace': trace, 'native_result': native, 'sandbox_receipt': receipt, 'safety': safety}, 'evidence_kind': 'controlled_test'}
         if visual:
             bundle['artifact_dir'] = str(directory)
+        if scene is not None:
+            bundle['scene_condition'] = scene['validation']
         bref = self.write(directory / 'bundle.json', bundle)
         feedback = self.write(directory / 'feedback.json', {**public_trace_projection(trace_value), 'evidence_kind': 'controlled_test'})
         validation_input = self.write(directory / 'validation-input.json', {'memory_ids': [] if exposure == 'none' else [memory_id], 'exposure': exposure, 'context': ctx, 'policy_sha256': source['sha256'], 'config_sha256': config_ref['sha256']})
@@ -76,6 +80,9 @@ class Fixture:
             db.execute('INSERT INTO v2_versions VALUES (?,?,?)', (name, 1, encoded(record)))
             db.execute('INSERT INTO v2_jobs VALUES (?,?,?,?,?,?)', (job['job_id'], name, 1, 'execute', 'settled', encoded(job)))
         descriptor = {'schema_version': 'attentionbench.dev-v2-import.v1', 'cell': name, 'version': 1, 'context': ctx, 'manifest': mref, 'config': config_ref, 'version_record': vref, 'sdk_identity': self.sdk, 'ledger': {'uri': str(ledger), 'sha256': digest(ledger.read_bytes())}, 'execute_job_id': job['job_id'], 'validation_input': validation_input, 'permission_scope': {'run_id': binding['run_id'], 'cell': name, 'code_version': 1, 'code_sha256': source['sha256'], 'config_sha256': digest(json.dumps(config, sort_keys=True, ensure_ascii=False).encode()), 'action': 'sensor_only', 'action_version': 1, 'scope': {'mode': 'controlled_test_no_robot'}}}
+        if scene is not None:
+            descriptor['scene_state'] = self.write(directory / 'scene-condition.json',
+                                                   {'state': scene['state'], 'validation': scene['validation']})
         self.write(directory / 'execution.json', descriptor)
         vd = self.validator / name
         monitor = self.write(vd / 'monitor.json', {'schema_version': 'attentionbench.safety-monitor.v1', 'source': 'independent_safety_monitor', 'attempt_id': binding['attempt_id'], 'unsafe_attempts': 0, 'events': [{'kind': 'controlled_test_sample'}], 'violations': [], 'evidence_kind': 'controlled_test'})
@@ -84,6 +91,9 @@ class Fixture:
         comp = self.write(vd / 'comparison.json', comparison)
         costs = {'credits': 0, 'tokens': 0, 'seconds': 1.0, 'gpu_seconds': 0.0}
         verdict = {'schema_version': 'attentionbench.dev-v2-independent-validation.v1', 'purpose': 'offline_memory_validation', 'execution_import_id': name, 'bindings': {k: binding[k] for k in ('run_id', 'attempt_id', 'policy_sha256', 'config_sha256', 'task_id', 'seed')}, 'bundle': bref, 'native_result': native, 'trace': trace, 'native_success': success, 'checks': {'native_evaluation': True, 'safety': True, 'scene_reproduction': True, 'permissions': True, 'source_identity': True}, 'scene_replay_observations': obs, 'scene_replay_bindings': {'task_id': 'pick', 'seed': seed, 'config_sha256': config_ref['sha256']}, 'safety': monitor, 'permission_scope': descriptor['permission_scope'], 'costs': costs, 'validation_config': comparison, 'evidence_kind': 'controlled_test'}
+        if scene is not None:
+            verdict['scene_replay_states'] = [self.write(vd / f'state{i}.json', state)
+                                               for i, state in enumerate(scene['replays'])]
         self.write(vd / 'verdict.json', verdict)
         trial = {'schema_version': 'attentionbench.dev-v2-trial.v1', 'execution_import_id': name, 'validation_descriptor': name + '/verdict.json', 'exposure': exposure, 'memory_id': memory_id, 'costs': costs, 'developer_model': 'controlled_test_model', 'budget': budget, 'validation_config': comp, 'evidence_kind': 'controlled_test'}
         self.write(vd / 'trial.json', trial)

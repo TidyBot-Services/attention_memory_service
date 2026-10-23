@@ -22,7 +22,8 @@ def is_test_seeded(provenance):
 
 
 def is_provisional(provenance):
-    return bool(provenance and provenance.get('channel') == 'dev_v2_provisional'
+    return bool(provenance and (provenance.get('channel') == 'dev_v2_provisional'
+                               or provenance.get('channel') == 'dev_v2' and provenance.get('demoted_at') is not None)
                 and provenance.get('trust_scope') == 'provisional'
                 and provenance.get('unvalidated') is True
                 and provenance.get('excluded_from_results') is True)

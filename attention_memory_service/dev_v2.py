@@ -225,8 +225,9 @@ def stop_position(trace):
 
 
 class DevV2Evidence:
-    def __init__(self, store, catalogs=None):
+    def __init__(self, store, catalogs=None, registration_roots=None):
         self.store = store
+        self.registration_roots = self._registration_roots(registration_roots)
         with sqlite3.connect(store.path) as db:
             db.executescript('CREATE TABLE IF NOT EXISTS dev_v2_catalogs(id TEXT PRIMARY KEY,payload TEXT NOT NULL);'
                              'CREATE TABLE IF NOT EXISTS dev_v2_imports(id TEXT PRIMARY KEY,kind TEXT NOT NULL,attempt_id TEXT UNIQUE,payload TEXT NOT NULL);'
@@ -234,18 +235,74 @@ class DevV2Evidence:
         for catalog_id, catalog in (catalogs or {}).items():
             self.register(catalog_id, catalog)
 
+    @staticmethod
+    def _registration_roots(value):
+        if value is None:
+            return None
+        require(isinstance(value, dict) and {'executor', 'validator'} <= set(value)
+                and set(value) <= {'executor', 'validator', 'contract', 'source'},
+                'registration roots require executor and validator lists, with optional contract/source lists')
+        roots = {}
+        for role, entries in value.items():
+            require(isinstance(entries, list), 'registration roots must be lists')
+            roots[role] = []
+            for entry in entries:
+                require(isinstance(entry, str), 'registration root must be an absolute directory')
+                path = Path(entry)
+                require(path.is_absolute() and path.resolve() == path and path.is_dir(),
+                        'registration root must be a canonical existing absolute directory')
+                roots[role].append(path)
+        roots.setdefault('contract', [])
+        roots.setdefault('source', [])
+        require(not any(a.is_relative_to(b) or b.is_relative_to(a)
+                        for role, entries in roots.items() for other, others in roots.items() if role != other
+                        for a in entries for b in others), 'registration roots for different roles overlap')
+        return roots
+
+    def register_online(self, catalog_id, catalog):
+        if self.registration_roots is None:
+            raise PermissionError('registration not configured')
+        role = catalog.get('role')
+        require(role in self.registration_roots, 'catalog role required')
+        root = Path(catalog['root'])
+        require(root.is_absolute() and root.resolve() == root and root.is_dir(),
+                'catalog needs a canonical existing root')
+        require(any(root.is_relative_to(parent) and parent.resolve() == parent
+                    for parent in self.registration_roots[role]),
+                'catalog outside configured roots for its role')
+        self.register(catalog_id, catalog)
+        with sqlite3.connect(self.store.path) as db:
+            db.execute("INSERT OR IGNORE INTO events(event_key,entity_type,entity_id,event_type,payload) "
+                       "VALUES (?,'catalog',?,'catalog.registered',?)",
+                       ('catalog-register:' + catalog_id, catalog_id, encoded(dict(
+                           catalog_id=catalog_id, role=role, root=str(root), actor='importer',
+                           recorded_at=time.time()))))
+        return {'catalog_id': catalog_id, 'role': role, 'root': str(root)}
+
+    @evidence_operation
     def register(self, catalog_id, catalog):
-        """Startup configuration only: no registration endpoint or online method."""
+        """One sealed-file verifier for startup and restricted importer registration."""
         require(isinstance(catalog_id, str) and catalog_id, 'catalog ID required')
-        require(catalog['role'] in {'executor', 'validator'}, 'catalog role required')
+        require(catalog['role'] in {'executor', 'validator', 'contract', 'source'}, 'catalog role required')
         root = Path(catalog['root'])
         require(root.is_absolute() and root.resolve() == root and root.is_dir(), 'catalog needs a canonical existing root')
         scope(catalog['context'])
         require(isinstance(catalog.get('files'), dict) and catalog['files'], 'sealed file list required')
         for name, sha in catalog['files'].items():
-            self._path(catalog, name)
             require(isinstance(sha, str) and SHA.fullmatch(sha), 'catalog digest required')
+            self.verify_file_for_catalog(catalog, name, sha)
         self._put('dev_v2_catalogs', catalog_id, catalog)
+
+    def verify_file_for_catalog(self, catalog, name, sha):
+        path = self._path(catalog, name)
+        identity = _identity(path)
+        hasher = hashlib.sha256()
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                hasher.update(block)
+        require(hasher.hexdigest() == sha, 'registered evidence digest changed')
+        require(self._path(catalog, name) == path and _identity(path) == identity,
+                'evidence changed during registration')
 
     @staticmethod
     def _path(catalog, name):
@@ -303,6 +360,7 @@ class DevV2Evidence:
         return self.read(catalog_id, name, raw=raw)
 
     def verify_file(self, catalog_id, ref):
+        catalog_id = self._catalog_for_ref(catalog_id, ref, 'source')
         catalog = self.catalog(catalog_id)
         path = Path(ref['uri'])
         require(path.is_absolute() and path.is_relative_to(catalog['root']), 'locked source outside registered root')
@@ -322,6 +380,41 @@ class DevV2Evidence:
         if state is not None:
             state['files'][key] = (catalog, relative, canonical, identity)
 
+    def scene_contract(self, executor_id, ref):
+        """Resolve an exact sealed ref from executor, contract or source evidence."""
+        return self.ref(self._catalog_for_ref(executor_id, ref, 'contract', 'source'), ref)
+
+    def _catalog_for_ref(self, executor_id, ref, *roles):
+        require(isinstance(ref, dict) and set(ref) == {'uri', 'sha256'}, 'exact artifact reference required')
+        executor = self.catalog(executor_id, 'executor')
+        path = Path(ref['uri'])
+        require(path.is_absolute(), 'scene contract needs an absolute URI')
+        if path.is_relative_to(executor['root']):
+            require(executor['files'].get(str(path.relative_to(executor['root']))) == ref['sha256'],
+                    'artifact is not preregistered at exact digest')
+            return executor_id
+        with sqlite3.connect(self.store.path) as db:
+            rows = db.execute('SELECT id,payload FROM dev_v2_catalogs ORDER BY id').fetchall()
+        for catalog_id, payload in rows:
+            catalog = json.loads(payload)
+            if catalog['role'] in roles and path.is_relative_to(catalog['root']):
+                name = str(path.relative_to(catalog['root']))
+                if catalog['files'].get(name) == ref['sha256']:
+                    return catalog_id
+        allowed = ' or '.join(role + ' catalogs' for role in roles)
+        require(False, f'artifact outside registered {allowed} or not pinned at exact digest')
+
+    def _source_set_catalog(self, executor_id, folder, expected, files):
+        path = Path(folder)
+        require(path.is_absolute() and path.resolve() == path and path.is_dir(), 'SDK source set needs canonical directory')
+        executor = self.catalog(executor_id, 'executor')
+        with sqlite3.connect(self.store.path) as db:
+            catalogs = [json.loads(row[0]) for row in db.execute('SELECT payload FROM dev_v2_catalogs')]
+        allowed = [executor] if path.is_relative_to(executor['root']) else [c for c in catalogs if c['role'] == 'source']
+        require(any(path.is_relative_to(c['root']) and all(
+            Path(name).is_relative_to(path) and c['files'].get(str(Path(name).relative_to(c['root']))) == files[name]
+            for name in expected) for c in allowed), 'SDK source set outside sealed source catalogs')
+
     def _put(self, table, key, value, *, kind=None, attempt_id=None):
         require(isinstance(key, str) and key.strip(), 'nonempty immutable ID required')
         payload = encoded(value)
@@ -335,6 +428,12 @@ class DevV2Evidence:
                 if table == 'dev_v2_imports':
                     db.execute('INSERT INTO dev_v2_imports VALUES (?,?,?,?)', (key, kind, attempt_id, payload))
                 else:
+                    root = Path(value['root'])
+                    for row in db.execute('SELECT payload FROM dev_v2_catalogs'):
+                        other = json.loads(row[0])
+                        if value['role'] != other['role'] and {'contract', 'source'} & {value['role'], other['role']}:
+                            require(not root.is_relative_to(other['root']) and not Path(other['root']).is_relative_to(root),
+                                    'source/contract catalog roots must not overlap other roles')
                     db.execute('INSERT INTO dev_v2_catalogs VALUES (?,?)', (key, payload))
             except sqlite3.IntegrityError as exc:
                 raise StateConflictError('attempt already belongs to another import') from exc
@@ -409,7 +508,8 @@ class DevV2Evidence:
         require(lock['schema'] == 'attentionbench.dev-identity-lock.v2' and lock['formal_eligible'] is False, 'frozen Dev identity lock required')
         require(lock.get('source_sets'), 'complete SDK source file sets required')
         for folder, expected in lock['source_sets'].items():
-            require(Path(folder).is_relative_to(catalog['root']) and Path(folder).resolve() == Path(folder) and _source_set(folder) == expected and all(name in lock['files'] for name in expected), 'SDK source file set drift')
+            require(_source_set(folder) == expected and all(name in lock['files'] for name in expected), 'SDK source file set drift')
+            self._source_set_catalog(catalog_id, folder, expected, lock['files'])
             if _OPERATION.get() is not None:
                 _OPERATION.get()['directories'][folder] = expected
         require(lock['files'].get(lock['planner_lock']['path']) == lock['planner_lock']['sha256'] and lock['model_sources'] and all(lock['files'].get(n) == sha for n, sha in lock['model_sources'].items()), 'planner/robot source identity incomplete')
@@ -481,12 +581,16 @@ class DevV2Evidence:
                 'objects': {k: numeric(v) for k, v in observation['perception']['values'].items()}}
         require(all(feedback.get(k) == v for k, v in projected.items()) and not set(feedback) - {*projected, 'evidence_kind'}, 'public feedback differs from original trace projection')
         if 'scene_contract' in config:
-            contract = self.ref(catalog_id, config['scene_contract'])
+            from .scene_contract import V1, V2, verify_v2_receipt
+            contract = self.scene_contract(catalog_id, config['scene_contract'])
             original = self.ref(catalog_id, d['scene_state'])
             condition = bundle['scene_condition']
-            require(contract['schema'] == 'attentionbench.public-scene-contract.v1' and contract['tolerance'] == 1e-6, 'frozen scene contract/tolerance required')
+            require(contract['schema'] in {V1, V2} and contract['tolerance'] == 1e-6, 'frozen scene contract/tolerance required')
             require(original['validation'] == condition and condition['contract'] == config['scene_contract'] and condition['task_id'] == config['task_id'] and condition['tolerance'] == 1e-6, 'original scene receipt/contract binding mismatch')
-            require(type(condition['matched']) is bool and condition['matched'] == scene_matches(contract['tasks'][config['task_id']]['state'], original['state']) and condition['raw_sha256'] == digest(encoded(original['state']).encode()), 'original scene verdict differs from raw state')
+            if contract['schema'] == V1:
+                require(type(condition['matched']) is bool and condition['matched'] == scene_matches(contract['tasks'][config['task_id']]['state'], original['state']) and condition['raw_sha256'] == digest(encoded(original['state']).encode()), 'original scene verdict differs from raw state')
+            else:
+                verify_v2_receipt(contract, config, original['state'], condition)
         evidence = {'catalog_id': catalog_id, 'descriptor': descriptor, 'context': d['context'], 'cell': d['cell'], 'version': d['version'], 'bundle': job['receipt']['bundle'], 'public_feedback': job['receipt']['public_feedback'], 'source': record['source'], 'config': d['config'], 'manifest': d['manifest'], 'ledger': d['ledger'], 'run_id': bundle['run_id'], 'attempt_id': bundle['attempt_id'], 'status': bundle['status']}
         return evidence, d, bundle, artifacts, cell
 
@@ -527,9 +631,16 @@ class DevV2Evidence:
             require(scene_matches({'robot': observations[0]['robot'], 'objects': observations[0]['perception']['values']}, {'robot': observations[1]['robot'], 'objects': observations[1]['perception']['values']}), 'same-seed scene reproduction evidence failed')
             config = self.ref(execution['catalog_id'], execution['config'])
             if 'scene_contract' in config:
-                contract = self.ref(execution['catalog_id'], config['scene_contract'])
+                from .scene_contract import V1, verify_v2_receipt
+                contract = self.scene_contract(execution['catalog_id'], config['scene_contract'])
                 states = [self.ref(validator_id, ref) for ref in v['scene_replay_states']]
-                require(len(states) == 2 and v['scene_replay_states'][0]['uri'] != v['scene_replay_states'][1]['uri'] and all(scene_matches(contract['tasks'][bundle['task_id']]['state'], state) for state in states), 'full fixture/robot/object scene reproduction failed')
+                require(len(states) == 2 and v['scene_replay_states'][0]['uri'] != v['scene_replay_states'][1]['uri'],
+                        'full fixture/robot/object scene reproduction failed')
+                if contract['schema'] == V1:
+                    matched = [scene_matches(contract['tasks'][bundle['task_id']]['state'], state) for state in states]
+                else:
+                    matched = [verify_v2_receipt(contract, config, receipt['state'], receipt['validation']) for receipt in states]
+                require(all(matched), 'full fixture/robot/object scene reproduction failed')
         safety_path = self._path(validator, str(Path(v['safety']['uri']).relative_to(validator['root'])))
         self.ref(validator_id, v['safety'])
         from .memory_v2 import MemoryV2Manager
@@ -723,7 +834,7 @@ class DevV2Evidence:
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
         if from_provisional is not None:
             from .seeded_notes import is_provisional
-            require(isinstance(from_provisional, str) and re.fullmatch(r'p-[0-9a-f]{24}', from_provisional),
+            require(isinstance(from_provisional, str) and from_provisional,
                     'invalid from_provisional id')
             with sqlite3.connect(self.store.path) as db:
                 linked = db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?',
@@ -733,6 +844,11 @@ class DevV2Evidence:
             require(is_provisional(prior) and note is not None
                     and note.applicability.get('task_id') == s['context']['task_id']
                     and prior.get('source_seed') == s['source_seed'], 'from_provisional scope mismatch')
+            require(re.fullmatch(r'p-[0-9a-f]{24}', from_provisional) or prior.get('demoted_at') is not None,
+                    'invalid from_provisional id')
+            if prior.get('demoted_at') is not None:
+                require(prior['source_import_id'] == source_import_id, 'demoted candidate source changed')
+                provenance['from_provisional_version'] = note.version
             provenance['from_provisional'] = from_provisional
         if 'title' in s:
             provenance['title'] = s['title']
@@ -762,7 +878,7 @@ class DevV2Evidence:
         return candidate
 
     def authorize_validation(self, *, memory_id, cell, version, seed, context,
-                             policy_sha256, config_sha256, exposure):
+                             policy_sha256, config_sha256, exposure, origin_source_sha256=None):
         from .memory_v2 import MemoryV2Manager
         manager = MemoryV2Manager(self.store)
         provenance = manager.provenance(memory_id)
@@ -770,6 +886,9 @@ class DevV2Evidence:
         require(provenance.get('channel') == 'dev_v2' and memory.status.value == 'candidate', 'offline validation grant requires a Dev v2 candidate')
         plan = manager.get_plan(memory_id)
         require(plan is not None, 'freeze a validation plan before dispatch')
+        require(manager.get_decision(memory_id) is None, 'validation batch is closed')
+        generated = plan.get('arm_generation') == 'dev_from_origin'
+        require(generated or origin_source_sha256 is None, 'origin binding requires dev_from_origin plan')
         scope(context)
         require(type(version) is int and version > 0 and isinstance(cell, str) and cell and type(seed) is int, 'exact cell/version/seed required')
         require(exposure in {'none', 'candidate_validation'} and all(isinstance(x, str) and SHA.fullmatch(x) for x in (policy_sha256, config_sha256)), 'explicit exposure and code/config digests required')
@@ -779,10 +898,17 @@ class DevV2Evidence:
         if plan.get('profile', 'default') == 'single_scene_v1':
             arm = 'control_cell' if exposure == 'none' else 'treatment_cell'
             require(any(pair[arm] == cell for pair in plan['pairs']), 'cell/exposure outside frozen single-scene pairs')
-            require(policy_sha256 == plan['validation_policy_sha256'] and config_sha256 == plan['validation_config_sha256'], 'single-scene policy/config differs from frozen plan')
+            require(config_sha256 == plan['validation_config_sha256'], 'single-scene policy/config differs from frozen plan')
+            if generated:
+                require(origin_source_sha256 == plan['origin_source_sha256'], 'validation origin differs from frozen plan')
+            else:
+                require(policy_sha256 == plan['validation_policy_sha256'], 'single-scene policy/config differs from frozen plan')
         binding = dict(memory_id=memory_id, memory_version=memory.version, cell=cell, version=version, seed=seed,
                        context=context, policy_sha256=policy_sha256, config_sha256=config_sha256,
                        exposure=exposure, plan_sha256=digest(encoded(plan).encode()))
+        if generated:
+            binding.update(origin_source_sha256=origin_source_sha256, dev_model=plan['dev_model'],
+                           guidance_sha256=digest(memory.guidance.encode()))
         with sqlite3.connect(self.store.path) as db:
             db.execute('BEGIN IMMEDIATE')
             current = json.loads(db.execute('SELECT payload FROM memories WHERE id=?', (memory_id,)).fetchone()[0])
@@ -792,12 +918,64 @@ class DevV2Evidence:
                 grant = json.loads(old[0]); require(grant['binding'] == binding, 'validation dispatch already binds different evidence')
                 return grant
             rows = db.execute('SELECT payload FROM dev_v2_validation_grants WHERE memory_id=?', (memory_id,)).fetchall()
-            require(all(json.loads(row[0])['binding']['policy_sha256'] == policy_sha256 for row in rows), 'validation policy version is frozen across all cases')
+            if not generated:
+                require(all(json.loads(row[0])['binding']['policy_sha256'] == policy_sha256 for row in rows), 'validation policy version is frozen across all cases')
             if plan.get('profile', 'default') == 'single_scene_v1':
                 require(all(json.loads(row[0])['binding']['config_sha256'] == config_sha256 for row in rows), 'validation configuration is frozen across all single-scene arms')
             grant = {'schema_version': 'attentionbench.dev-v2-validation-grant.v1', 'grant_id': 'validation:' + uuid.uuid4().hex, 'issued_at': time.time(), 'binding': binding}
             db.execute('INSERT INTO dev_v2_validation_grants VALUES (?,?,?,?,?)', (grant['grant_id'], memory_id, cell, version, encoded(grant)))
         return grant
+
+    def _validation_generation(self, execution, ed, binding, plan, candidate):
+        """Reconstruct arm lineage from executor files and its settled model job."""
+        catalog_id = execution['catalog_id']
+        record = self.ref(catalog_id, ed['version_record'])
+        require({'parent_source', 'model_input', 'model_output', 'dev_memory_exposure'} <= set(record)
+                and 'model_job_id' in ed, 'generation lineage/exposure receipt missing')
+        require(binding.get('origin_source_sha256') == plan['origin_source_sha256']
+                and binding.get('dev_model') == plan['dev_model'], 'generation grant origin/model changed')
+        parent = self.ref(catalog_id, record['parent_source'], raw=True)
+        require(record['parent_source']['sha256'] == plan['origin_source_sha256'], 'wrong generation parent/origin')
+        with self._ledger(catalog_id, ed) as db:
+            job = self._job(db, ed['model_job_id'], ed['cell'], ed['version'], 'model')
+        request, output, provider = self._provider(catalog_id, job)
+        require(record['model_input'] == provider['request'] and record['model_output'] == provider['response']
+                and job['actual'].get('dev_calls') == 1
+                and job['settled_at'] <= self._execution_claim_time(execution, ed), 'generation model lineage mismatch')
+        model = {'provider': request.get('model_source', 'parcc'), 'model': request.get('model')}
+        wire = self.ref(catalog_id, provider['provider_response'])
+        require(model == plan['dev_model'] and output.get('model') == model['model']
+                and output.get('model_source', 'parcc') == model['provider']
+                and wire['body'].get('model', model['model']) == model['model'], 'generation Dev model differs from plan')
+        messages = request['messages']
+        require(len(messages) == 2 and [m['role'] for m in messages] == ['system', 'user'],
+                'generation requires one system and one user packet')
+        packet = json.loads(messages[1]['content'])
+        require(isinstance(packet, dict) and set(packet) <= {'locked_task', 'previous_complete_source',
+                'public_feedback', 'attention_control', 'remaining_budget', 'source_size_limit_bytes'}
+                and packet.get('previous_complete_source', '').encode() == parent,
+                'generation prompt differs from frozen origin or contains extra sections')
+        require(candidate.version == binding['memory_version']
+                and digest(candidate.guidance.encode()) == binding['guidance_sha256'],
+                'generation candidate version/guidance changed')
+        treatment = binding['exposure'] == 'candidate_validation'
+        notes = [{'content': candidate.guidance}] if treatment else []
+        require(packet.get('attention_control') == {'memory': notes} and not request.get('memory_truncated'),
+                'generation Memory must contain only the granted guidance, or no notes for control')
+        exposure = self.ref(catalog_id, record['dev_memory_exposure'])
+        entries = [dict(memory_id=binding['memory_id'], memory_version=binding['memory_version'],
+                        guidance_sha256=binding['guidance_sha256'])] if treatment else []
+        require(exposure == {'schema_version': 'attentionbench.dev-memory-exposure.v1',
+                'cell': ed['cell'], 'version': ed['version'], 'model_input': provider['request'], 'entries': entries},
+                'sealed Dev memory exposure receipt differs from grant/request')
+        require(type(exposure['version']) is int and all(type(e['memory_version']) is int for e in exposure['entries']),
+                'exposure versions must be exact integers')
+        generated = output['content'].strip()
+        if generated.startswith('```'):
+            generated = re.sub(r'^```(?:json)?\s*|\s*```$', '', generated)
+        require(digest(json.loads(generated)['source'].encode()) == execution['source']['sha256']
+                == binding['policy_sha256'], 'generated source differs from executed/granted policy')
+        return dict(origin_source_sha256=plan['origin_source_sha256'], dev_model=model)
 
     def validation_grant(self, grant_id):
         with sqlite3.connect(self.store.path) as db:
@@ -805,27 +983,22 @@ class DevV2Evidence:
         require(row is not None, 'unknown original offline validation grant')
         return json.loads(row[0])
 
-    def import_trial(self, *, import_id, catalog_id, descriptor):
-        self.catalog(catalog_id, 'validator')
-        d = self.read(catalog_id, descriptor)
-        execution, ed, bundle, artifacts, cell, verdict, safety = self.verdict(d['execution_import_id'], catalog_id, d['validation_descriptor'])
-        require(d['schema_version'] == 'attentionbench.dev-v2-trial.v1', 'unsupported offline trial descriptor')
-        exposure = d['exposure']
-        require(exposure in {'none', 'candidate_validation'}, 'only offline candidate validation exposure supported')
-        grant = self.validation_grant(d['validation_grant_id'])
+    def _verify_validation_arm(self, execution, ed, bundle, artifacts, grant, exposure, memory_id):
         binding = grant['binding']
         from .memory_v2 import MemoryV2Manager
         manager = MemoryV2Manager(self.store)
         plan = manager.get_plan(binding['memory_id'])
         require(plan and digest(encoded(plan).encode()) == binding['plan_sha256'], 'original validation plan changed')
         require(all(binding[k] == v for k, v in {'cell': ed['cell'], 'version': ed['version'], 'seed': bundle['seed'], 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'exposure': exposure}.items()), 'offline validation grant/raw run binding mismatch')
-        require(exposure == 'none' or binding['memory_id'] == d['memory_id'], 'candidate validation grant memory mismatch')
-        ids = [] if exposure == 'none' else [d['memory_id']]
+        require(exposure == 'none' or binding['memory_id'] == memory_id, 'candidate validation grant memory mismatch')
+        ids = [] if exposure == 'none' else [memory_id]
         # Validator must bind exposure to the original executor's frozen input,
         # not infer treatment from the eventual outcome.
         input_value = self.ref(execution['catalog_id'], ed['validation_input'])
         require(input_value == {'memory_ids': ids, 'exposure': exposure, 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'validation_grant_id': grant['grant_id']}, 'original validation exposure/config mismatch')
         candidate = self.store.get_memory(binding['memory_id'])
+        generation = (self._validation_generation(execution, ed, binding, plan, candidate)
+                      if plan.get('arm_generation') == 'dev_from_origin' else {})
         expected_consumption = {'validation_grant_id': grant['grant_id'],
             'input_sha256': ed['validation_input']['sha256'], 'memory_ids': ids, 'exposure': exposure,
             'memory_version': binding['memory_version'] if ids else None,
@@ -838,6 +1011,24 @@ class DevV2Evidence:
             dispatches = [(at, json.loads(payload)) for at, payload in db.execute("SELECT at,payload FROM v2_events WHERE kind='memory_validation_dispatch'")]
         expected_dispatch = {'cell': ed['cell'], 'version': ed['version'], 'validation_input': ed['validation_input'], 'validation_grant_id': grant['grant_id'], 'source': execution['source'], 'config': execution['config']}
         require(len([(at, p) for at, p in dispatches if p == expected_dispatch and grant['issued_at'] <= at <= job['claimed_at']]) == 1, 'trial lacks an original pre-execution validation dispatch event')
+        return manager, plan, ids, generation
+
+    def import_trial(self, *, import_id, catalog_id, descriptor):
+        self.catalog(catalog_id, 'validator')
+        d = self.read(catalog_id, descriptor)
+        execution, ed, bundle, artifacts, cell, verdict, safety = self.verdict(d['execution_import_id'], catalog_id, d['validation_descriptor'])
+        require(d['schema_version'] == 'attentionbench.dev-v2-trial.v1', 'unsupported offline trial descriptor')
+        exposure = d['exposure']
+        require(exposure in {'none', 'candidate_validation'}, 'only offline candidate validation exposure supported')
+        grant = self.validation_grant(d['validation_grant_id'])
+        binding = grant['binding']
+        manager, plan, ids, generation = self._verify_validation_arm(
+            execution, ed, bundle, artifacts, grant, exposure, d.get('memory_id'))
+        decision = manager.get_decision(binding['memory_id'])
+        if decision and 'failed_check' in decision:
+            with sqlite3.connect(self.store.path) as db:
+                old = db.execute("SELECT 1 FROM dev_v2_imports WHERE id=? AND kind='trial'", (import_id,)).fetchone()
+            require(old is not None, 'validation batch is closed')
         costs = d['costs']
         require(costs == verdict['costs'] and all(type(costs.get(k)) in (int, float) and math.isfinite(costs[k]) and costs[k] >= 0 for k in ('credits', 'seconds', 'gpu_seconds', 'tokens')), 'independent validation costs missing')
         with self._ledger(execution['catalog_id'], ed) as db:
@@ -845,6 +1036,7 @@ class DevV2Evidence:
         require(costs['credits'] == sum(j['actual'].get('help_credits', 0) for j in settled) and costs['tokens'] == sum(j['actual'].get('provider_tokens', 0) for j in settled), 'validation cost differs from original settled jobs')
         require(costs['seconds'] == artifacts['sandbox_receipt']['elapsed_seconds'], 'trial time differs from native receipt')
         trial = {'run_id': bundle['run_id'], 'run': {'suite': bundle['suite'], 'task_id': bundle['task_id'], 'seed': bundle['seed'], 'policy_id': cell['policy_id'], 'execution_target': 'simulator', 'developer_model': d['developer_model'], 'budget': d['budget']}, 'success': bundle['native_success'], 'attempt_status': 'succeeded' if bundle['native_success'] else 'failed', 'evaluator_authoritative': True, 'mode': execution['context']['perception_mode'], 'memory_ids': ids, 'exposure': exposure, 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'variation': {k: execution['context'][k] for k in (*AXES, 'camera_names', 'task_prompt')}, 'context': execution['context'], **costs}
+        trial.update(generation)
         if plan.get('profile', 'default') == 'single_scene_v1':
             signature = manager.provenance(binding['memory_id'])['failure_signature']
             feedback = public_trace_projection(artifacts['trace'])
@@ -871,7 +1063,10 @@ class DevV2Evidence:
         for import_id, payload in rows:
             old = json.loads(payload)
             if old['attempt_id'] == attempt_id:
-                return self.import_trial(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])['trial']
+                trial = self.import_trial(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])['trial']
+                descriptor = self.read(old['catalog_id'], old['descriptor'])
+                binding = self.validation_grant(descriptor['validation_grant_id'])['binding']
+                return {**trial, 'validation_memory_id': binding['memory_id']}
         return None
 
     def _result_evidence(self, grant, execution_import_id):

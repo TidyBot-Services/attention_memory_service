@@ -28,7 +28,8 @@ from .seeded_notes import create as create_test_seeded, flags, is_test_seeded, i
 
 class MemoryService:
     def __init__(self, store: AttentionStore | Path, *, artifact_root: Path | None = None,
-                 dev_v2_catalogs: dict[str, Any] | None = None) -> None:
+                 dev_v2_catalogs: dict[str, Any] | None = None,
+                 dev_v2_registration_roots: dict[str, Any] | None = None) -> None:
         # Existing harnesses may provide a v1 AttentionStore object. Reopen its
         # file with this package's versioned decoder instead of mixing enum
         # classes from two separately imported packages.
@@ -41,7 +42,18 @@ class MemoryService:
         self.dev_use = DevMemoryUse(self)
         provisional_notes.initialize(self.store)
         from .dev_v2 import DevV2Evidence
-        self.dev_v2 = DevV2Evidence(self.store, dev_v2_catalogs)
+        self.dev_v2 = DevV2Evidence(self.store, dev_v2_catalogs, dev_v2_registration_roots)
+
+    def register_dev_v2_catalog(self, **payload):
+        return self.dev_v2.register_online(**payload)
+
+    def validation_queue(self):
+        from .auto_validation import validation_queue
+        return validation_queue(self)
+
+    def memory_events(self, *, after=0):
+        from .auto_validation import memory_events
+        return memory_events(self.store, after=after)
 
     def _publish_if_validated_source(self, memory_id: str) -> None:
         if not flags(self.v2._provenance(memory_id)):
@@ -79,6 +91,10 @@ class MemoryService:
         return self.dev_v2.import_trial(**payload)
 
     @evidence_operation
+    def record_dev_v2_failed_check(self, **payload) -> dict[str, Any]:
+        return self.v2.record_failed_check(**payload)
+
+    @evidence_operation
     def authorize_dev_v2_validation(self, **payload) -> dict[str, Any]:
         self._refuse_provisional(payload['memory_id'])
         return self.dev_v2.authorize_validation(**payload)
@@ -92,7 +108,14 @@ class MemoryService:
 
     @evidence_operation
     def record_dev_v2_result(self, **payload) -> dict[str, Any]:
-        return self.dev_v2.record_result(**payload)
+        result = self.dev_v2.record_result(**payload)
+        plan = self.v2.get_plan(result['memory_id'])
+        if plan and plan.get('profile') == 'single_scene_v1':
+            execution = self.dev_v2.get(payload['execution_import_id'])
+            data = self.dev_v2.ref(execution['catalog_id'], execution['public_feedback'], raw=True)
+            self.record_provisional_outcome(grant_id=result['grant_id'], development_id=result['development_id'],
+                public_feedback_text=data.decode('utf-8'), public_feedback_sha256=hashlib.sha256(data).hexdigest())
+        return result
 
     @evidence_operation
     def record_dev_v2_pair(self, *, memory_id: str, control_import_id: str,
@@ -427,17 +450,18 @@ class MemoryService:
             seeded = is_test_seeded(provenance)
             provisional = is_provisional(provenance)
             case = plan['cases'][0] if plan and plan.get('profile') == 'single_scene_v1' else None
-            if seeded or provisional:
+            if seeded or provisional and provenance.get('channel') == 'dev_v2_provisional':
                 case = memory.applicability
-            trusted = memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
+            trusted = not provisional and memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
             scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
             rows.append({
                 'memory_id': memory.memory_id, 'version': memory.version,
                 'layer': 'scene',
                 'from_provisional': provenance.get('from_provisional'),
+                **({'decision_link': provenance['decision_link']} if 'decision_link' in provenance else {}),
                 **({'read_layer': LAYER.get(levels.get(memory.memory_id))} if levels is not None else {}),
                 **({'origin_summary': {k: provenance['origin'][k] for k in ('experiment_id', 'help_version', 'policy_id')},
-                    'from_run_note': provenance.get('from_run_note')} if provisional else {}),
+                    'from_run_note': provenance.get('from_run_note')} if provisional and 'origin' in provenance else {}),
                 'title': provenance.get('title'),
                 'summary': provenance.get('summary'),
                 'group': provenance.get('group'),

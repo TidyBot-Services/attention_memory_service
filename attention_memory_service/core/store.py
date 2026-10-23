@@ -318,7 +318,7 @@ class AttentionStore:
                 raise StateConflictError("unknown memory")
             current = self._decode_memory(json.loads(row[0]))
             provisional = connection.execute(
-                "SELECT 1 FROM events WHERE entity_id=? AND event_type='memory.provisional_created'",
+                "SELECT 1 FROM events WHERE entity_id=? AND event_type IN ('memory.provisional_created','memory.demoted')",
                 (memory_id,)).fetchone() is not None
             if current.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED, MemoryStatus.PROVISIONAL} and not (
                     provisional and current.status in {MemoryStatus.DISABLED, MemoryStatus.EXPIRED}):
@@ -351,58 +351,78 @@ class AttentionStore:
         actor: str | None = None,
     ) -> MemoryRecord:
         with self._transaction() as connection:
-            existing_event = connection.execute(
-                "SELECT payload FROM events WHERE event_key = ?", (event_key,)
-            ).fetchone()
-            if existing_event is not None:
-                return self._decode_memory(json.loads(existing_event[0])["memory"])
-            row = connection.execute(
-                "SELECT payload FROM memories WHERE id = ?", (memory_id,)
-            ).fetchone()
-            if row is None:
-                raise StateConflictError(f"memory {memory_id!r} does not exist")
-            current = self._decode_memory(json.loads(row[0]))
-            provisional = connection.execute(
-                "SELECT 1 FROM events WHERE entity_id=? AND event_type='memory.provisional_created'",
-                (memory_id,)).fetchone() is not None
-            if provisional and status in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED, MemoryStatus.REJECTED}:
-                raise StateConflictError('provisional notes cannot enter validation or promotion')
-            if status is MemoryStatus.PROVISIONAL:
-                if not provisional or current.expires_at is None or current.expires_at <= time.time():
-                    raise StateConflictError('provisional note expired; set_expiry before enabling')
-            if current.status is MemoryStatus.EXPIRED and not provisional:
-                raise StateConflictError('expired memory cannot be revived')
-            if status not in MEMORY_TRANSITIONS[current.status]:
-                raise StateConflictError(
-                    f"illegal memory transition {current.status.value} -> {status.value}"
-                )
-            updated = replace(
-                current,
-                status=status,
-                confidence=current.confidence if confidence is None else confidence,
-                validation_successes=(
-                    current.validation_successes
-                    if validation_successes is None
-                    else validation_successes
-                ),
-                validation_failures=(
-                    current.validation_failures
-                    if validation_failures is None
-                    else validation_failures
-                ),
-                status_reason=reason,
+            return self._transition_memory_tx(
+                connection, memory_id, status, event_key=event_key, confidence=confidence,
+                validation_successes=validation_successes, validation_failures=validation_failures,
+                reason=reason, actor=actor,
             )
-            connection.execute(
-                "UPDATE memories SET payload = ? WHERE id = ?",
-                (_json(updated.artifact()), memory_id),
+
+    def _transition_memory_tx(
+        self,
+        connection: sqlite3.Connection,
+        memory_id: str,
+        status: MemoryStatus,
+        *,
+        event_key: str,
+        confidence: float | None = None,
+        validation_successes: int | None = None,
+        validation_failures: int | None = None,
+        reason: str | None = None,
+        actor: str | None = None,
+    ) -> MemoryRecord:
+        """Apply the same transition guards/audit inside a caller-owned transaction."""
+        existing_event = connection.execute(
+            "SELECT payload FROM events WHERE event_key = ?", (event_key,)
+        ).fetchone()
+        if existing_event is not None:
+            return self._decode_memory(json.loads(existing_event[0])["memory"])
+        row = connection.execute(
+            "SELECT payload FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflictError(f"memory {memory_id!r} does not exist")
+        current = self._decode_memory(json.loads(row[0]))
+        provisional = connection.execute(
+            "SELECT 1 FROM events WHERE entity_id=? AND event_type IN ('memory.provisional_created','memory.demoted')",
+            (memory_id,)).fetchone() is not None
+        if provisional and status in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED, MemoryStatus.TRUSTED, MemoryStatus.REJECTED}:
+            raise StateConflictError('provisional notes cannot enter validation or promotion')
+        if status is MemoryStatus.PROVISIONAL:
+            if not provisional or current.expires_at is None or current.expires_at <= time.time():
+                raise StateConflictError('provisional note expired; set_expiry before enabling')
+        if current.status is MemoryStatus.EXPIRED and not provisional:
+            raise StateConflictError('expired memory cannot be revived')
+        if status not in MEMORY_TRANSITIONS[current.status]:
+            raise StateConflictError(
+                f"illegal memory transition {current.status.value} -> {status.value}"
             )
-            payload = {"memory": updated.artifact(), "actor": actor, "reason": reason}
-            connection.execute(
-                "INSERT INTO events(event_key, entity_type, entity_id, event_type, payload) "
-                "VALUES (?, 'memory', ?, ?, ?)",
-                (event_key, memory_id, f"memory.{status.value}", _json(payload)),
-            )
-            return updated
+        updated = replace(
+            current,
+            status=status,
+            confidence=current.confidence if confidence is None else confidence,
+            validation_successes=(
+                current.validation_successes
+                if validation_successes is None
+                else validation_successes
+            ),
+            validation_failures=(
+                current.validation_failures
+                if validation_failures is None
+                else validation_failures
+            ),
+            status_reason=reason,
+        )
+        connection.execute(
+            "UPDATE memories SET payload = ? WHERE id = ?",
+            (_json(updated.artifact()), memory_id),
+        )
+        payload = {"memory": updated.artifact(), "actor": actor, "reason": reason}
+        connection.execute(
+            "INSERT INTO events(event_key, entity_type, entity_id, event_type, payload) "
+            "VALUES (?, 'memory', ?, ?, ?)",
+            (event_key, memory_id, f"memory.{status.value}", _json(payload)),
+        )
+        return updated
 
     def list_memories(self) -> list[MemoryRecord]:
         return [self._decode_memory(value) for value in self._list_payloads("memories")]

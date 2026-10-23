@@ -63,7 +63,8 @@ class MemoryManager:
 
     def enable(self, memory_id: str, *, reason: str = "human_reenabled",
                actor: str | None = None) -> MemoryRecord:
-        provisional = self.store.count_memory_events(memory_id, 'memory.provisional_created') > 0
+        provisional = (self.store.count_memory_events(memory_id, 'memory.provisional_created') > 0
+                       or self.store.count_memory_events(memory_id, 'memory.demoted') > 0)
         target = MemoryStatus.PROVISIONAL if provisional else MemoryStatus.TRUSTED
         cycle = self.store.count_memory_events(memory_id, f'memory.{target.value}')
         return self.store.transition_memory(

@@ -17,19 +17,29 @@ SIGNATURE = {'public_error_class': 'RuntimeError: TimeoutError', 'operation': 'l
 
 
 def setup_scene(tmp_path, *, controls=(True,) * 5, treatments=(False,) * 5,
-                control_calls=(1,) * 5, treatment_calls=(1,) * 5, interface=False):
+                control_calls=(1,) * 5, treatment_calls=(1,) * 5, interface=False, linked=False, generated=False):
     f = Fixture(tmp_path, interface=interface)
     failed = f.make('failed', failure=True)
     f.add_advice(failed, SIGNATURE)
     for i in range(len(controls)):
-        f.make(f'c{i}', failure=controls[i], completed_calls=control_calls[i])
+        code = lambda arm: f'def policy(sdk):\n    # {arm}{i}\n    pass\n' if generated else 'def policy(sdk):\n    pass\n'
+        f.make(f'c{i}', failure=controls[i], completed_calls=control_calls[i], code=code('c'))
         f.make(f't{i}', failure=treatments[i], completed_calls=treatment_calls[i],
-               exposure='candidate_validation', memory_id='m1')
+               exposure='candidate_validation', memory_id='m1', code=code('t'))
     service = MemoryService(tmp_path / 'authority.sqlite',
                             dev_v2_catalogs={k: v for k, v in f.seal().items() if k in {'failed', 'validator-failed'}})
     service.import_dev_v2_execution(import_id='failed', catalog_id='failed', descriptor='failed/execution.json')
     service.import_dev_v2_source(import_id='source', catalog_id='failed', descriptor='failed/source.json')
-    service.create_dev_v2_candidate(memory_id='m1', source_import_id='source', created_at=1.0)
+    from_provisional = None
+    if linked:
+        from tests.test_provisional_notes import payload
+        from_provisional = 'p-' + 'a' * 24
+        note_context = {**failed['context'], 'seed': 101,
+                        'scene_contract_ref': {'uri': 'fixture://scene', 'sha256': 'b' * 64}}
+        service.create_provisional_note(**payload(from_provisional, context=note_context,
+            guidance=service.dev_v2.get('source')['guidance']))
+    service.create_dev_v2_candidate(memory_id='m1', source_import_id='source', created_at=1.0,
+                                    from_provisional=from_provisional)
     ctx = failed['context']
     case = {'seed': 101, **{k: ctx[k] for k in ('scene_id', 'object_set_id', 'camera_config_id',
                                                 'task_variant_id', 'camera_names', 'task_prompt')}}

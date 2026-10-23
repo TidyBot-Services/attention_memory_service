@@ -79,11 +79,25 @@ class MemoryServiceClient:
     def import_dev_v2_execution(self, **payload):
         return self._call('POST', '/dev-v2/executions', payload, importer=True)
 
+    def register_dev_v2_catalog(self, **payload):
+        return self._call('POST', '/dev-v2/catalogs', payload, importer=True)
+
+    def validation_queue(self):
+        return self._call('GET', '/dev-v2/validation-queue')['items']
+
+    def memory_events(self, *, after=0):
+        if type(after) is not int or after < 0:
+            raise ValueError('after must be a nonnegative sequence')
+        return self._call('GET', f'/dev-v2/memory-events?after={after}')['events']
+
     def import_dev_v2_source(self, **payload):
         return self._call('POST', '/dev-v2/sources', payload, importer=True)
 
     def import_dev_v2_trial(self, **payload):
         return self._call('POST', '/dev-v2/trials', payload, importer=True)
+
+    def record_dev_v2_failed_check(self, **payload):
+        return self._call('POST', '/dev-v2/failed-checks', payload, importer=True)
 
     def authorize_dev_v2_validation(self, **payload):
         return self._call('POST', '/dev-v2/validation-grants', payload, importer=True)

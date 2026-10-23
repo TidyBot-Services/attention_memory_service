@@ -151,31 +151,43 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
     request = dict(grant_id=grant_id, development_id=development_id,
                    public_feedback_text=public_feedback_text, public_feedback_sha256=public_feedback_sha256)
     fingerprint = digest(encoded(request).encode())
+    # Sealed-source verification may reopen immutable imports. Do it before
+    # acquiring the outcome write lock, then recheck provenance in that lock.
+    with sqlite3.connect(service.store.path) as db:
+        row = db.execute('SELECT payload FROM memory_dev_exposures WHERE grant_id=?', (grant_id,)).fetchone()
+    if row is None:
+        raise StateConflictError('unknown Dev Memory grant')
+    grant = json.loads(row[0])
+    provenance = service.v2.provenance(grant['memory_id'])
+    plan = service.v2.get_plan(grant['memory_id'])
     with sqlite3.connect(service.store.path) as db:
         db.execute('BEGIN IMMEDIATE')
-        row = db.execute('SELECT payload FROM memory_dev_exposures WHERE grant_id=?', (grant_id,)).fetchone()
-        if row is None:
-            raise StateConflictError('unknown Dev Memory grant')
-        grant = json.loads(row[0])
-        provenance = service.v2.provenance(grant['memory_id'])
-        if (not is_provisional(provenance) or grant.get('trust_scope') != 'provisional'
-                or grant['development_id'] != development_id):
-            raise StateConflictError('outcome requires a matching provisional development grant')
         old = db.execute('SELECT payload FROM memory_provisional_outcomes WHERE grant_id=?', (grant_id,)).fetchone()
         if old:
             record = json.loads(old[0])
             if record['request_sha256'] != fingerprint:
                 raise StateConflictError('provisional outcome is immutable')
             return record
+        current = json.loads(db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?',
+                                        (grant['memory_id'],)).fetchone()[0])
+        if current != provenance:
+            raise StateConflictError('memory provenance changed while recording outcome; retry')
+        eligible = (is_provisional(provenance) and grant.get('trust_scope') == 'provisional'
+                    or provenance.get('channel') == 'dev_v2'
+                    and plan and plan.get('profile') == 'single_scene_v1')
+        if (not eligible or grant['development_id'] != development_id):
+            raise StateConflictError('outcome requires a matching provisional development grant')
         record = dict(schema_version='attentionbench.provisional-outcome.v1',
                       grant_id=grant_id, memory_id=grant['memory_id'], memory_version=grant['memory_version'],
                       development_id=development_id, public_feedback_sha256=public_feedback_sha256,
                       signature_present=signature_present(observed, provenance['failure_signature']),
-                      progress=progress(observed), origin_progress=provenance['origin_progress'],
+                      progress=progress(observed), origin_progress=provenance.get('origin_progress'),
                       observational=True, attested_by='offline_importer', recorded_at=time.time(),
                       request_sha256=fingerprint, **flags(provenance))
         db.execute('INSERT INTO memory_provisional_outcomes(grant_id,memory_id,payload) VALUES (?,?,?)',
                    (grant_id, grant['memory_id'], encoded(record)))
+        from .auto_validation import demote_if_due
+        demote_if_due(db, grant['memory_id'])
     return record
 
 

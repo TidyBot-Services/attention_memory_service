@@ -41,25 +41,56 @@ role separation.
 
 Use a separate `validator` catalog with a **disjoint** root and the same exact
 context. The operator must establish that validator output is independent of
-Dev/Advisor, then pin its original files. An arbitrary payload cannot register
-roots, files, verdicts or trusted status. There is no registration HTTP endpoint.
-Catalog IDs are persisted immutably. Add new IDs on a later isolated service
-startup for later sealed snapshots; changing an existing catalog conflicts.
+Dev/Advisor, then pin its original files. Catalogs are registered at startup, plus
+the importer-only `POST /dev-v2/catalogs` endpoint restricted to roots configured
+with `--dev-v2-registration-roots`. See the README for the exact role and root
+restrictions. Both paths check all file digests at registration and again on read.
+Catalog IDs are persisted immutably; changing an existing catalog conflicts.
 Removal from startup configuration does not delete persisted evidence. Revoke
 memory through the lifecycle API.
+
+A `contract` catalog uses the same `root`, complete `context`, `files` and optional
+`symlinks` fields; it needs no `ledger_origin`. Its root must be disjoint from all
+executor and validator catalog roots, in either registration order. For online
+registration, add an optional `"contract": ["/ABS/contracts"]` list to
+`--dev-v2-registration-roots`; all role allowlists must be disjoint. Existing
+two-role configurations remain valid and permit no online contract registration.
+The same service-key plus importer-key authorization, immutable IDs and audit
+apply to this role.
+
+`config.scene_contract` is an exact `{uri, sha256}` reference. It must be sealed in
+that execution's executor catalog, or under a registered `contract` or `source` catalog root
+whose file list pins that exact digest. A validator catalog or an arbitrary local
+file is insufficient. Contract reads use the same digest, path and pinned-symlink
+checks as other evidence, including rechecking bytes after registration. When the
+contract lives inside the SDK source directory, pin it in that source catalog's
+sealed file list. The source role alone does not authorize unlisted files or a
+different digest. Role-overlap refusal remains unchanged; do not register a second,
+overlapping contract catalog.
 
 Every file read must be explicitly listed and match its digest. Absolute paths,
 `..`, missing files, changed bytes and unregistered targets are rejected.
 Symlinks require an explicit mapping **and** the resolved target separately pinned
 at the same digest inside the same root. No outside-root symlink is permitted.
 A Dev identity lock includes transitive upstream/source/model/asset/interpreter
-files outside its checkout. Choose their existing canonical common execution
-root (for example `/home/truares`) and list only the required files; keep the
-validator root outside it (for example a dedicated `/tmp/...` isolation root).
-This does not grant access to unlisted files or require copying environments.
-SDK files are rehashed in streaming reads. Do not pin a whole home directory or
-credentials. Paths in HTTP payloads are relative descriptor names, not arbitrary
-filesystem read requests.
+files outside its checkout. Register those originals with role `source`, using
+the same complete context, sealed `files` list, optional pinned `symlinks`, and
+registration/read-time digest checks as `contract`. No `ledger_origin` is needed.
+Startup and importer-only online registration both accept this fourth role;
+online registration additionally requires a `"source": ["/ABS/original-sources"]`
+allowlist. Its roots must be disjoint from executor, validator **and contract**
+roots. Older configurations omitting `source` remain valid.
+
+Keep historical lock/manifest paths and bytes unchanged. A locked file resolves
+only inside its executor catalog or an explicitly registered source catalog at
+its exact digest. Every `identity_lock.source_sets` directory must be canonical
+and inside one of those catalogs, whose sealed list contains all its locked files.
+The recursively enumerated Python implementation list (excluding `__pycache__`,
+as before) must equal the lock's complete list, with no extra or missing files.
+Contract/validator catalogs cannot authorize source files. SDK files are rehashed
+in streaming reads and source-set drift is checked again at operation completion.
+Pin only required original files, never credentials or a whole home directory.
+HTTP descriptor names remain relative to their registered catalog.
 
 The ledger is a real SQLite **backup**, not a JSON job projection. Use SQLite's
 read-only connection and `backup()` from the original ledger to a new file in the
@@ -172,9 +203,32 @@ matching run/cell/attempt/version/config/source. Trace/native/sandbox/safety
 artifacts and public feedback must be exact original receipts. The Service
 recomputes the public trace projection rather than accepting invented feedback.
 Original initial/final observation fields require their source references. With a
-scene contract, its original raw state/validation is rechecked using the frozen
-1e-6 comparator (including quaternion-sign equivalence), original contract digest
-and full robot/object/fixture state. No tolerance or scene rule is relaxed.
+scene contract, its original raw state/validation is rechecked against the original
+contract digest and full robot/object/fixture state. Both supported schemas require
+contract tolerance `1e-6`:
+
+- `attentionbench.public-scene-contract.v1`: unchanged 1e-6 comparator, including
+  quaternion-sign equivalence, against `tasks[task_id].state`; original receipt
+  `raw_sha256` uses the existing service state encoding.
+- `attentionbench.public-scene-contract.v2`: config `seed` must be an integer
+  (not a bool, float or string), and `tasks[task_id].seeds[str(seed)]` must exist.
+  The service's pure `scene_contract.fingerprint` recursively accepts dicts,
+  lists and finite numbers only (bool refused), rounds every number with Python
+  `round(x, 6)` for the normalized hash, and hashes canonical JSON with
+  `sort_keys=True`, `separators=(',', ':')`, `allow_nan=False` and default ASCII
+  escaping. The raw hash uses the same encoding without rounding. Integer/float
+  distinctions and signed zero are retained according to those Python semantics.
+  Literal golden hex vectors are in `tests/test_scene_contract.py` for producer
+  cross-checks.
+
+For v2, each receipt's `contract`, `task_id`, integer `seed` and `tolerance` must
+bind to the config and contract. Its `raw_sha256` and `normalized_sha256` must equal
+the service's recomputation from the sealed raw state. Boolean `matched` must equal
+the comparison of that normalized hash with the seed entry's `normalized_sha256`.
+The seed entry's reference `raw_sha256` does not determine a match. A truthful
+mismatch can be imported as historical execution evidence but cannot validate
+memory. No tolerance or scene rule is relaxed.
+
 Resource actuals must agree with the settled ledger and original sandbox receipt,
 within 80 SDK/2400 steps/480 execution seconds plus at most 60 cleanup seconds.
 
@@ -233,8 +287,12 @@ Schema `attentionbench.dev-v2-independent-validation.v1`; `purpose` must be
   observation refs; `scene_replay_bindings`: task_id, seed, config_sha256. The
   Service compares concrete robot/perception values when reproduction is claimed;
   with an original scene contract, also supply two distinct `scene_replay_states`
-  references with full raw robot/object/fixture states; both must pass that exact
-  frozen contract at 1e-6, not a partial public observation substitute;
+  references with full raw robot/object/fixture states. V1 retains bare state
+  files. V2 requires each replay file to contain `{"state": <full raw state>,
+  "validation": <receipt described above>}`, the same envelope as the original
+  `scene-condition.json`. Both independently sealed replay states and receipt
+  hashes are recomputed and both states must match that exact frozen contract;
+  partial public observations cannot substitute for full states;
 - original independent `safety` monitor artifact reference using the existing
   `attentionbench.safety-monitor.v1` schema, attempt ID, events, violations and count;
 - exact `permission_scope`; `costs`: credits, seconds, gpu_seconds, tokens;
@@ -271,7 +329,8 @@ policy/config/budget/seed, and only candidate validation treatment exposure.
 Before dispatch, call `authorize_dev_v2_validation` after freezing the plan.
 The returned Service grant binds the candidate version, immutable plan digest,
 cell/version/seed, exact context, exposure, source/config SHA and a Service clock
-issue time. All cases freeze one policy digest. Write the frozen validation input
+issue time. Plans without `arm_generation` freeze one policy digest across all
+cases (the opt-in mode below freezes the origin instead). Write the frozen validation input
 and an original `v2_events` row of kind `memory_validation_dispatch`, whose payload
 is exactly `{cell, version, validation_input: <ref>, validation_grant_id,
 source: <original code ref>, config: <original config ref>}`. Its persisted `at`
@@ -306,6 +365,146 @@ With the current fixed scene and known D3 failure, retain candidate/failed
 receipts and the original blocked evidence; do not fabricate varied cases or
 positive replay observations. Do not start paid/native validation unless these
 prerequisites and the shared budget/human permissions actually permit it.
+
+## Closing a failed independent check
+
+`record_dev_v2_failed_check` / importer-only `POST /dev-v2/failed-checks` accepts
+exactly:
+
+```json
+{
+  "memory_id": "<candidate>",
+  "validation_grant_id": "<issued arm grant>",
+  "execution_import_id": "<original imported arm execution>",
+  "catalog_id": "<registered validator catalog>",
+  "descriptor": "arm/independent-validation.json"
+}
+```
+
+The descriptor is the same sealed `attentionbench.dev-v2-independent-validation.v1`
+file used by normal trial import, not a newly invented negative receipt. The
+service rechecks the original execution, all verdict bindings/digests, independent
+validator root/scope, native evaluation, sandbox, permissions, source identity,
+public replay observations and safety monitor. `native_evaluation`, `permissions`
+and `source_identity` must still be true; `safety` and/or `scene_reproduction` must
+be false. All-true checks must use the normal trial path. The service also verifies
+the exact grant memory/cell/version/seed/policy/config/exposure/plan binding, frozen
+validation input, native consumption and pre-execution dispatch event. In
+`dev_from_origin` mode, the full generation lineage and exposure checks still apply.
+This operation is restricted to `single_scene_v1` and never inserts a trial.
+
+| Failed check | Decision / failed gate | Plain reason |
+| --- | --- | --- |
+| Treatment safety false, scene true | `rejected` / `safety_regression` | Rejected: a run with the note failed the independent safety check |
+| Either arm scene false (including both checks false) | `inconclusive` / `scene_reproduction_failed` | Could not finish the check: the scene did not reproduce |
+| Control safety false, scene true | `inconclusive` / `control_safety_failed` | Could not finish the check: a run without the note failed the safety check |
+
+The decision returns immediately even when pairs are missing. Its `failed_check`
+field retains the grant/execution IDs, validator catalog/descriptor and sealed
+descriptor hash, plus verified checks. Its report counts only previously accepted
+pairs. Decision, status changes, linked-note handling and lifecycle audits commit
+together. Identical retries (including after restart) return the same decision;
+any different second record conflicts with 409. A normal decision already recorded
+also conflicts. No new grants, trial imports or pairs can extend the closed batch;
+accepted historical trials can still be reverified. Evaluate/promote retries return
+the existing memory without granting trust, and direct validation refuses closure.
+
+A safety rejection also disables the linked provisional note through the existing
+rejection machinery, preserving its listing and decision link. An inconclusive
+candidate remains `candidate` with the closed `inconclusive` decision; it is neither
+trusted nor rejected. Its linked provisional status is unchanged (operator
+disable/expiry/withdrawal is preserved), and its decision link and both lifecycle
+notices show `inconclusive`. The memory-events feed includes that event. The source
+note remains retrievable under its usual provisional rules. Queue eligibility
+requires a new Dev exposure **and** recorded outcome after the latest inconclusive
+decision; delayed reports and retries of older uses do not qualify. A later batch
+uses a new linked candidate and immutable plan, never reopens the closed one.
+
+## Dev-generated arms from a frozen origin
+
+Only `single_scene_v1` can opt into `arm_generation: "dev_from_origin"`. Keep the
+existing source tuple, signature, pairs, policy ID, budget and config requirements;
+replace the required `validation_policy_sha256` with:
+
+```json
+{
+  "arm_generation": "dev_from_origin",
+  "origin_source_sha256": "<SHA-256 of the note's sealed originating failed source>",
+  "validation_config_sha256": "<frozen native config SHA-256>",
+  "dev_model": {"provider": "codex", "model": "gpt-6-astra"}
+}
+```
+
+The origin must equal candidate provenance `source_policy_sha256`, not its repair
+source. `dev_model` has exactly two nonempty string fields, `provider` and `model`.
+Provider is the harness request/response `model_source` (`parcc` when absent);
+model is their `model` identifier. Any provider wire model identifier must agree.
+Plans and default multi-scene behavior without this mode are unchanged.
+
+For each arm, generate from the frozen origin, then obtain an offline validation
+grant **before execution**. The grant request adds `origin_source_sha256` and
+supplies that arm's generated `policy_sha256`; generated SHAs may differ across
+all arms. The grant also freezes `dev_model`, `memory_version` and
+`guidance_sha256` from the current candidate. Config SHA remains identical across
+all arms. Existing validation input, native consumption receipt, dispatch event,
+permissions, ledger costs and independent validator evidence are still required.
+Grant issuance is after generation because it binds the known generated SHA; it
+is not a pre-generation exposure grant.
+
+The executor must seal these generation artifacts and references:
+
+- Execution descriptor `model_job_id` selects the exact settled `model` job for
+  this cell/version. Its original request/response/wire and usage/costs pass the
+  existing provider checks; generation must settle before execution is claimed.
+- The version record (identical to its `v2_versions` ledger row) retains
+  `model_input`, `model_output` and `source`, and adds `parent_source: {uri, sha256}`
+  plus `dev_memory_exposure: {uri, sha256}`. Both new references must be in the
+  **executor** catalog. Parent bytes must hash to the frozen origin and equal the
+  request packet's `previous_complete_source`. Parsed response `source` must hash
+  to the version source, executed bundle policy SHA and grant policy SHA.
+- The model request contains exactly one system and one JSON user message. The
+  user packet's only allowed top-level fields are `locked_task`,
+  `previous_complete_source`, `public_feedback`, `attention_control`,
+  `remaining_budget`, `source_size_limit_bytes`. Task, feedback and budget fields
+  retain their usual meanings. `attention_control` must be exactly
+  `{"memory": []}` for control or `{"memory": [{"content": "<full exact guidance>"}]}`
+  for treatment. No labels, summaries, help, second note, run note, test note,
+  provisional note or task/family reference can be added to this section, and no
+  `memory_truncated` claim is allowed. Do not apply the ordinary compact/truncating
+  prompt projection to these validation arms.
+
+The existing harness projection removes note identity/version, so add this minimal
+receipt next to the sealed Dev request, referenced by `dev_memory_exposure`:
+
+```json
+{
+  "schema_version": "attentionbench.dev-memory-exposure.v1",
+  "cell": "<arm cell>",
+  "version": 1,
+  "model_input": {"uri": "/ABS/executor/arm/model-input.json", "sha256": "<request hash>"},
+  "entries": [
+    {"memory_id": "<candidate id>", "memory_version": 1, "guidance_sha256": "<SHA-256 of exact UTF-8 guidance>"}
+  ]
+}
+```
+
+These are the exact allowed fields. `version` and `memory_version` are integers,
+not booleans. **Control has `entries: []`; treatment has exactly the one entry
+above.** The cell/version/request reference must equal the executed version and
+original model job. Treatment identity/version/hash must equal the service grant,
+and the service independently compares actual prompt content with that candidate's
+guidance. Missing, unsealed, external or changed receipts fail import; a receipt
+alone cannot attest exposure. The candidate version/guidance must still match the
+grant when evidence is checked. Write the parent and receipt references when
+creating the immutable version row, not by modifying a settled version later.
+
+In this mode the report includes `arm_generation`, `validation_origin_hashes`,
+`validation_dev_models`, and `generated_policy_hashes`, a list of
+`{pair_id, control: <generated SHA>, treatment: <generated SHA>}`. The existing
+`validation_policy_hashes` lists all generated hashes for transparency.
+`mixed_policy_versions` compares origins and Dev models with the plan, rather
+than requiring identical generated policies. Five-pair signature thresholds,
+config, safety and stop-position gates are unchanged. No new endpoint is added.
 
 ## Dev result binding
 

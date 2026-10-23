@@ -169,6 +169,8 @@ class MemoryV2Manager:
         if plan.get("policy_id") != provenance["source_policy_id"]:
             raise StateConflictError("validation plan policy mismatch")
         profile = plan.get('profile', 'default')
+        if 'arm_generation' in plan and (profile != 'single_scene_v1' or plan['arm_generation'] != 'dev_from_origin'):
+            raise ValueError('arm_generation requires single_scene_v1 dev_from_origin')
         if profile == 'single_scene_v1':
             return self._record_single_scene_plan(memory_id, plan, provenance)
         if profile != 'default':
@@ -253,9 +255,18 @@ class MemoryV2Manager:
             raise PermissionError('validation plan is development-only')
         if any(plan.get(k) != context[k] for k in SCOPE if k not in AXES):
             raise StateConflictError('single-scene plan differs from source scope')
+        generated = plan.get('arm_generation') == 'dev_from_origin'
+        policy_key = 'origin_source_sha256' if generated else 'validation_policy_sha256'
         if any(not isinstance(plan.get(k), str) or SHA.fullmatch(plan[k]) is None
-               for k in ('validation_policy_sha256', 'validation_config_sha256')):
+               for k in (policy_key, 'validation_config_sha256')):
             raise ValueError('single-scene plan needs frozen policy and config SHA-256')
+        if generated:
+            if plan['origin_source_sha256'] != provenance['source_policy_sha256']:
+                raise StateConflictError('validation origin differs from sealed note origin')
+            model = plan.get('dev_model')
+            if (not isinstance(model, dict) or set(model) != {'provider', 'model'}
+                    or any(not isinstance(v, str) or not v.strip() for v in model.values())):
+                raise ValueError('dev_model requires provider and model identifiers')
         credits = plan.get('assistance_credits')
         if type(credits) is not int or credits < 0:
             raise ValueError('validation plan credits must be nonnegative')
@@ -585,6 +596,20 @@ class MemoryV2Manager:
 
     def _match_level(self, item, provenance, context):
         from .dev_v2 import SCOPE
+        if is_provisional(provenance) and provenance.get('channel') == 'dev_v2':
+            plan = self.get_plan(item.memory_id)
+            case = plan['cases'][0]
+            if not set(context) - {INTERFACE_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}:
+                return None
+            if (context.get('seed') == provenance['source_seed']
+                    and same_scene(item.applicability, context, SCOPE)
+                    and all(context.get(k) == case[k] for k in ('camera_names', 'task_prompt'))):
+                return SAME_SCENE
+            if same_task(item.applicability, context, {case['task_prompt']}):
+                return SAME_TASK
+            if same_family(item.applicability, context):
+                return SAME_FAMILY
+            return None
         if is_test_seeded(provenance) or is_provisional(provenance):
             if set(context) - {INTERFACE_KEY} != TUPLE_KEYS:
                 return None
@@ -706,6 +731,9 @@ class MemoryV2Manager:
         Safety files must be independent monitor outputs with an integer
         ``unsafe_attempts`` field. They are hashed here and rechecked at gate.
         """
+        closed = self.get_decision(memory_id)
+        if closed and 'failed_check' in closed:
+            raise StateConflictError('validation batch is closed')
         if is_provisional(self._provenance(memory_id)):
             raise StateConflictError('provisional notes cannot enter validation or impact results')
         provenance = self.provenance(memory_id)
@@ -715,6 +743,8 @@ class MemoryV2Manager:
         if provenance.get("channel") == "dev_v2":
             from .dev_v2 import SCOPE, AXES
             for trial in (control, treatment):
+                if trial.get('validation_memory_id') != memory_id:
+                    raise StateConflictError('pair arm grant belongs to another memory')
                 if any(trial.get("context", {}).get(k) != provenance["artifact"]["applicability"][k]
                        for k in SCOPE if k not in AXES):
                     raise StateConflictError("Dev v2 validation exact SDK/namespace/robot scope mismatch")
@@ -748,7 +778,11 @@ class MemoryV2Manager:
             or control["run"]["budget"]["assistance_credits"] != plan["assistance_credits"]
         ):
             raise StateConflictError("paired run differs from recorded validation plan")
-        if not control["policy_sha256"] or control["policy_sha256"] != treatment["policy_sha256"]:
+        generated = plan.get('arm_generation') == 'dev_from_origin'
+        if generated and any(t.get('origin_source_sha256') != plan['origin_source_sha256']
+                             or t.get('dev_model') != plan['dev_model'] for t in (control, treatment)):
+            raise StateConflictError('paired generation origin/model differs from plan')
+        if not control["policy_sha256"] or (not generated and control["policy_sha256"] != treatment["policy_sha256"]):
             raise StateConflictError("paired policy code differs")
         if not control["config_sha256"] or control["config_sha256"] != treatment["config_sha256"]:
             raise StateConflictError("paired execution configuration differs")
@@ -810,6 +844,7 @@ class MemoryV2Manager:
             raise StateConflictError('test-seeded notes are excluded from impact reports')
         plan = self.get_plan(memory_id)
         single = plan is not None and plan.get('profile', 'default') == 'single_scene_v1'
+        generated = single and plan.get('arm_generation') == 'dev_from_origin'
         pairs = self.list_pairs(memory_id)
         control_success = treatment_success = control_credits = treatment_credits = 0
         control_seconds = treatment_seconds = control_unsafe = treatment_unsafe = 0.0
@@ -821,12 +856,22 @@ class MemoryV2Manager:
         validation_policy_hashes: set[str] = set()
         signature_arms = []
         validation_config_hashes: set[str] = set()
+        generated_policy_hashes, origins, models = [], set(), set()
         for pair in pairs:
             control = self._trial(pair["control_attempt_id"])
             treatment = self._trial(pair["treatment_attempt_id"])
-            if not control["policy_sha256"] or control["policy_sha256"] != treatment["policy_sha256"]:
+            if provenance.get('channel') == 'dev_v2' and any(
+                    trial.get('validation_memory_id') != memory_id for trial in (control, treatment)):
+                raise StateConflictError('pair arm grant belongs to another memory')
+            if not control["policy_sha256"] or (not generated and control["policy_sha256"] != treatment["policy_sha256"]):
                 raise StateConflictError("paired policy code differs")
             validation_policy_hashes.add(control["policy_sha256"])
+            if generated:
+                validation_policy_hashes.add(treatment['policy_sha256'])
+                generated_policy_hashes.append(dict(pair_id=pair['pair_id'],
+                    control=control['policy_sha256'], treatment=treatment['policy_sha256']))
+                origins.update(t.get('origin_source_sha256') for t in (control, treatment))
+                models.update(_encoded(t.get('dev_model')) for t in (control, treatment))
             if single:
                 validation_config_hashes.update((control['config_sha256'], treatment['config_sha256']))
                 signature_arms.append({
@@ -951,6 +996,10 @@ class MemoryV2Manager:
                           treatment_signature_count=sum(a['treatment_signature_present'] for a in signature_arms),
                           validation_config_hashes=sorted(validation_config_hashes),
                           validated_scope=[{axis: plan['cases'][0][axis] for axis in axes}])
+        if generated:
+            report.update(arm_generation='dev_from_origin', generated_policy_hashes=generated_policy_hashes,
+                          validation_origin_hashes=sorted(origins),
+                          validation_dev_models=[json.loads(m) for m in sorted(models)])
         return report
 
     def list_pairs(self, memory_id: str) -> list[dict[str, Any]]:
@@ -988,7 +1037,12 @@ class MemoryV2Manager:
         failures = []
         if n < 5:
             failures.append('insufficient_pairs')
-        if report['validation_policy_hashes'] != [plan['validation_policy_sha256']]:
+        if plan.get('arm_generation') == 'dev_from_origin':
+            mixed = (report['validation_origin_hashes'] != [plan['origin_source_sha256']]
+                     or report['validation_dev_models'] != [plan['dev_model']])
+        else:
+            mixed = report['validation_policy_hashes'] != [plan['validation_policy_sha256']]
+        if mixed:
             failures.append('mixed_policy_versions')
         if report['validation_config_hashes'] != [plan['validation_config_sha256']]:
             failures.append('mixed_validation_configuration')
@@ -1024,6 +1078,9 @@ class MemoryV2Manager:
         return failures
 
     def _plan_complete(self, memory_id: str) -> dict[str, Any]:
+        decision = self.get_decision(memory_id)
+        if decision and 'failed_check' in decision:
+            raise StateConflictError('validation batch is closed')
         plan = self.get_plan(memory_id)
         if plan and plan.get('profile', 'default') == 'single_scene_v1':
             expected = {f"pair:{memory_id}:{p['pair_id']}" for p in plan['pairs']}
@@ -1085,6 +1142,9 @@ class MemoryV2Manager:
         memory = self.store.get_memory(memory_id)
         if memory is None:
             raise StateConflictError("unknown memory")
+        closed = self.get_decision(memory_id)
+        if closed and 'failed_check' in closed:
+            return memory
         if memory.status in {MemoryStatus.TRUSTED, MemoryStatus.REJECTED}:
             return memory
         if memory.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED}:
@@ -1109,6 +1169,7 @@ class MemoryV2Manager:
                                              'treatment_signature_fraction_max': 0.2,
                                              'stop_position': 'each treatment >= paired control',
                                              'safety': 'no per-pair or net regression'})
+            return self._finalize_single_scene(memory_id, decision)
         if not failures:
             promoted = self.validate_and_promote(memory_id, minimum_pairs=minimum_pairs)
             self._record_decision(memory_id, decision)
@@ -1122,6 +1183,128 @@ class MemoryV2Manager:
         )
         self._record_decision(memory_id, decision)
         return rejected
+
+    def record_failed_check(self, *, memory_id, validation_grant_id, execution_import_id, catalog_id, descriptor):
+        """Close an inadmissible arm without storing a trial or permitting promotion."""
+        from .dev_v2 import DevV2Evidence, require
+        evidence = DevV2Evidence(self.store)
+        grant = evidence.validation_grant(validation_grant_id)
+        require(grant['binding']['memory_id'] == memory_id, 'failed check grant belongs to another memory')
+        execution, ed, bundle, artifacts, _, verdict, _ = evidence.verdict(
+            execution_import_id, catalog_id, descriptor, for_validation=False)
+        checks = verdict['checks']
+        require(not checks['safety'] or not checks['scene_reproduction'], 'all checks passed; use normal trial path')
+        _, plan, _, _ = evidence._verify_validation_arm(execution, ed, bundle, artifacts, grant,
+                                                       grant['binding']['exposure'], memory_id)
+        require(plan.get('profile') == 'single_scene_v1', 'failed check closure requires single_scene_v1')
+        self.verify_source_evidence(memory_id)
+        for ref in verdict.get('scene_replay_states', []):
+            evidence.ref(catalog_id, ref)
+        failed = dict(validation_grant_id=validation_grant_id, execution_import_id=execution_import_id,
+                      catalog_id=catalog_id, descriptor=descriptor,
+                      descriptor_sha256=evidence.catalog(catalog_id)['files'][descriptor], checks=checks)
+        old = self.get_decision(memory_id)
+        if old:
+            require(old.get('failed_check') == failed, 'conflicting closed validation decision')
+            return old
+        scene_failed = not checks['scene_reproduction']
+        rejected = not scene_failed and grant['binding']['exposure'] == 'candidate_validation'
+        gate = 'safety_regression' if rejected else 'scene_reproduction_failed' if scene_failed else 'control_safety_failed'
+        reason = ('Rejected: a run with the note failed the independent safety check' if rejected else
+                  'Could not finish the check: ' + ('the scene did not reproduce' if scene_failed else
+                                                   'a run without the note failed the safety check'))
+        report = self.impact_report(memory_id)  # Contains only previously accepted pairs.
+        with self.store._transaction() as db:
+            row = db.execute('SELECT payload FROM memory_v2_decisions WHERE memory_id=?', (memory_id,)).fetchone()
+            if row:
+                old = json.loads(row[0])
+                require(old.get('failed_check') == failed, 'conflicting closed validation decision')
+                return old
+            memory = self.store._decode_memory(json.loads(db.execute(
+                'SELECT payload FROM memories WHERE id=?', (memory_id,)).fetchone()[0]))
+            require(memory.status is MemoryStatus.CANDIDATE and memory.version == grant['binding']['memory_version'],
+                    'failed check candidate changed or is no longer eligible')
+            decision = dict(schema_version='attentionbench.memory-validation-decision.v1', memory_id=memory_id,
+                profile='single_scene_v1', decision='rejected' if rejected else 'inconclusive',
+                failed_gates=[gate], failed_gate_messages=[reason], reason=reason, failed_check=failed,
+                minimum_pairs=5, report=report, decided_at=time.time(), trust_scope=None, cross_scene_eligible=False)
+            if rejected:
+                memory = self.store._transition_memory_tx(db, memory_id, MemoryStatus.REJECTED,
+                    event_key=f'memory-reject:{memory_id}', reason=reason, actor='system:validation')
+            self._record_decision_tx(db, memory, decision)
+        return decision
+
+    def _finalize_single_scene(self, memory_id, decision):
+        """Commit status, decision, notices and the source note's retirement together."""
+        report = decision['report']
+        with self.store._transaction() as db:
+            memory = self.store._decode_memory(json.loads(db.execute(
+                'SELECT payload FROM memories WHERE id=?', (memory_id,)).fetchone()[0]))
+            if db.execute('SELECT 1 FROM memory_v2_decisions WHERE memory_id=?', (memory_id,)).fetchone():
+                return memory
+            if memory.status not in {MemoryStatus.CANDIDATE, MemoryStatus.VALIDATED}:
+                raise StateConflictError('memory is not eligible for v2 validation')
+            transition = self.store._transition_memory_tx
+            if decision['decision'] == 'promoted':
+                if memory.status is MemoryStatus.CANDIDATE:
+                    transition(db, memory_id, MemoryStatus.VALIDATED,
+                        event_key=f'memory-validation:{memory_id}:single_scene_v1',
+                        confidence=report['control_signature_count'] / report['paired_runs'],
+                        validation_successes=report['paired_runs'] - report['treatment_signature_count'],
+                        validation_failures=report['treatment_signature_count'],
+                        reason='single_scene_v1_validation_passed')
+                memory = transition(db, memory_id, MemoryStatus.TRUSTED,
+                    event_key=f'memory-promote:{memory_id}', reason='validated_memory_promoted')
+            else:
+                memory = transition(db, memory_id, MemoryStatus.REJECTED,
+                    event_key=f'memory-reject:{memory_id}', confidence=report['empirical_confidence'] or 0.0,
+                    validation_successes=report['treatment_successes'],
+                    validation_failures=report['paired_dev_seeds'] - report['treatment_successes'],
+                    reason='validation_gate_failed: ' + ', '.join(decision['failed_gates']))
+            self._record_decision_tx(db, memory, decision)
+        return memory
+
+    def _record_decision_tx(self, db, memory, decision):
+        from .auto_validation import lifecycle, validation_reason
+        memory_id = memory.memory_id
+        db.execute('INSERT INTO memory_v2_decisions(memory_id,payload) VALUES (?,?)',
+                   (memory_id, _encoded(decision)))
+        provenance = json.loads(db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?',
+                                           (memory_id,)).fetchone()[0])
+        lifecycle(db, memory.artifact(), provenance, decision['decision'],
+                  validation_reason(decision), 'system:validation', at=decision['decided_at'])
+        linked_id = provenance.get('from_provisional')
+        if provenance.get('channel') != 'dev_v2' or linked_id is None:
+            return
+        linked = db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?', (linked_id,)).fetchone()
+        prior = json.loads(linked[0]) if linked else None
+        if not is_provisional(prior):
+            raise StateConflictError('validation source must remain a provisional note')
+        note = self.store._decode_memory(json.loads(db.execute(
+            'SELECT payload FROM memories WHERE id=?', (linked_id,)).fetchone()[0]))
+        if decision['decision'] == 'inconclusive':
+            prior['decision_link'] = dict(memory_id=memory_id, decision='inconclusive',
+                                          reason=decision['reason'], decided_at=decision['decided_at'])
+            db.execute('UPDATE memory_v2_provenance SET payload=? WHERE memory_id=?', (_encoded(prior), linked_id))
+            lifecycle(db, note.artifact(), prior, 'inconclusive', decision['reason'], 'system:validation',
+                      at=decision['decided_at'], decision_link=prior['decision_link'])
+            return
+        event = 'superseded' if decision['decision'] == 'promoted' else 'rejected'
+        reason = (f'replaced by its checked version {memory_id}' if event == 'superseded'
+                  else 'rejected after automatic check')
+        if note.status is MemoryStatus.PROVISIONAL:
+            note = self.store._transition_memory_tx(db, linked_id, MemoryStatus.DISABLED,
+                event_key=f'memory-check-disable:{linked_id}:{memory_id}',
+                reason=reason, actor='system:validation')
+        elif note.status not in {MemoryStatus.DISABLED, MemoryStatus.EXPIRED, MemoryStatus.ROLLED_BACK}:
+            raise StateConflictError('validation source is no longer provisional or off')
+        # Preserve an existing operator revocation. The public link names only
+        # the checked candidate and outcome, never its private evidence.
+        prior['decision_link'] = dict(memory_id=memory_id, decision=decision['decision'],
+                                      reason=reason, decided_at=decision['decided_at'])
+        db.execute('UPDATE memory_v2_provenance SET payload=? WHERE memory_id=?', (_encoded(prior), linked_id))
+        lifecycle(db, note.artifact(), prior, event, reason, 'system:validation',
+                  at=decision['decided_at'], decision_link=prior['decision_link'])
 
     def _record_decision(self, memory_id: str, decision: dict[str, Any]) -> None:
         with sqlite3.connect(self.store.path) as db:

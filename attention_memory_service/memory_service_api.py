@@ -107,6 +107,21 @@ class ImportInput(BaseModel):
     descriptor: str
 
 
+class CatalogInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    catalog_id: str
+    catalog: dict[str, Any]
+
+
+class FailedCheckInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    validation_grant_id: str
+    execution_import_id: str
+    catalog_id: str
+    descriptor: str
+
+
 class ImportedCandidateInput(BaseModel):
     model_config = {'extra': 'forbid'}
     memory_id: str
@@ -138,6 +153,7 @@ class ValidationGrantInput(BaseModel):
     policy_sha256: str
     config_sha256: str
     exposure: str
+    origin_source_sha256: str | None = None
 
 
 class SeededNoteInput(BaseModel):
@@ -210,7 +226,8 @@ class ProvisionalOutcomeInput(BaseModel):
 
 def create_app(store_path: Path, *, api_key: str, operator_key: str | None = None,
                importer_key: str | None = None,
-               dev_v2_catalogs: dict[str, Any] | None = None) -> FastAPI:
+               dev_v2_catalogs: dict[str, Any] | None = None,
+               dev_v2_registration_roots: dict[str, Any] | None = None) -> FastAPI:
     if not api_key or len(api_key) < 16:
         raise ValueError("Memory Service requires an API key of at least 16 characters")
     if operator_key is not None and len(operator_key) < 16:
@@ -219,7 +236,8 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
         raise ValueError("operator key must differ from the service API key")
     if importer_key is not None and (len(importer_key) < 16 or importer_key in {api_key, operator_key}):
         raise ValueError('importer key must be distinct and have at least 16 characters')
-    service = MemoryService(store_path, dev_v2_catalogs=dev_v2_catalogs)
+    service = MemoryService(store_path, dev_v2_catalogs=dev_v2_catalogs,
+                            dev_v2_registration_roots=dev_v2_registration_roots)
     app = FastAPI(title="TidyBot Attention Memory Service", version="2")
 
     def authorized(x_memory_service_key: str | None = Header(default=None)) -> None:
@@ -256,6 +274,18 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                 value.pop(key, None)
         return value
 
+    @app.post('/dev-v2/catalogs', dependencies=[Depends(importer_authorized)])
+    def register_catalog(payload: CatalogInput):
+        return guarded(service.register_dev_v2_catalog, **payload.model_dump())
+
+    @app.get('/dev-v2/validation-queue', dependencies=[Depends(authorized)])
+    def validation_queue():
+        return {'items': guarded(service.validation_queue)}
+
+    @app.get('/dev-v2/memory-events', dependencies=[Depends(authorized)])
+    def memory_events(after: int = 0):
+        return {'events': guarded(service.memory_events, after=after)}
+
     @app.post('/dev-v2/executions', dependencies=[Depends(importer_authorized)])
     def import_execution(payload: ImportInput):
         return guarded(service.import_dev_v2_execution, **payload.model_dump())
@@ -267,6 +297,10 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     @app.post('/dev-v2/trials', dependencies=[Depends(importer_authorized)])
     def import_trial(payload: ImportInput):
         return guarded(service.import_dev_v2_trial, **payload.model_dump())
+
+    @app.post('/dev-v2/failed-checks', dependencies=[Depends(importer_authorized)])
+    def failed_check(payload: FailedCheckInput):
+        return guarded(service.record_dev_v2_failed_check, **payload.model_dump())
 
     @app.post('/dev-v2/validation-grants', dependencies=[Depends(importer_authorized)])
     def validation_grant(payload: ValidationGrantInput):
@@ -495,6 +529,7 @@ def main() -> int:
     parser.add_argument("--operator-key-env", default="ATTENTION_MEMORY_OPERATOR_KEY")
     parser.add_argument('--importer-key-env', default='ATTENTION_MEMORY_IMPORTER_KEY')
     parser.add_argument('--dev-v2-catalogs', type=Path)
+    parser.add_argument('--dev-v2-registration-roots', type=Path)
     args = parser.parse_args()
     key = os.environ.get(args.api_key_env, "")
     app = create_app(
@@ -502,6 +537,7 @@ def main() -> int:
         operator_key=os.environ.get(args.operator_key_env) or None,
         importer_key=os.environ.get(args.importer_key_env) or None,
         dev_v2_catalogs=json.loads(args.dev_v2_catalogs.read_text()) if args.dev_v2_catalogs else None,
+        dev_v2_registration_roots=json.loads(args.dev_v2_registration_roots.read_text()) if args.dev_v2_registration_roots else None,
     )
     import uvicorn
 
