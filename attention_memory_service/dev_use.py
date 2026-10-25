@@ -17,6 +17,7 @@ from typing import Any
 from pathlib import Path
 
 from .core.models import MemoryStatus
+from .memory_v2 import trusted_here
 from .core.store import StateConflictError
 from .seeded_notes import flags, is_test_seeded, is_provisional
 from .applicability import SAME_SCENE, SAME_TASK, SAME_FAMILY, layer_of, marker as level_marker
@@ -61,8 +62,8 @@ class DevMemoryUse:
         # The existing retrieval guard checks exact validated variation,
         # provenance, trusted status and expiry.  Recheck status atomically
         # before the guidance leaves the Service.
-        # Dev exposure may read every level; trust stays same-scene only and
-        # anything not trusted here is excluded from results.
+        # Dev exposure may read every level; explicit task authority also
+        # applies at SAME_TASK. Anything not trusted here is excluded.
         memory, level = self._find(memory_id, context, now)
         if memory is None:
             raise StateConflictError("memory is not trusted or applicable to Dev context")
@@ -90,8 +91,10 @@ class DevMemoryUse:
                     or current.get("expires_at") is not None
                     and current["expires_at"] <= time.time()):
                 raise StateConflictError("memory was revoked or expired before Dev exposure")
-            # Trust is same-scene only; everything else is a labelled reference.
-            marker = {**marker, **level_marker(level, level == SAME_SCENE and current["status"] == MemoryStatus.TRUSTED.value),
+            # Scene and task authority share one trust predicate.
+            trusted = current['status'] == MemoryStatus.TRUSTED.value and (
+                level == SAME_SCENE or trusted_here(memory, level, provenance))
+            marker = {**marker, **level_marker(level, trusted),
                       'source_task_id': current.get('applicability', context).get('task_id')}
             if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
                 marker.update(source_seed=provenance.get('source_seed'),

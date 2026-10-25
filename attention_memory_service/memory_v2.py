@@ -25,9 +25,10 @@ from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, SAME_F
                             same_task, valid_interface)
 
 
-def trusted_here(memory, level):
-    """Only a trusted note at the exact scene is trusted for that scene."""
-    return memory.status is MemoryStatus.TRUSTED and level == SAME_SCENE
+def trusted_here(memory, level, provenance=None):
+    """Task authority is explicit; legacy and seeded notes keep exact trust."""
+    task = (provenance or {}).get('channel') == 'dev_v2' and (provenance or {}).get('trust_scope') == 'task_scoped'
+    return memory.status is MemoryStatus.TRUSTED and (level == SAME_SCENE or task and level == SAME_TASK)
 
 
 def _digest(data: bytes) -> str:
@@ -589,8 +590,8 @@ class MemoryV2Manager:
             level = self._match_level(item, provenance, context)
             if level in levels:
                 result.append((item, level))
-        here = [pair for pair in result if trusted_here(*pair)]
-        rest = sorted((pair for pair in result if not trusted_here(*pair)),
+        here = [pair for pair in result if trusted_here(*pair, self._provenance(pair[0].memory_id))]
+        rest = sorted((pair for pair in result if not trusted_here(*pair, self._provenance(pair[0].memory_id))),
                       key=lambda pair: (-pair[0].created_at, pair[0].memory_id))
         return here + rest
 

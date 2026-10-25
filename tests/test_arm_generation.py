@@ -23,9 +23,10 @@ def setup(tmp_path, **kwargs):
 
 
 def grant_args(r, plan):
-    return dict(memory_id='m1', cell=r['name'], version=1, seed=101, context=r['context'],
+    return dict(memory_id='m1', cell=r['name'], version=1, seed=plan.get('target_seed', 101), context=r['context'],
                 policy_sha256=r['record']['source']['sha256'], config_sha256=r['descriptor']['config']['sha256'],
-                exposure=r['trial']['exposure'], origin_source_sha256=plan['origin_source_sha256'])
+                exposure=r['trial']['exposure'], origin_source_sha256=plan['origin_source_sha256'],
+                **({'target_seed': plan['target_seed']} if 'target_seed' in plan else {}))
 
 
 def prepare(f, service, plan, name, *, fault=None, unsafe=False, checks=None):

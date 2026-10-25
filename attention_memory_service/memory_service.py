@@ -43,6 +43,8 @@ class MemoryService:
         provisional_notes.initialize(self.store)
         from .dev_v2 import DevV2Evidence
         self.dev_v2 = DevV2Evidence(self.store, dev_v2_catalogs, dev_v2_registration_roots)
+        from .cross_seed import CrossSeed
+        self.cross_seed = CrossSeed(self)
 
     def register_dev_v2_catalog(self, **payload):
         return self.dev_v2.register_online(**payload)
@@ -454,9 +456,11 @@ class MemoryService:
                 case = memory.applicability
             trusted = not provisional and memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
             scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
+            if trusted and provenance.get('trust_scope') == 'task_scoped':
+                scope = 'task_scoped'
             rows.append({
                 'memory_id': memory.memory_id, 'version': memory.version,
-                'layer': 'scene',
+                'layer': 'task' if scope == 'task_scoped' else 'scene',
                 'from_provisional': provenance.get('from_provisional'),
                 **({'decision_link': provenance['decision_link']} if 'decision_link' in provenance else {}),
                 **({'read_layer': LAYER.get(levels.get(memory.memory_id))} if levels is not None else {}),
@@ -466,7 +470,8 @@ class MemoryService:
                 'summary': provenance.get('summary'),
                 'group': provenance.get('group'),
                 'status': memory.status.value, 'trust_scope': scope,
-                'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped' else None,
+                'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped'
+                                 else 'task_scoped_trusted' if scope == 'task_scoped' else None,
                 'profile': None if plan is None else plan.get('profile', 'default'),
                 'applicability_summary': {
                     'benchmark': memory.applicability['benchmark'],
@@ -502,7 +507,7 @@ class MemoryService:
                 'source_seed': provenance['source_seed'],
                 'match_level': None if levels is None else levels.get(memory.memory_id),
                 'trusted_here': None if levels is None else (
-                    memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id])),
+                    memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id], provenance)),
                 'guidance_length': len(memory.guidance) if seeded else None,
                 'guidance_sha256': hashlib.sha256(memory.guidance.encode()).hexdigest() if seeded else None,
                 **({'expires_at': memory.expires_at, 'uses': provisional_notes.uses_summary(self.store, memory.memory_id),

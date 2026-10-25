@@ -154,6 +154,43 @@ class ValidationGrantInput(BaseModel):
     config_sha256: str
     exposure: str
     origin_source_sha256: str | None = None
+    target_seed: StrictInt | None = None
+
+
+class CrossSeedProbeInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    target_seed: StrictInt
+    execution_import_id: str
+    catalog_id: str
+    descriptor: str
+    scene_contract_ref: dict[str, str]
+
+
+class CrossSeedPlanInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    target_seed: StrictInt
+    pairs: list[dict[str, str]]
+    dev_model: dict[str, str]
+
+
+class CrossSeedPairInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    target_seed: StrictInt
+    control_import_id: str
+    treatment_import_id: str
+
+
+class CrossSeedFailedInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    memory_id: str
+    target_seed: StrictInt
+    validation_grant_id: str
+    execution_import_id: str
+    catalog_id: str
+    descriptor: str
 
 
 class SeededNoteInput(BaseModel):
@@ -274,6 +311,30 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                 value.pop(key, None)
         return value
 
+    @app.post('/dev-v2/cross-seed/probes', dependencies=[Depends(importer_authorized)])
+    def cross_seed_probe(payload: CrossSeedProbeInput):
+        return guarded(service.cross_seed.probe, **payload.model_dump())
+
+    @app.post('/dev-v2/cross-seed/plans', dependencies=[Depends(importer_authorized)])
+    def cross_seed_plan(payload: CrossSeedPlanInput):
+        return guarded(service.cross_seed.plan, **payload.model_dump())
+
+    @app.post('/dev-v2/cross-seed/pairs', dependencies=[Depends(importer_authorized)])
+    def cross_seed_pair(payload: CrossSeedPairInput):
+        return guarded(service.cross_seed.pair, **payload.model_dump())
+
+    @app.post('/dev-v2/cross-seed/failed-checks', dependencies=[Depends(importer_authorized)])
+    def cross_seed_failed(payload: CrossSeedFailedInput):
+        return guarded(service.cross_seed.failed_check, **payload.model_dump())
+
+    @app.get('/dev-v2/cross-seed/status', dependencies=[Depends(authorized)])
+    def cross_seed_status(memory_id: str):
+        return guarded(service.cross_seed.status, memory_id=memory_id)
+
+    @app.get('/dev-v2/cross-seed/queue', dependencies=[Depends(authorized)])
+    def cross_seed_queue():
+        return {'queue': guarded(service.cross_seed.queue)}
+
     @app.post('/dev-v2/catalogs', dependencies=[Depends(importer_authorized)])
     def register_catalog(payload: CatalogInput):
         return guarded(service.register_dev_v2_catalog, **payload.model_dump())
@@ -381,7 +442,7 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                                    levels=tuple(getattr(payload, 'match_levels', ['same_scene']))):
             value = online_memory(item)
             provenance = service.v2._provenance(item.memory_id) or {}
-            value.update(marker(level, trusted_here(item, level)), source_seed=provenance.get('source_seed'),
+            value.update(marker(level, trusted_here(item, level, provenance)), source_seed=provenance.get('source_seed'),
                          source_task_id=item.applicability.get('task_id'))
             rows.append(value)
         return rows

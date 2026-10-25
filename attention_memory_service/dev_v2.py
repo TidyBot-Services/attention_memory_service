@@ -924,7 +924,13 @@ class DevV2Evidence:
         return candidate
 
     def authorize_validation(self, *, memory_id, cell, version, seed, context,
-                             policy_sha256, config_sha256, exposure, origin_source_sha256=None):
+                             policy_sha256, config_sha256, exposure, origin_source_sha256=None, target_seed=None):
+        if target_seed is not None:
+            from .memory_service import MemoryService
+            return MemoryService(self.store.path).cross_seed.authorize(
+                memory_id=memory_id, target_seed=target_seed, cell=cell, version=version, seed=seed,
+                context=context, policy_sha256=policy_sha256, config_sha256=config_sha256,
+                exposure=exposure, origin_source_sha256=origin_source_sha256)
         from .memory_v2 import MemoryV2Manager
         manager = MemoryV2Manager(self.store)
         provenance = manager.provenance(memory_id)
@@ -1029,11 +1035,21 @@ class DevV2Evidence:
         require(row is not None, 'unknown original offline validation grant')
         return json.loads(row[0])
 
-    def _verify_validation_arm(self, execution, ed, bundle, artifacts, grant, exposure, memory_id):
+    def _verify_validation_arm(self, execution, ed, bundle, artifacts, grant, exposure, memory_id, *, historical=False):
         binding = grant['binding']
         from .memory_v2 import MemoryV2Manager
         manager = MemoryV2Manager(self.store)
         plan = manager.get_plan(binding['memory_id'])
+        if 'target_seed' in binding:
+            with sqlite3.connect(self.store.path) as db:
+                row = db.execute('SELECT payload FROM memory_cross_seed_plans WHERE memory_id=? AND seed=?',
+                                 (binding['memory_id'], binding['target_seed'])).fetchone()
+            plan = json.loads(row[0]) if row else None
+            require(plan is not None and binding['memory_version'] == plan['memory_version'], 'cross-seed version changed')
+            config = self.ref(execution['catalog_id'], execution['config'])
+            require(config['seed'] == binding['target_seed'] and config.get('scene_contract') == plan['cases'][0]['scene_contract_ref']
+                    and execution['context'] == plan['context'] and bundle['config_sha256'] == plan['validation_config_sha256'],
+                    'cross-seed execution differs from frozen case')
         require(plan and digest(encoded(plan).encode()) == binding['plan_sha256'], 'original validation plan changed')
         require(all(binding[k] == v for k, v in {'cell': ed['cell'], 'version': ed['version'], 'seed': bundle['seed'], 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'exposure': exposure}.items()), 'offline validation grant/raw run binding mismatch')
         require(exposure == 'none' or binding['memory_id'] == memory_id, 'candidate validation grant memory mismatch')
@@ -1043,6 +1059,23 @@ class DevV2Evidence:
         input_value = self.ref(execution['catalog_id'], ed['validation_input'])
         require(input_value == {'memory_ids': ids, 'exposure': exposure, 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'validation_grant_id': grant['grant_id']}, 'original validation exposure/config mismatch')
         candidate = self.store.get_memory(binding['memory_id'])
+        if (historical and plan.get('profile') == 'single_scene_v1' and plan.get('arm_generation') == 'dev_from_origin'
+                and candidate.version != binding['memory_version']):
+            # A task -> scene transition changes authority/version, not the
+            # immutable note validated on the origin. Reverify old accepted
+            # trials against the snapshot saved by task promotion, never grant
+            # an old version permission for a new execution.
+            decision = manager.get_decision(binding['memory_id']) or {}
+            frozen = decision.get('cross_seed_validation', {}).get('origin_memory')
+            provenance = manager.provenance(binding['memory_id'])
+            require(frozen and provenance.get('task_demoted_at') is not None
+                    and decision.get('trust_scope') in {'scene_scoped', 'task_scoped'} and candidate.status.value == 'trusted'
+                    and frozen['version'] == binding['memory_version'] < candidate.version
+                    and candidate.version in provenance.get('scene_trust_versions', [])
+                    and all(candidate.artifact()[k] == frozen[k] for k in
+                            ('guidance', 'candidate_repair', 'applicability', 'source_trace_id', 'evidence_refs', 'created_at')),
+                    'historical origin note differs from the checked version')
+            candidate = self.store._decode_memory(frozen)
         generation = (self._validation_generation(execution, ed, binding, plan, candidate)
                       if plan.get('arm_generation') == 'dev_from_origin' else {})
         expected_consumption = {'validation_grant_id': grant['grant_id'],
@@ -1059,7 +1092,7 @@ class DevV2Evidence:
         require(len([(at, p) for at, p in dispatches if p == expected_dispatch and grant['issued_at'] <= at <= job['claimed_at']]) == 1, 'trial lacks an original pre-execution validation dispatch event')
         return manager, plan, ids, generation
 
-    def import_trial(self, *, import_id, catalog_id, descriptor):
+    def import_trial(self, *, import_id, catalog_id, descriptor, _persist=True):
         self.catalog(catalog_id, 'validator')
         d = self.read(catalog_id, descriptor)
         execution, ed, bundle, artifacts, cell, verdict, safety = self.verdict(d['execution_import_id'], catalog_id, d['validation_descriptor'])
@@ -1068,8 +1101,12 @@ class DevV2Evidence:
         require(exposure in {'none', 'candidate_validation'}, 'only offline candidate validation exposure supported')
         grant = self.validation_grant(d['validation_grant_id'])
         binding = grant['binding']
+        with sqlite3.connect(self.store.path) as db:
+            prior = db.execute("SELECT payload FROM dev_v2_imports WHERE id=? AND kind='trial'", (import_id,)).fetchone()
+        historical = bool(prior and json.loads(prior[0])['catalog_id'] == catalog_id
+                          and json.loads(prior[0])['descriptor'] == descriptor)
         manager, plan, ids, generation = self._verify_validation_arm(
-            execution, ed, bundle, artifacts, grant, exposure, d.get('memory_id'))
+            execution, ed, bundle, artifacts, grant, exposure, d.get('memory_id'), historical=historical)
         decision = manager.get_decision(binding['memory_id'])
         if decision and 'failed_check' in decision:
             with sqlite3.connect(self.store.path) as db:
@@ -1083,7 +1120,7 @@ class DevV2Evidence:
         require(costs['seconds'] == artifacts['sandbox_receipt']['elapsed_seconds'], 'trial time differs from native receipt')
         trial = {'run_id': bundle['run_id'], 'run': {'suite': bundle['suite'], 'task_id': bundle['task_id'], 'seed': bundle['seed'], 'policy_id': cell['policy_id'], 'execution_target': 'simulator', 'developer_model': d['developer_model'], 'budget': d['budget']}, 'success': bundle['native_success'], 'attempt_status': 'succeeded' if bundle['native_success'] else 'failed', 'evaluator_authoritative': True, 'mode': execution['context']['perception_mode'], 'memory_ids': ids, 'exposure': exposure, 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'variation': {k: execution['context'][k] for k in (*AXES, 'camera_names', 'task_prompt')}, 'context': execution['context'], **costs}
         trial.update(generation)
-        if plan.get('profile', 'default') == 'single_scene_v1':
+        if plan.get('profile', 'default') in {'single_scene_v1', 'cross_seed_v1'}:
             signature = manager.provenance(binding['memory_id'])['failure_signature']
             feedback = public_trace_projection(artifacts['trace'])
             present = signature_present(feedback, signature)
@@ -1099,7 +1136,8 @@ class DevV2Evidence:
         require(comparison == verdict['validation_config'] and comparison['execution_config'] == {k: v for k, v in self.ref(execution['catalog_id'], execution['config']).items() if k != 'seed'}, 'frozen paired configuration mismatch')
         require(d['budget'] == comparison['budget'] and d['developer_model'] == comparison['developer_model'], 'trial model/budget differs from frozen comparison')
         evidence = {'kind': 'trial', 'catalog_id': catalog_id, 'descriptor': descriptor, 'attempt_id': bundle['attempt_id'], 'trial': trial, 'safety': {'uri': str(safety), 'sha256': digest(safety.read_bytes()), 'attempt_id': bundle['attempt_id']}}
-        self._put('dev_v2_imports', import_id, evidence, kind='trial')
+        if _persist:
+            self._put('dev_v2_imports', import_id, evidence, kind='trial')
         return evidence
 
     @memo_evidence('trial')

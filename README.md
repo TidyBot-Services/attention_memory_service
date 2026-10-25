@@ -103,6 +103,81 @@ show task outcome improvement or cross-scene generalization; exclude it from
 cross-scene aggregate claims. The decision and impact report mark
 `cross_scene_eligible: false` for downstream filtering.
 
+
+### Cross-seed validation and task trust
+
+`cross_seed_v1` attaches checks to a current, scene-trusted Dev v2 note whose
+origin plan is `single_scene_v1`. Candidate seeds come from the worker; none are
+hard-coded. The service refuses the origin seed, another task/scope, a changed
+SDK interface, and seeds without an exact registered **contract** catalog.
+Each target case carries its own `scene_contract_ref`, pointing to a v2 contract
+that contains that seed's normalized fingerprint. Original scene matching and
+existing plans are unchanged; the target contract never replaces the origin's.
+The existing exact executor scope checks, including SDK build identity, remain.
+
+All four writes below require the online **and importer** keys, as `/dev-v2/pairs`
+does. Both reads require the online key only.
+
+| Route | Input / result |
+|---|---|
+| `POST /dev-v2/cross-seed/probes` | `memory_id`, `target_seed`, `execution_import_id`, validator `catalog_id`, `descriptor`, `scene_contract_ref`; returns the service-computed role |
+| `POST /dev-v2/cross-seed/plans` | `memory_id`, `target_seed`, `pairs` (`pair_id`, `control_cell`, `treatment_cell`), `dev_model` (`provider`, `model`); freezes the plan from the probe |
+| `POST /dev-v2/cross-seed/pairs` | `memory_id`, `target_seed`, `control_import_id`, `treatment_import_id`; closes the scene when all prescribed pairs arrive |
+| `POST /dev-v2/cross-seed/failed-checks` | `memory_id`, `target_seed`, `validation_grant_id`, `execution_import_id`, validator `catalog_id`, `descriptor`; closes an independently failed check |
+| `GET /dev-v2/cross-seed/status?memory_id=...` | Per-seed role, pairs done/needed, verdict and plain reason; `task_trust.met`, `missing`, scene count and failed transfer seeds |
+| `GET /dev-v2/cross-seed/queue` | `queue`: scene-trusted notes with an open need, ordered by the M-8 failure-gone/use-count rank |
+
+First import a sealed direct execution of the note's frozen origin source with
+no notes and no model/advice jobs. Its sealed `validation_input` is the normal
+`none` input (empty `memory_ids`, context, policy/config hashes), without a grant.
+Import its independent validator descriptor through `probes`. The service derives
+the signature from the public trace: present means **transfer**, absent means
+**neutral**. Failed scene reproduction or probe safety means **could_not_finish**;
+that seed is closed and does not count as a tested scene. Client-supplied roles
+are refused. Replay twice, independent roots, native evaluation, permissions,
+original source identity, and all catalog/digest gates remain required.
+
+The service freezes exactly **five** pairs for transfer or **three** for neutral.
+All pairs use `dev_from_origin`: the worker supplies cells and Dev model, while
+the service binds the origin SHA, target config, signature, case and pair count.
+For each arm, use the existing `POST /dev-v2/validation-grants` with the additional
+`target_seed` field, then the existing execution/trial import routes. Grants bind
+the current memory version and exact plan. M-8's original Dev request, output,
+lineage, exposure receipt, native consumption and dispatch checks enforce empty
+Memory for control and only this note for treatment.
+
+Transfer uses the unchanged `_single_scene_failures` rule (control >= 3/5,
+treatment <= 1/5, no safety regression, no earlier stop). Neutral checks only
+pairwise/net safety and earlier stopping. Verdicts are `transfer_passed`,
+`transfer_failed`, `neutral_no_harm`, `neutral_harm`, or `could_not_finish`.
+The failed-check exit preserves M-8's distinction: treatment safety failure is
+harm/failure; control safety or replay failure is `could_not_finish`.
+
+Every scene verdict evaluates task trust in the same transaction. It requires
+current origin-scene trust, at least one other `transfer_passed`, no
+`neutral_harm`, and at least three verdict-bearing scenes including the origin.
+`transfer_failed` counts and is listed in the decision, but does not itself block
+promotion. Evidence from an older memory version cannot satisfy a new crossing;
+closed seeds remain closed. A known neutral harm remains a blocker. Promotion
+rechecks participating sealed evidence, updates the decision to
+`trust_scope: "task_scoped"`, and emits one `promoted` lifecycle event. The original
+scene report and `cross_scene_eligible: false` are retained; this does not loosen
+the default multi-scene profile or admit a note to the frozen matrix.
+
+A task-scoped note still matches `SAME_TASK` on another seed, but `trusted_here`
+becomes true and it joins the trusted block. Origin labels, source-evidence checks,
+legacy/test-seeded notes, and family references keep their existing behavior.
+Task trust does not change the note version or guidance. Each demotion increments
+the version, so old use records cannot cause a second drop: at least three target
+failures in the last five non-origin uses demote task → scene. The origin-use
+window can also demote task → scene; a later M-8 crossing demotes scene →
+provisional. Each event records its triggering use IDs, and retries are idempotent.
+
+The additive tables are `memory_cross_seed_probes`, `memory_cross_seed_plans`,
+`memory_cross_seed_pairs`, and `memory_cross_seed_verdicts`. These retain sealed
+provenance separately from origin plans and evidence; service restart preserves
+all checks and decisions. No feasible target seeds are assumed by this feature.
+
 ### Automatic validation service hooks
 
 Evidence catalogs can be registered at startup, plus the importer-only registration

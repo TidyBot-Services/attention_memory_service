@@ -61,7 +61,7 @@ def validation_queue(service):
     return rank_validation_queue(rows)
 
 
-def lifecycle(db, memory, provenance, event, reason, actor, *, at=None, use_ids=None, decision_link=None):
+def lifecycle(db, memory, provenance, event, reason, actor, *, at=None, use_ids=None, decision_link=None, suffix=None):
     value = dict(memory_id=memory['memory_id'], title=provenance.get('title'), event=event,
                  reason=reason, time=time.time() if at is None else at, actor=actor,
                  memory=memory)
@@ -70,6 +70,8 @@ def lifecycle(db, memory, provenance, event, reason, actor, *, at=None, use_ids=
     if decision_link is not None:
         value['decision_link'] = decision_link
     event_key = f"memory-lifecycle:{memory['memory_id']}:{memory['version']}:{event}"
+    if suffix is not None:
+        event_key += ':' + suffix
     if decision_link is not None:
         event_key += ':' + decision_link['memory_id']
     db.execute("INSERT OR IGNORE INTO events(event_key,entity_type,entity_id,event_type,payload) "
@@ -100,15 +102,41 @@ def demote_if_due(db, memory_id):
         'SELECT payload FROM memory_provisional_outcomes WHERE memory_id=? ORDER BY rowid', (memory_id,))]
     uses = [r for r in uses if r['memory_version'] == memory['version']]
     uses.sort(key=lambda r: r['recorded_at'])  # Stable row order breaks clock ties.
+    decision_row = db.execute('SELECT payload FROM memory_v2_decisions WHERE memory_id=?', (memory_id,)).fetchone()
+    decision = json.loads(decision_row[0]) if decision_row else {}
+    task = decision.get('trust_scope') == 'task_scoped'
+    other = False
+    if task:
+        grants = {r[0]: json.loads(r[1]) for r in db.execute(
+            'SELECT grant_id,payload FROM memory_dev_exposures WHERE memory_id=?', (memory_id,))}
+        origin_uses = [r for r in uses if grants.get(r['grant_id'], {}).get('context', {}).get('seed') == p['source_seed']]
+        other_uses = [r for r in uses if type(grants.get(r['grant_id'], {}).get('context', {}).get('seed')) is int
+                      and grants[r['grant_id']]['context']['seed'] != p['source_seed']]
+        other = len(other_uses) >= 5 and sum(r['signature_present'] is True for r in other_uses[-5:]) >= 3
+        uses = other_uses if other else origin_uses
     last = uses[-5:]
     if len(last) < 5 or sum(r['signature_present'] is True for r in last) < 3:
         return
     now = time.time()
-    reason = 'target failure in 3 of last 5 uses'
+    reason = 'target failure in 3 of last 5 uses' + (' on other seeds' if other else '')
+    if task:
+        memory.update(version=memory['version'] + 1, status_reason=reason)
+        p.update(trust_scope='scene_scoped', task_demoted_at=now,
+                 scene_trust_versions=[*p.get('scene_trust_versions', []), memory['version']])
+        decision.update(trust_scope='scene_scoped')
+        db.execute('UPDATE memories SET payload=? WHERE id=?', (encoded(memory), memory_id))
+        db.execute('UPDATE memory_v2_provenance SET payload=? WHERE memory_id=?', (encoded(p), memory_id))
+        db.execute('UPDATE memory_v2_decisions SET payload=? WHERE memory_id=?', (encoded(decision), memory_id))
+        lifecycle(db, memory, p, 'demoted', reason, 'system:auto-demotion', at=now,
+                  use_ids=[r['grant_id'] for r in last])
+        return
     expires_at = memory.get('expires_at')
     memory.update(status='provisional', version=memory['version'] + 1, status_reason=reason,
                   expires_at=now + 14 * 86400 if expires_at is None else min(expires_at, now + 14 * 86400))
     p.update(demoted_at=now, trust_scope='provisional', unvalidated=True, excluded_from_results=True)
+    if 'cross_seed_validation' in decision:
+        decision.update(trust_scope='provisional')
+        db.execute('UPDATE memory_v2_decisions SET payload=? WHERE memory_id=?', (encoded(decision), memory_id))
     db.execute('UPDATE memories SET payload=? WHERE id=?', (encoded(memory), memory_id))
     db.execute('UPDATE memory_v2_provenance SET payload=? WHERE memory_id=?', (encoded(p), memory_id))
     lifecycle(db, memory, p, 'demoted', reason, 'system:auto-demotion', at=now,
