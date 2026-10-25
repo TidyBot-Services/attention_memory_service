@@ -25,6 +25,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .provider_evidence import verify_provider, frozen_provider, verify_codex_record
+from .feedback_evidence import verify_feedback
 from .core.models import MemoryRecord
 from .core.store import StateConflictError
 from .applicability import (PROFILE_KEY, validate_profile, require_profile_match, config_profile, profile_fields)
@@ -574,16 +576,15 @@ class DevV2Evidence:
         require(expected_files and sdk['implementation'] == expected_files, 'SDK implementation source list mismatch')
         return catalog, manifest, config, record, source, cell
 
-    def _provider(self, catalog_id, job):
+    def _provider(self, catalog_id, job, manifest, config):
         receipt = job['receipt']
         request = self.ref(catalog_id, receipt['request'])
         output = self.ref(catalog_id, receipt['response'])
         wire = self.ref(catalog_id, receipt['provider_response'])
-        usage = wire['body']['usage']
-        require(wire['http_status'] == 200 and isinstance(wire.get('request_id') or wire['body'].get('id'), str) and (wire.get('request_id') or wire['body'].get('id')), 'successful original provider response/request ID required')
-        require(all(type(usage.get(k)) is int and usage[k] >= 0 for k in ('total_tokens', 'prompt_tokens', 'completion_tokens')) and usage['total_tokens'] == usage['prompt_tokens'] + usage['completion_tokens'], 'complete provider usage required')
-        require(receipt['usage'] == usage and output['usage'] == usage and output['content'] == wire['body']['choices'][0]['message']['content'], 'provider output/usage differs from original wire')
-        require(all(job['actual'].get(k) == usage[v] for k, v in [('provider_tokens', 'total_tokens'), ('input_tokens', 'prompt_tokens'), ('output_tokens', 'completion_tokens')]), 'ledger provider costs disagree')
+        identity = verify_provider(request, output, wire, receipt, job['actual'],
+                                   manifest, config, job['kind'], require)
+        if identity == 'codex_exec':
+            receipt = dict(receipt, provider_identity=identity)
         for message in request['messages']:
             if message['role'] == 'user':
                 public(json.loads(message['content']))
@@ -697,12 +698,15 @@ class DevV2Evidence:
         require(isinstance(v['permission_scope'], dict) and v['permission_scope'] == d['permission_scope'] and v['permission_scope'], 'permission scope not bound to trusted validation')
         return execution, d, bundle, artifacts, cell, v, safety_path
 
-    def _visual_advisor(self, catalog_id, config, bundle, advisor, model, help_value):
+    def _visual_advisor(self, catalog_id, config, bundle, advisor, model, help_value, manifest):
         """Check the original visual request, response, frame bytes and ledger receipt."""
         require(help_value.get('mode') == 'vision' and not help_value.get('rejected'), 'visual Advisor help must be answered in vision mode')
         hint_ref = help_value.get('advisor_proxy')
         require(isinstance(hint_ref, dict) and hint_ref == advisor.get('receipt', {}).get('advisor_answer'), 'visual Advisor help/ledger reference mismatch')
         hint = self.ref(catalog_id, hint_ref)
+        provider_source, locked_model = frozen_provider(manifest, config, 'advisor', require)
+        if provider_source == 'codex':
+            verify_codex_record(hint, locked_model, require)
         view_ref = hint.get('request_view')
         require(isinstance(view_ref, dict) and view_ref == advisor['receipt'].get('request_view'), 'visual Advisor request_view/ledger reference mismatch')
         view = self.ref(catalog_id, view_ref)
@@ -806,6 +810,33 @@ class DevV2Evidence:
                 'visual Advisor usage/committed cost receipt incomplete')
         return hint['feedback'], view_ref, hint['model']
 
+    def _generation_feedback(self, packets, failed, catalog_id, descriptor):
+        """Bind additions to the failed version in the sealed original ledger."""
+        expected_source = self.ref(failed['catalog_id'], failed['source'], raw=True).decode()
+        feedback = self.ref(failed['catalog_id'], failed['public_feedback'])
+        require(descriptor['manifest'] == failed['manifest'], 'feedback origin manifest differs')
+        manifest = self.ref(catalog_id, descriptor['manifest'])
+        with self._ledger(catalog_id, descriptor) as db:
+            cell = self._row(db, 'v2_cells', 'id=?', (failed['cell'],))
+            version = self._row(db, 'v2_versions', 'cell=? AND version=?',
+                                (failed['cell'], failed['version']))
+            require(version['source'] == failed['source'], 'feedback origin version differs')
+
+            def eval_job():
+                rows = db.execute("SELECT id FROM v2_jobs WHERE cell=? AND version=? AND kind='eval'",
+                                  (failed['cell'], failed['version'])).fetchall()
+                require(len(rows) == 1, 'sealed Eval job missing or ambiguous')
+                return dict(self._job(db, rows[0][0], failed['cell'], failed['version'], 'eval'), state='settled')
+
+            modes = []
+            for audience, packet in packets:
+                require(packet.get('previous_complete_source') == expected_source,
+                        'online help source/public failed trace mismatch')
+                modes.append(verify_feedback(packet.get('public_feedback'), feedback, audience=audience, version=version,
+                    cell=cell, manifest=manifest, read=lambda ref: self.ref(catalog_id, ref),
+                    eval_job=eval_job, require=require))
+        return 'with_eval_review' if 'with_eval_review' in modes else 'exact'
+
     def import_source(self, *, import_id, catalog_id, descriptor):
         d = self.read(catalog_id, descriptor)
         title = validate_title(d['title']) if 'title' in d else None
@@ -818,52 +849,86 @@ class DevV2Evidence:
             advisor = self._job(db, d['advisor_job_id'], d['cell'], d['version'], 'advisor')
             model = self._job(db, d['model_job_id'], d['cell'], d['version'], 'model')
             row = self._row(db, 'v2_planner_requests', 'id=?', (d['request_id'],)) if 'request_id' in d else None
-        mr, mo, mc = self._provider(catalog_id, model)
+            # Omitting the ID must not hide an existing (including rejected) request.
+            requests = []
+            if row is None and db.execute("SELECT 1 FROM sqlite_master WHERE name='v2_planner_requests'").fetchone():
+                requests = [json.loads(p) for p, in db.execute(
+                    'SELECT payload FROM v2_planner_requests WHERE cell=?', (d['cell'],))]
+                requests = [r for r in requests if r.get('version') == d['version'] and r.get('request_type') == 'advisor']
+        mr, mo, mc = self._provider(catalog_id, model, manifest, config)
         help_value = self.ref(catalog_id, record['help'])
         provider = help_value.get('provider')
         require(provider in {'advisor', 'human_proxy'}, 'unsupported Advisor provider')
         if provider == 'advisor':
-            require(row is not None, 'original Advisor request row required')
-            ar, ao, ac = self._provider(catalog_id, advisor)
+            ar, ao, ac = self._provider(catalog_id, advisor, manifest, config)
             require(help_value['provider'] == 'advisor' and not help_value.get('rejected') and help_value['content'] == ao['content'] and help_value['request'] == ac['request'] and help_value['response'] == ac['response'] and help_value['usage'] == ac['usage'], 'answered original Advisor guidance required')
             require(isinstance(ao['content'], str) and ao['content'].strip(), 'nonempty answered guidance required')
-            require(row['binding'] == {'cell': d['cell'], 'version': d['version'], 'input_sha256': digest(json.dumps(ar['messages'], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()), 'source_sha256': failed['source']['sha256'], 'policy_id': cell['policy_id'], 'config_sha256': d['config']['sha256']}, 'Advisor request binding differs from original source/input/scope')
-            require(advisor['claimed_at'] <= row['created_at'] <= advisor['settled_at'] <= row['responded_at'] <= row['deadline_epoch'] and row['responded_at'] <= model['claimed_at'], 'Advisor response late or not available before actual adoption')
             require(advisor['actual'].get('advisor_calls') == 1 and advisor['actual'].get('help_count') == 1 and advisor['actual'].get('help_credits') == 1 and model['actual'].get('dev_calls') == 1, 'committed assistance/model cost required')
-            require(row['cell'] == d['cell'] and row['version'] == d['version'] and row['request_type'] == 'advisor' and row['state'] == 'answered' and row['accepted'] is True and row['adopted'] is True and row['response'] == ac['response'] and row['adoption'] == {'model_input': mc['request'], 'result_source': record['source']}, 'answered/adopted request must bind actual generation')
+            if row is not None:
+                require(row['binding'] == {'cell': d['cell'], 'version': d['version'], 'input_sha256': digest(json.dumps(ar['messages'], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()), 'source_sha256': failed['source']['sha256'], 'policy_id': cell['policy_id'], 'config_sha256': d['config']['sha256']}, 'Advisor request binding differs from original source/input/scope')
+                require(advisor['claimed_at'] <= row['created_at'] <= advisor['settled_at'] <= row['responded_at'] <= row['deadline_epoch'] and row['responded_at'] <= model['claimed_at'], 'Advisor response late or not available before actual adoption')
+                require(row['cell'] == d['cell'] and row['version'] == d['version'] and row['request_type'] == 'advisor' and row['state'] == 'answered' and row['accepted'] is True and row['adopted'] is True and row['response'] == ac['response'] and row['adoption'] == {'model_input': mc['request'], 'result_source': record['source']}, 'answered/adopted request must bind actual generation')
+            else:
+                selection = manifest.get('selection')
+                require(isinstance(selection, dict) and not requests
+                        and not any(value.get('planner_features') for value in (manifest, selection, config, cell)),
+                        'original Advisor request row required for planner features or existing requests')
+                require(cell['policy_id'] in {'reactive_help', 'retry_k_then_ask',
+                        'budget_matched_random_escalation', 'trace_aware_hint_only',
+                        'full_trace_aware_attention_planner'}, 'Advisor source requires an asking policy')
+                require('rejected' not in help_value, 'rejected Advisor help cannot be imported')
+                require(advisor['claimed_at'] <= advisor['settled_at'] <= model['claimed_at'],
+                        'Advisor response late or not available before actual adoption')
+                # Adoption is proved below: guidance is in the next version's
+                # generation input, and that version's source is the model output.
             guidance, view_ref, advisor_model = ao['content'], None, None
         else:
-            guidance, view_ref, advisor_model = self._visual_advisor(catalog_id, config, bundle, advisor, model, help_value)
+            guidance, view_ref, advisor_model = self._visual_advisor(catalog_id, config, bundle, advisor, model, help_value, manifest)
             require(model['actual'].get('dev_calls') == 1, 'committed Dev model cost required')
         require(record['model_input'] == mc['request'] and record['model_output'] == mc['response'], 'model input/output lineage mismatch')
         packet = json.loads(mr['messages'][-1]['content'])
-        expected_source = self.ref(failed['catalog_id'], failed['source'], raw=True).decode()
         expected_feedback = self.ref(failed['catalog_id'], failed['public_feedback'])
+        packets = [('dev', packet)]
         if provider == 'advisor':
-            advisor_packet = json.loads(ar['messages'][-1]['content'])
-            require(packet['previous_complete_source'] == expected_source and packet['public_feedback'] == expected_feedback and advisor_packet['previous_complete_source'] == expected_source and advisor_packet['public_feedback'] == expected_feedback, 'online help source/public failed trace mismatch')
-        else:
-            require(packet['previous_complete_source'] == expected_source and packet['public_feedback'] == expected_feedback,
-                    'online help source/public failed trace mismatch')
+            packets.append(('advisor', json.loads(ar['messages'][-1]['content'])))
+        projection = self._generation_feedback(packets, failed, catalog_id, d)
         signature = d.get('failure_signature')
         if signature is not None:
             validate_signature(signature, expected_feedback)
-        require(packet['attention_control']['help']['provider'] == provider and packet['attention_control']['help']['content'] == guidance, 'guidance not actually present in generation input')
+        help_input = packet.get('attention_control', {}).get('help', {})
+        require(help_input.get('provider') == provider and help_input.get('content') == guidance, 'guidance not actually present in generation input')
         generated = mo['content'].strip()
         if generated.startswith('```'):
             generated = re.sub(r'^```(?:json)?\s*|\s*```$', '', generated)
         require(json.loads(generated)['source'].encode() == repair, 'adopted source differs from actual model output')
         public(guidance); public(repair.decode())
         evidence = {'kind': 'source', 'catalog_id': catalog_id, 'descriptor': descriptor, 'failed_execution_import_id': d['failed_execution_import_id'], 'context': d['context'], 'request_id': d.get('request_id'), 'cell': d['cell'], 'version': d['version'], 'guidance': guidance, 'repair': repair.decode(), 'failure_signature': signature, 'source_policy_sha256': failed['source']['sha256'], 'repair_sha256': record['source']['sha256'], 'source_policy_id': cell['policy_id'], 'source_seed': config['seed'], 'source_run_id': bundle['run_id'], 'source_attempt_id': bundle['attempt_id']}
+        evidence['feedback_projection'] = projection
+        if mc.get('provider_identity') == 'codex_exec':
+            evidence.update(provider_identity='codex_exec', provider_identities=dict(model='codex_exec', advisor='codex_exec'))
         if title is not None:
             evidence['title'] = title
         if summary is not None:
             evidence['summary'] = summary
         if group is not None:
             evidence['group'] = group
+        if provider == 'advisor':
+            evidence['advisor_evidence'] = 'planner_request' if row is not None else 'advisor_job'
         if provider == 'human_proxy':
             evidence.update(provider=provider, request_view=view_ref, advisor_model=advisor_model, advisor_mode='vision')
-        self._put('dev_v2_imports', import_id, evidence, kind='source')
+        stored = evidence
+        # Derived annotations may be absent in immutable pre-C10/C10b imports.
+        # Only those omissions are compatible; changed evidence still conflicts.
+        with sqlite3.connect(self.store.path) as db:
+            old = db.execute('SELECT payload FROM dev_v2_imports WHERE id=?', (import_id,)).fetchone()
+        if old:
+            legacy = json.loads(old[0])
+            optional = {'feedback_projection'}
+            if provider == 'advisor' and row is not None:
+                optional.add('advisor_evidence')
+            if legacy == {k: v for k, v in evidence.items() if k not in optional - set(legacy)}:
+                stored = legacy
+        self._put('dev_v2_imports', import_id, stored, kind='source')
         return evidence
 
     @memo_evidence('source')
@@ -995,7 +1060,7 @@ class DevV2Evidence:
         require(record['parent_source']['sha256'] == plan['origin_source_sha256'], 'wrong generation parent/origin')
         with self._ledger(catalog_id, ed) as db:
             job = self._job(db, ed['model_job_id'], ed['cell'], ed['version'], 'model')
-        request, output, provider = self._provider(catalog_id, job)
+        request, output, provider = self._provider(catalog_id, job, self.ref(catalog_id, ed['manifest']), self.ref(catalog_id, ed['config']))
         require(record['model_input'] == provider['request'] and record['model_output'] == provider['response']
                 and job['actual'].get('dev_calls') == 1
                 and job['settled_at'] <= self._execution_claim_time(execution, ed), 'generation model lineage mismatch')
@@ -1012,6 +1077,18 @@ class DevV2Evidence:
                 'public_feedback', 'attention_control', 'remaining_budget', 'source_size_limit_bytes'}
                 and packet.get('previous_complete_source', '').encode() == parent,
                 'generation prompt differs from frozen origin or contains extra sections')
+        feedback_evidence = {}
+        # Old generation records without a frozen validation_origin omitted this
+        # section. Any supplied feedback, and every frozen-origin run, is checked.
+        if 'public_feedback' in packet or self.ref(catalog_id, ed['manifest']).get('validation_origin'):
+            from .memory_v2 import MemoryV2Manager
+            provenance = MemoryV2Manager(self.store).provenance(binding['memory_id'])
+            source = self.source(provenance['source_import_id'])
+            failed, *_ = self.execution(source['failed_execution_import_id'])
+            require(failed['source']['sha256'] == plan['origin_source_sha256'],
+                    'generation feedback origin differs from plan')
+            feedback_evidence['feedback_projection'] = self._generation_feedback(
+                [('dev', packet)], failed, source['catalog_id'], self.read(source['catalog_id'], source['descriptor']))
         require(candidate.version == binding['memory_version']
                 and digest(candidate.guidance.encode()) == binding['guidance_sha256'],
                 'generation candidate version/guidance changed')
@@ -1032,7 +1109,7 @@ class DevV2Evidence:
             generated = re.sub(r'^```(?:json)?\s*|\s*```$', '', generated)
         require(digest(json.loads(generated)['source'].encode()) == execution['source']['sha256']
                 == binding['policy_sha256'], 'generated source differs from executed/granted policy')
-        return dict(origin_source_sha256=plan['origin_source_sha256'], dev_model=model)
+        return dict(origin_source_sha256=plan['origin_source_sha256'], dev_model=model, **feedback_evidence)
 
     def validation_grant(self, grant_id):
         with sqlite3.connect(self.store.path) as db:
@@ -1168,7 +1245,7 @@ class DevV2Evidence:
         record = self.ref(catalog_id, d['version_record'])
         with self._ledger(catalog_id, d) as db:
             model = self._job(db, d['model_job_id'], d['cell'], d['version'], 'model')
-        request, output, receipt = self._provider(catalog_id, model)
+        request, output, receipt = self._provider(catalog_id, model, self.ref(catalog_id, d['manifest']), self.ref(catalog_id, d['config']))
         require(model['settled_at'] <= self._execution_claim_time(execution, d), 'native execution preceded settled source generation')
         require(record['model_input'] == receipt['request'] and record['model_output'] == receipt['response'] and model['actual'].get('dev_calls') == 1, 'result model lineage mismatch')
         generated = output['content'].strip()
