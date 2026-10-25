@@ -30,7 +30,7 @@ from .feedback_evidence import verify_feedback
 from .failure_signature import REASON_CODE, planner_reason_code, public_error_class
 from .core.models import MemoryRecord
 from .core.store import StateConflictError
-from .applicability import (PROFILE_KEY, validate_profile, require_profile_match, config_profile, profile_fields)
+from .applicability import (PROFILE_KEY, DEV_LOCAL_KEY, validate_profile, require_profile_match, config_profile, profile_fields)
 from .note_title import validate_group, validate_summary, validate_title
 
 SCOPE = ('benchmark', 'suite', 'task_id', 'robot', 'controller', 'perception_mode',
@@ -978,7 +978,7 @@ class DevV2Evidence:
                 'provisional notes cannot become candidates; create a new evidence-backed candidate')
         require(type(created_at) in (int, float) and math.isfinite(created_at), 'finite candidate timestamp required')
         s = self.source(source_import_id)
-        artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in (*SCOPE, 'sdk_interface_sha256', PROFILE_KEY) if k in s['context']}}
+        artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in (*SCOPE, 'sdk_interface_sha256', PROFILE_KEY, DEV_LOCAL_KEY) if k in s['context']}}
         if s['failure_signature'] is not None:
             artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}

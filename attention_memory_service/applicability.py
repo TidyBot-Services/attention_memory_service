@@ -27,6 +27,7 @@ LEVELS = (SAME_SCENE, SAME_TASK, SAME_FAMILY)
 LAYER = {SAME_SCENE: 'scene', SAME_TASK: 'task', SAME_FAMILY: 'family'}
 
 PROFILE_KEY = 'execution_profile'
+DEV_LOCAL_KEY = 'planner_dev_local_sha256'
 _PROFILE = re.compile(r'[a-z0-9][a-z0-9-]{0,47}\Z')
 INTERFACE_KEY = 'sdk_interface_sha256'
 SDK_KEYS = frozenset(('sdk_sha256', INTERFACE_KEY))
@@ -65,6 +66,10 @@ def valid_interface(context):
 
 def validate_profile(value):
     """Only omission represents legacy; explicit null/legacy are invalid."""
+    if isinstance(value, dict) and DEV_LOCAL_KEY in value:
+        digest = value[DEV_LOCAL_KEY]
+        if not isinstance(digest, str) or not _SHA.fullmatch(digest):
+            raise ValueError('planner_dev_local_sha256 must be 64 lowercase hexadecimal characters')
     # Existing validators own container-shape errors; keep legacy errors intact.
     if isinstance(value, dict) and PROFILE_KEY in value:
         profile = value[PROFILE_KEY]
@@ -74,7 +79,8 @@ def validate_profile(value):
 
 def profile_matches(applicability, context):
     """A note can cross no execution-profile boundary, including legacy."""
-    return applicability.get(PROFILE_KEY) == context.get(PROFILE_KEY)
+    return (applicability.get(PROFILE_KEY) == context.get(PROFILE_KEY)
+            and applicability.get(DEV_LOCAL_KEY) == context.get(DEV_LOCAL_KEY))
 
 
 def require_profile_match(applicability, context):
@@ -84,7 +90,9 @@ def require_profile_match(applicability, context):
     if not profile_matches(applicability, context):
         raise StateConflictError(
             f"execution profile mismatch: note {applicability.get(PROFILE_KEY, 'legacy')}, "
-            f"context {context.get(PROFILE_KEY, 'legacy')}")
+            f"context {context.get(PROFILE_KEY, 'legacy')}"
+            + (f"; planner_dev_local_sha256 note {applicability.get(DEV_LOCAL_KEY)}, context {context.get(DEV_LOCAL_KEY)}"
+               if DEV_LOCAL_KEY in applicability or DEV_LOCAL_KEY in context else ''))
 
 
 def config_profile(config):
@@ -92,13 +100,15 @@ def config_profile(config):
     if not isinstance(settings, dict):
         raise ValueError('execution_settings must be an object')
     value = {PROFILE_KEY: settings['profile']} if 'profile' in settings else {}
+    if config.get('planner_source', {}).get('kind') == 'dev-local':
+        value[DEV_LOCAL_KEY] = settings.get('planner_deployment', {}).get('sha256')
     validate_profile(value)
     return value
 
 
 def profile_fields(applicability):
     """Omission labels legacy without changing existing response bytes."""
-    return {PROFILE_KEY: applicability[PROFILE_KEY]} if PROFILE_KEY in applicability else {}
+    return {k: applicability[k] for k in (PROFILE_KEY, DEV_LOCAL_KEY) if k in applicability}
 
 
 def sdk_matches(applicability, context):
