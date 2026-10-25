@@ -22,11 +22,14 @@ from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
 from .seeded_notes import is_test_seeded, is_provisional, flags, TUPLE_KEYS
 from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, SAME_FAMILY, same_family, same_scene,
-                            same_task, valid_interface)
+                            same_task, valid_interface, PROFILE_KEY, profile_matches, validate_profile,
+                            require_profile_match, profile_fields)
 
 
-def trusted_here(memory, level, provenance=None):
+def trusted_here(memory, level, provenance=None, context=None):
     """Task authority is explicit; legacy and seeded notes keep exact trust."""
+    if context is not None and not profile_matches(memory.applicability, context):
+        return False
     task = (provenance or {}).get('channel') == 'dev_v2' and (provenance or {}).get('trust_scope') == 'task_scoped'
     return memory.status is MemoryStatus.TRUSTED and (level == SAME_SCENE or task and level == SAME_TASK)
 
@@ -97,6 +100,7 @@ class MemoryV2Manager:
         context: dict[str, Any],
     ) -> dict[str, Any]:
         """Bind a live trusted lookup to one attempt before releasing guidance."""
+        validate_profile(context)
         if not attempt_id or not isinstance(attempt_id, str):
             raise ValueError("use grant requires an attempt ID")
         # BEGIN IMMEDIATE serializes this final status check with operator
@@ -107,6 +111,7 @@ class MemoryV2Manager:
             if row is None:
                 raise StateConflictError("unknown memory")
             memory = json.loads(row[0])
+            require_profile_match(memory['applicability'], context)
             issued_at = time.time()
             if (
                 memory["status"] != MemoryStatus.TRUSTED.value
@@ -134,6 +139,7 @@ class MemoryV2Manager:
                 "used_at": issued_at,
             }
             grant.update(flags(self._provenance(memory_id)))
+            grant.update(profile_fields(memory['applicability']))
             db.execute(
                 "INSERT INTO memory_v2_use_grants(grant_id, memory_id, attempt_id, payload) "
                 "VALUES (?, ?, ?, ?)",
@@ -149,6 +155,7 @@ class MemoryV2Manager:
         return None if row is None else json.loads(row[0])
 
     def record_plan(self, memory_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        validate_profile(plan)
         if is_provisional(self._provenance(memory_id)):
             raise StateConflictError('provisional notes cannot enter validation or impact results')
         provenance = self.provenance(memory_id)
@@ -157,6 +164,7 @@ class MemoryV2Manager:
         if memory is None or memory.status is not MemoryStatus.CANDIDATE:
             raise StateConflictError("validation plan requires a candidate memory")
         applicability = provenance["artifact"]["applicability"]
+        require_profile_match(applicability, plan)
         if provenance.get('channel') == 'dev_v2':
             from .dev_v2 import SCOPE, AXES
             if any(plan.get(k) != applicability[k] for k in SCOPE if k not in AXES):
@@ -303,6 +311,7 @@ class MemoryV2Manager:
         artifact_kind: str = "text_hint",
         human_attention_seconds: float = 0.0,
     ) -> MemoryRecord:
+        validate_profile(applicability)
         if 'sdk_sha256' in applicability or 'namespace' in applicability:
             raise StateConflictError('exact Dev v2 scope requires trusted source importer')
         if artifact_kind not in {"text_hint", "policy_patch", "skill"}:
@@ -439,6 +448,7 @@ class MemoryV2Manager:
             from .dev_v2 import DevV2Evidence, SCOPE
             source = DevV2Evidence(self.store).source(value["source_import_id"])
             if (memory.applicability != value["artifact"]["applicability"]
+                    or not profile_matches(memory.applicability, source["context"])
                     or any(memory.applicability.get(k) != source["context"][k] for k in SCOPE)
                     or memory.guidance != source["guidance"]
                     or memory.candidate_repair != source["repair"]
@@ -567,6 +577,7 @@ class MemoryV2Manager:
                         levels=(SAME_SCENE, SAME_TASK)) -> list[tuple[MemoryRecord, str]]:
         """Return ``(memory, match_level)``: trusted same-scene notes first, then
         notes not trusted here (provisional, other-scene), newest first."""
+        validate_profile(context)
         if context.get("perception_mode") not in {"sim_gt", "vision"}:
             raise ValueError("retrieval requires explicit perception mode")
         if not isinstance(levels, (list, tuple)) or not levels or any(level not in LEVELS for level in levels):
@@ -590,17 +601,19 @@ class MemoryV2Manager:
             level = self._match_level(item, provenance, context)
             if level in levels:
                 result.append((item, level))
-        here = [pair for pair in result if trusted_here(*pair, self._provenance(pair[0].memory_id))]
-        rest = sorted((pair for pair in result if not trusted_here(*pair, self._provenance(pair[0].memory_id))),
+        here = [pair for pair in result if trusted_here(*pair, self._provenance(pair[0].memory_id), context)]
+        rest = sorted((pair for pair in result if not trusted_here(*pair, self._provenance(pair[0].memory_id), context)),
                       key=lambda pair: (-pair[0].created_at, pair[0].memory_id))
         return here + rest
 
     def _match_level(self, item, provenance, context):
+        if not profile_matches(item.applicability, context):
+            return None
         from .dev_v2 import SCOPE
         if is_provisional(provenance) and provenance.get('channel') == 'dev_v2':
             plan = self.get_plan(item.memory_id)
             case = plan['cases'][0]
-            if not set(context) - {INTERFACE_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}:
+            if not set(context) - {INTERFACE_KEY, PROFILE_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}:
                 return None
             if (context.get('seed') == provenance['source_seed']
                     and same_scene(item.applicability, context, SCOPE)
@@ -612,7 +625,7 @@ class MemoryV2Manager:
                 return SAME_FAMILY
             return None
         if is_test_seeded(provenance) or is_provisional(provenance):
-            if set(context) - {INTERFACE_KEY} != TUPLE_KEYS:
+            if set(context) - {INTERFACE_KEY, PROFILE_KEY} != TUPLE_KEYS:
                 return None
             if same_scene(item.applicability, context, TUPLE_KEYS):
                 return SAME_SCENE
@@ -624,7 +637,7 @@ class MemoryV2Manager:
         if self._trusted_exact(item, provenance, context):
             return SAME_SCENE
         if (item.status is MemoryStatus.TRUSTED and provenance.get('channel') == 'dev_v2'
-                and set(context) - {INTERFACE_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}):
+                and set(context) - {INTERFACE_KEY, PROFILE_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}):
             plan = self.get_plan(item.memory_id)
             prompts = {case.get('task_prompt') for case in (plan or {}).get('cases', [])}
             if plan is not None and same_task(item.applicability, context, prompts):
@@ -636,6 +649,8 @@ class MemoryV2Manager:
         return None
 
     def _trusted_exact(self, item, provenance, context):
+        if not profile_matches(item.applicability, context):
+            return False
         from .dev_v2 import SCOPE
         plan = self.get_plan(item.memory_id)
         if plan and plan.get('profile', 'default') == 'single_scene_v1':
@@ -741,6 +756,9 @@ class MemoryV2Manager:
         self.verify_source_evidence(memory_id)
         control = self._trial(control_attempt_id)
         treatment = self._trial(treatment_attempt_id)
+        for trial in (control, treatment):
+            require_profile_match(provenance["artifact"]["applicability"],
+                                  trial.get("context") or trial.get("memory_context") or {})
         if provenance.get("channel") == "dev_v2":
             from .dev_v2 import SCOPE, AXES
             for trial in (control, treatment):

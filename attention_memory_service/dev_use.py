@@ -20,7 +20,7 @@ from .core.models import MemoryStatus
 from .memory_v2 import trusted_here
 from .core.store import StateConflictError
 from .seeded_notes import flags, is_test_seeded, is_provisional
-from .applicability import SAME_SCENE, SAME_TASK, SAME_FAMILY, layer_of, marker as level_marker
+from .applicability import profile_fields, require_profile_match, SAME_SCENE, SAME_TASK, SAME_FAMILY, layer_of, marker as level_marker
 
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -66,6 +66,9 @@ class DevMemoryUse:
         # applies at SAME_TASK. Anything not trusted here is excluded.
         memory, level = self._find(memory_id, context, now)
         if memory is None:
+            note = self.service.store.get_memory(memory_id)
+            if note is not None:
+                require_profile_match(note.applicability, context)
             raise StateConflictError("memory is not trusted or applicable to Dev context")
         provenance = self.service.v2._provenance(memory_id)
         marker = flags(provenance)
@@ -91,9 +94,11 @@ class DevMemoryUse:
                     or current.get("expires_at") is not None
                     and current["expires_at"] <= time.time()):
                 raise StateConflictError("memory was revoked or expired before Dev exposure")
+            require_profile_match(current.get('applicability', {}), context)
+            marker.update(profile_fields(current.get('applicability', {})))
             # Scene and task authority share one trust predicate.
             trusted = current['status'] == MemoryStatus.TRUSTED.value and (
-                level == SAME_SCENE or trusted_here(memory, level, provenance))
+                level == SAME_SCENE or trusted_here(memory, level, provenance, context))
             marker = {**marker, **level_marker(level, trusted),
                       'source_task_id': current.get('applicability', context).get('task_id')}
             if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:

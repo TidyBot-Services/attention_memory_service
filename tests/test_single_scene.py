@@ -17,8 +17,12 @@ SIGNATURE = {'public_error_class': 'RuntimeError: TimeoutError', 'operation': 'l
 
 
 def setup_scene(tmp_path, *, controls=(True,) * 5, treatments=(False,) * 5,
-                control_calls=(1,) * 5, treatment_calls=(1,) * 5, interface=False, linked=False, generated=False):
+                control_calls=(1,) * 5, treatment_calls=(1,) * 5, interface=False, linked=False, generated=False, execution_profile=None):
     f = Fixture(tmp_path, interface=interface)
+    if execution_profile is not None:
+        from functools import partial
+        f.make = partial(f.make, execution_profile=execution_profile,
+                         execution_settings={'profile': execution_profile})
     failed = f.make('failed', failure=True)
     f.add_advice(failed, SIGNATURE)
     for i in range(len(controls)):
@@ -52,6 +56,8 @@ def setup_scene(tmp_path, *, controls=(True,) * 5, treatments=(False,) * 5,
             'failure_signature': SIGNATURE, 'assistance_credits': 1,
             'validation_policy_sha256': f.records['c0']['record']['source']['sha256'],
             'validation_config_sha256': f.records['c0']['descriptor']['config']['sha256']}
+    if execution_profile is not None:
+        plan['execution_profile'] = execution_profile
     return f, service, plan
 
 

@@ -5,6 +5,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .applicability import require_profile_match, validate_profile, config_profile, profile_fields
 from .auto_validation import lifecycle, rank_validation_queue
 from .dev_v2 import AXES, SCOPE, SHA, digest, encoded, evidence_operation, require, public_trace_projection, signature_present
 from .scene_contract import V2
@@ -52,11 +53,14 @@ class CrossSeed:
         require(seed != p['source_seed'], 'target cannot be the origin seed')
         origin = self.evidence.source(p['source_import_id'])['context']
         ctx = execution['context']
+        require_profile_match(p['artifact']['applicability'], ctx)
+        require_profile_match(origin, ctx)
         require(all(ctx.get(k) == origin.get(k) for k in (*SCOPE, 'camera_names', 'task_prompt') if k not in AXES),
                 'target belongs to another task or source scope')
         require(isinstance(origin.get('sdk_interface_sha256'), str)
                 and ctx.get('sdk_interface_sha256') == origin['sdk_interface_sha256'], 'target SDK interface mismatch')
         config = self.evidence.ref(execution['catalog_id'], execution['config'])
+        require_profile_match(ctx, config_profile(config))
         require(config['seed'] == seed and config.get('scene_contract') == contract_ref,
                 'target seed/scene contract ref mismatch')
         # Deliberately require the M-8 contract role, even when an executor or
@@ -155,7 +159,7 @@ class CrossSeed:
         self._target(memory_id, target_seed, execution, probe['scene_contract_ref'])
         origin_plan = self.service.v2.get_plan(memory_id)
         ctx = execution['context']
-        value = dict(profile='cross_seed_v1', memory_id=memory_id, memory_version=memory['version'],
+        value = dict(**profile_fields(ctx), profile='cross_seed_v1', memory_id=memory_id, memory_version=memory['version'],
                      role=probe['role'], target_seed=target_seed, pairs=pairs, dev_model=dev_model,
                      arm_generation='dev_from_origin', origin_source_sha256=p['source_policy_sha256'],
                      validation_config_sha256=execution['config']['sha256'], context=ctx,
@@ -173,7 +177,10 @@ class CrossSeed:
 
     def authorize(self, *, memory_id, target_seed, cell, version, seed, context,
                   policy_sha256, config_sha256, exposure, origin_source_sha256=None):
+        validate_profile(context)
         plan = self.get('plans', memory_id, target_seed)
+        if plan is not None:
+            require_profile_match(plan['context'], context)
         require(plan and type(seed) is int and seed == target_seed and context == plan['context'], 'grant outside cross-seed case')
         require(type(version) is int and version > 0 and exposure in {'none', 'candidate_validation'}, 'invalid cross-seed dispatch')
         arm = 'control_cell' if exposure == 'none' else 'treatment_cell'
@@ -182,8 +189,9 @@ class CrossSeed:
                 'grant differs from frozen cross-seed plan')
         with self.store._transaction() as db:
             memory, _ = self._eligible(memory_id, db, version=plan['memory_version'])
+            require_profile_match(memory['applicability'], context)
             require(self.get('verdicts', memory_id, target_seed, db) is None, 'target seed is closed')
-            binding = dict(memory_id=memory_id, memory_version=memory['version'], target_seed=target_seed,
+            binding = dict(**profile_fields(context), memory_id=memory_id, memory_version=memory['version'], target_seed=target_seed,
                 cell=cell, version=version, seed=seed, context=context, policy_sha256=policy_sha256,
                 config_sha256=config_sha256, exposure=exposure, plan_sha256=digest(encoded(plan).encode()),
                 origin_source_sha256=origin_source_sha256, dev_model=plan['dev_model'], guidance_sha256=digest(memory['guidance'].encode()))
@@ -309,6 +317,8 @@ class CrossSeed:
         row = db.execute('SELECT payload FROM memory_v2_decisions WHERE memory_id=?', (memory_id,)).fetchone()
         d = json.loads(row[0]) if row else {}
         scenes = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_cross_seed_verdicts WHERE memory_id=? ORDER BY seed', (memory_id,))]
+        for scene in scenes:
+            require_profile_match(m['applicability'], scene)
         current = [s for s in scenes if s['memory_version'] == m['version']]
         origin = m['status'] == 'trusted' and d.get('trust_scope') in {'scene_scoped', 'task_scoped'}
         if m.get('expires_at') is not None and m['expires_at'] <= time.time(): origin = False
@@ -322,8 +332,8 @@ class CrossSeed:
 
     def _close(self, db, memory_id, seed, verdict, reason, extra):
         memory, p = self._eligible(memory_id, db)
-        value = dict(memory_id=memory_id, memory_version=memory['version'], target_seed=seed,
-                     verdict=verdict, reason=reason, decided_at=time.time(), **extra)
+        value = dict(**profile_fields(memory['applicability']), memory_id=memory_id,
+                     memory_version=memory['version'], target_seed=seed, verdict=verdict, reason=reason, decided_at=time.time(), **extra)
         db.execute('INSERT INTO memory_cross_seed_verdicts VALUES (?,?,?)', (memory_id, seed, encoded(value)))
         conditions = self._conditions(db, memory_id)
         if not conditions['missing']:
@@ -411,7 +421,8 @@ class CrossSeed:
                 if 'No neutral seed showed harm' in status['task_trust']['missing']:
                     continue
                 uses = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_provisional_outcomes WHERE memory_id=?', (mid,))]
-                rows.append(dict(memory_id=mid, version=memory['version'], title=p.get('title'), source_seed=p['source_seed'],
+                rows.append(dict(**profile_fields(memory['applicability']),
+                                 memory_id=mid, version=memory['version'], title=p.get('title'), source_seed=p['source_seed'],
                                  uses=len(uses), failure_gone=sum(r['signature_present'] is False for r in uses),
                                  created_at=memory['created_at'], **{k: status[k] for k in ('seeds', 'task_trust')}))
         return rank_validation_queue(rows)

@@ -5,6 +5,9 @@ trusted. ``same_task`` lets other scenes of the same task read a note as a
 labelled reference that is always excluded from results. ``same_family`` is
 an explicit opt-in read of another task in the configured family, never trusted.
 
+Execution profiles must match at every level. Omission on both sides is the
+legacy profile; no profile may read or validate a note from another profile.
+
 SDK matching uses the interface identity (contract plus Dev SDK prompt).
 Compatibility rule for notes stored before the field existed: a note whose
 applicability has no ``sdk_interface_sha256`` keeps the old exact match on the
@@ -23,6 +26,8 @@ SAME_FAMILY = 'same_family'
 LEVELS = (SAME_SCENE, SAME_TASK, SAME_FAMILY)
 LAYER = {SAME_SCENE: 'scene', SAME_TASK: 'task', SAME_FAMILY: 'family'}
 
+PROFILE_KEY = 'execution_profile'
+_PROFILE = re.compile(r'[a-z0-9][a-z0-9-]{0,47}\Z')
 INTERFACE_KEY = 'sdk_interface_sha256'
 SDK_KEYS = frozenset(('sdk_sha256', INTERFACE_KEY))
 # Seed, scene contract, scene/object/camera/variant axes may differ.
@@ -38,7 +43,8 @@ def same_family(applicability, context):
     from .families import family_of
     keys = ('benchmark', 'suite', 'robot', 'controller', 'perception_mode', 'namespace')
     family = family_of(applicability.get('task_id'))
-    return (sdk_matches(applicability, context)
+    return (profile_matches(applicability, context)
+            and sdk_matches(applicability, context)
             and all(isinstance(context.get(k), str) and context[k]
                     and applicability.get(k) == context[k] for k in keys)
             and applicability.get('task_id') != context.get('task_id')
@@ -57,6 +63,44 @@ def valid_interface(context):
     return value is None or isinstance(value, str) and _SHA.fullmatch(value) is not None
 
 
+def validate_profile(value):
+    """Only omission represents legacy; explicit null/legacy are invalid."""
+    # Existing validators own container-shape errors; keep legacy errors intact.
+    if isinstance(value, dict) and PROFILE_KEY in value:
+        profile = value[PROFILE_KEY]
+        if not isinstance(profile, str) or profile == 'legacy' or not _PROFILE.fullmatch(profile):
+            raise ValueError('execution_profile must match ^[a-z0-9][a-z0-9-]{0,47}$ and cannot be legacy')
+
+
+def profile_matches(applicability, context):
+    """A note can cross no execution-profile boundary, including legacy."""
+    return applicability.get(PROFILE_KEY) == context.get(PROFILE_KEY)
+
+
+def require_profile_match(applicability, context):
+    from .core.store import StateConflictError
+    validate_profile(applicability)
+    validate_profile(context)
+    if not profile_matches(applicability, context):
+        raise StateConflictError(
+            f"execution profile mismatch: note {applicability.get(PROFILE_KEY, 'legacy')}, "
+            f"context {context.get(PROFILE_KEY, 'legacy')}")
+
+
+def config_profile(config):
+    settings = config.get('execution_settings', {})
+    if not isinstance(settings, dict):
+        raise ValueError('execution_settings must be an object')
+    value = {PROFILE_KEY: settings['profile']} if 'profile' in settings else {}
+    validate_profile(value)
+    return value
+
+
+def profile_fields(applicability):
+    """Omission labels legacy without changing existing response bytes."""
+    return {PROFILE_KEY: applicability[PROFILE_KEY]} if PROFILE_KEY in applicability else {}
+
+
 def sdk_matches(applicability, context):
     stored = applicability.get(INTERFACE_KEY)
     if stored is not None:
@@ -66,12 +110,13 @@ def sdk_matches(applicability, context):
 
 def same_scene(applicability, context, keys):
     """Exact tuple on ``keys`` with the SDK compared by the rule above."""
-    return sdk_matches(applicability, context) and all(
+    return profile_matches(applicability, context) and sdk_matches(applicability, context) and all(
         applicability.get(k) == context.get(k) for k in keys if k not in SDK_KEYS)
 
 
 def same_task(applicability, context, task_prompts):
-    return (sdk_matches(applicability, context)
+    return (profile_matches(applicability, context)
+            and sdk_matches(applicability, context)
             and all(isinstance(context.get(k), str) and context[k] for k in TASK_KEYS)
             and all(applicability.get(k) == context.get(k) for k in TASK_KEYS if k != 'task_prompt')
             and context.get('task_prompt') in task_prompts)

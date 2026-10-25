@@ -9,6 +9,7 @@ import time
 from .core.models import MemoryRecord, MemoryStatus
 from .core.store import StateConflictError
 from .dev_v2 import SHA, digest, encoded, public, view_no_oracle, validate_signature, signature_present
+from .applicability import require_profile_match
 from .note_title import validate_group, validate_summary, validate_title
 from .seeded_notes import is_provisional, flags, validate_context
 
@@ -159,6 +160,7 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
         raise StateConflictError('unknown Dev Memory grant')
     grant = json.loads(row[0])
     provenance = service.v2.provenance(grant['memory_id'])
+    require_profile_match(provenance['artifact']['applicability'], grant['context'])
     plan = service.v2.get_plan(grant['memory_id'])
     with sqlite3.connect(service.store.path) as db:
         db.execute('BEGIN IMMEDIATE')

@@ -442,7 +442,7 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                                    levels=tuple(getattr(payload, 'match_levels', ['same_scene']))):
             value = online_memory(item)
             provenance = service.v2._provenance(item.memory_id) or {}
-            value.update(marker(level, trusted_here(item, level, provenance)), source_seed=provenance.get('source_seed'),
+            value.update(marker(level, trusted_here(item, level, provenance, payload.context)), source_seed=provenance.get('source_seed'),
                          source_task_id=item.applicability.get('task_id'))
             rows.append(value)
         return rows

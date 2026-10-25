@@ -21,7 +21,7 @@ from .dev_use import DevMemoryUse
 from .dev_v2 import evidence_operation
 from .memory_artifacts import MemoryArtifactStore
 from .memory_v2 import MemoryV2Manager, trusted_here
-from .applicability import LAYER, LEVELS, SAME_SCENE, marker
+from .applicability import require_profile_match, validate_profile, profile_fields, LAYER, LEVELS, SAME_SCENE, marker
 from . import provisional_notes
 from .seeded_notes import create as create_test_seeded, flags, is_test_seeded, is_provisional
 
@@ -224,6 +224,7 @@ class MemoryService:
         """Layered retrieval; callers opt in to the reference-only same_task level."""
         if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
             raise ValueError("retrieval time must be finite")
+        validate_profile(context)
         effective_now = time.time()
         for expired in MemoryManager(self.store).expire_due(now=effective_now):
             self._publish_if_validated_source(expired.memory_id)
@@ -241,6 +242,9 @@ class MemoryService:
             None,
         )
         if memory is None:
+            note = self.store.get_memory(memory_id)
+            if note is not None:
+                require_profile_match(note.applicability, context)
             raise StateConflictError("memory is no longer trusted or applicable")
         return self.v2.issue_use_grant(
             memory_id=memory_id, version=memory.version,
@@ -408,6 +412,7 @@ class MemoryService:
                 "memory_id": memory.memory_id, "version": memory.version,
                 "status": memory.status.value, "status_reason": memory.status_reason,
                 "guidance": memory.guidance, "applicability": memory.applicability,
+                **profile_fields(memory.applicability),
                 "confidence": memory.confidence,
                 "validation_successes": memory.validation_successes,
                 "validation_failures": memory.validation_failures,
@@ -473,7 +478,9 @@ class MemoryService:
                 'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped'
                                  else 'task_scoped_trusted' if scope == 'task_scoped' else None,
                 'profile': None if plan is None else plan.get('profile', 'default'),
+                **profile_fields(memory.applicability),
                 'applicability_summary': {
+                    **profile_fields(memory.applicability),
                     'benchmark': memory.applicability['benchmark'],
                     'suite': memory.applicability['suite'],
                     'task_id': memory.applicability['task_id'], 'seed': provenance['source_seed'],
@@ -507,7 +514,7 @@ class MemoryService:
                 'source_seed': provenance['source_seed'],
                 'match_level': None if levels is None else levels.get(memory.memory_id),
                 'trusted_here': None if levels is None else (
-                    memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id], provenance)),
+                    memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id], provenance, context)),
                 'guidance_length': len(memory.guidance) if seeded else None,
                 'guidance_sha256': hashlib.sha256(memory.guidance.encode()).hexdigest() if seeded else None,
                 **({'expires_at': memory.expires_at, 'uses': provisional_notes.uses_summary(self.store, memory.memory_id),

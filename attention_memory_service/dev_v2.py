@@ -27,6 +27,7 @@ from typing import Any
 
 from .core.models import MemoryRecord
 from .core.store import StateConflictError
+from .applicability import (PROFILE_KEY, validate_profile, require_profile_match, config_profile, profile_fields)
 from .note_title import validate_group, validate_summary, validate_title
 
 SCOPE = ('benchmark', 'suite', 'task_id', 'robot', 'controller', 'perception_mode',
@@ -131,6 +132,7 @@ def public(value):
 
 
 def scope(value):
+    validate_profile(value)
     require(isinstance(value, dict) and all(isinstance(value.get(k), str) and value[k].strip() for k in SCOPE), 'complete exact Dev v2 scope required')
     require(SHA.fullmatch(value['sdk_sha256']) is not None, 'SDK digest required')
     require('sdk_interface_sha256' not in value or isinstance(value['sdk_interface_sha256'], str)
@@ -529,6 +531,7 @@ class DevV2Evidence:
         scope(d['context'])
         manifest = self.ref(catalog_id, d['manifest'])
         config = self.ref(catalog_id, d['config'])
+        require_profile_match(d['context'], config_profile(config))
         record = self.ref(catalog_id, d['version_record'])
         source = self.ref(catalog_id, record['source'], raw=True)
         require(type(record['version']) is int and record['version'] == d['version'] and record['formal_eligible'] is False and record['valid'] is True, 'invalid adopted code version')
@@ -874,7 +877,7 @@ class DevV2Evidence:
                 'provisional notes cannot become candidates; create a new evidence-backed candidate')
         require(type(created_at) in (int, float) and math.isfinite(created_at), 'finite candidate timestamp required')
         s = self.source(source_import_id)
-        artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in (*SCOPE, 'sdk_interface_sha256') if k in s['context']}}
+        artifact = {'schema_version': 'attentionbench.memory-artifact.v2', 'kind': 'policy_patch', 'guidance': s['guidance'], 'repair': s['repair'], 'applicability': {k: s['context'][k] for k in (*SCOPE, 'sdk_interface_sha256', PROFILE_KEY) if k in s['context']}}
         if s['failure_signature'] is not None:
             artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
@@ -890,6 +893,7 @@ class DevV2Evidence:
             require(is_provisional(prior) and note is not None
                     and note.applicability.get('task_id') == s['context']['task_id']
                     and prior.get('source_seed') == s['source_seed'], 'from_provisional scope mismatch')
+            require_profile_match(note.applicability, s['context'])
             require(re.fullmatch(r'p-[0-9a-f]{24}', from_provisional) or prior.get('demoted_at') is not None,
                     'invalid from_provisional id')
             if prior.get('demoted_at') is not None:
@@ -942,6 +946,7 @@ class DevV2Evidence:
         generated = plan.get('arm_generation') == 'dev_from_origin'
         require(generated or origin_source_sha256 is None, 'origin binding requires dev_from_origin plan')
         scope(context)
+        require_profile_match(memory.applicability, context)
         require(type(version) is int and version > 0 and isinstance(cell, str) and cell and type(seed) is int, 'exact cell/version/seed required')
         require(exposure in {'none', 'candidate_validation'} and all(isinstance(x, str) and SHA.fullmatch(x) for x in (policy_sha256, config_sha256)), 'explicit exposure and code/config digests required')
         require(all(context[k] == memory.applicability[k] for k in SCOPE if k not in AXES), 'validation grant exact SDK/namespace/robot scope mismatch')
@@ -955,7 +960,7 @@ class DevV2Evidence:
                 require(origin_source_sha256 == plan['origin_source_sha256'], 'validation origin differs from frozen plan')
             else:
                 require(policy_sha256 == plan['validation_policy_sha256'], 'single-scene policy/config differs from frozen plan')
-        binding = dict(memory_id=memory_id, memory_version=memory.version, cell=cell, version=version, seed=seed,
+        binding = dict(**profile_fields(memory.applicability), memory_id=memory_id, memory_version=memory.version, cell=cell, version=version, seed=seed,
                        context=context, policy_sha256=policy_sha256, config_sha256=config_sha256,
                        exposure=exposure, plan_sha256=digest(encoded(plan).encode()))
         if generated:
@@ -1059,6 +1064,8 @@ class DevV2Evidence:
         input_value = self.ref(execution['catalog_id'], ed['validation_input'])
         require(input_value == {'memory_ids': ids, 'exposure': exposure, 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'validation_grant_id': grant['grant_id']}, 'original validation exposure/config mismatch')
         candidate = self.store.get_memory(binding['memory_id'])
+        require_profile_match(candidate.applicability, execution['context'])
+        require_profile_match(candidate.applicability, plan)
         if (historical and plan.get('profile') == 'single_scene_v1' and plan.get('arm_generation') == 'dev_from_origin'
                 and candidate.version != binding['memory_version']):
             # A task -> scene transition changes authority/version, not the

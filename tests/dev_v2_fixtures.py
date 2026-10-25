@@ -30,9 +30,11 @@ class Fixture:
         path.write_bytes((encoded(value) + '\n').encode() if not isinstance(value, str) else value.encode())
         return {'uri': str(path), 'sha256': digest(path.read_bytes())}
 
-    def make(self, name, seed=101, variant=0, success=False, code='def policy(sdk):\n    pass\n', exposure='none', memory_id=None, failure=False, completed_calls=None, visual=False, scene=None):
+    def make(self, name, seed=101, variant=0, success=False, code='def policy(sdk):\n    pass\n', exposure='none', memory_id=None, failure=False, completed_calls=None, visual=False, scene=None, execution_profile=None, execution_settings=None):
         directory = self.root / name; directory.mkdir()
         config = {'task_id': 'pick', 'seed': seed, 'robot': 'OpenArm365', 'controller': 'test_controller', 'perception_mode': 'sim_gt', 'scene_id': f'scene-{variant}', 'object_set_id': f'objects-{variant}', 'camera_names': [f'camera-{variant}'], 'task_prompt': f'pick cup variant {variant}', 'camera_width': 64, 'camera_height': 64, 'randomize_cameras': False, 'official_env': 'PickPlaceCounterToSink', 'layout_id': 11 + variant, 'style_id': 34, 'base_mode': 'fixed', 'evidence_kind': 'controlled_test', 'sdk_call_limit': 80, 'horizon': 2400, 'attempt_wall_seconds': 480}
+        if execution_settings is not None:
+            config['execution_settings'] = execution_settings
         if visual:
             config['advisor_proxy'] = {'enabled': True, 'mode': 'vision', 'model': 'controlled_test_visual_advisor'}
         if scene is not None:
@@ -40,6 +42,8 @@ class Fixture:
         camera = {k: config[k] for k in ('camera_names', 'camera_width', 'camera_height', 'randomize_cameras')}
         ctx = {k: config[k] for k in ('task_id', 'robot', 'controller', 'perception_mode', 'scene_id', 'object_set_id', 'camera_names', 'task_prompt')}
         ctx.update(benchmark='AttentionBench', suite='robocasa365', namespace='controlled_test_only', sdk_sha256=self.sdk_sha, camera_config_id='robocasa365:' + digest(json.dumps(camera, sort_keys=True, ensure_ascii=False).encode()), task_variant_id=f"PickPlaceCounterToSink:layout{11+variant}:style34:fixed")
+        if execution_profile is not None:
+            ctx['execution_profile'] = execution_profile
         if self.interface:
             from attention_memory_service.applicability import interface_digest
             ctx['sdk_interface_sha256'] = interface_digest(self.sdk)

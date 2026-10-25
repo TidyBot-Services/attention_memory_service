@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..applicability import profile_matches, validate_profile
 from .models import MemoryRecord, MemoryStatus, MemoryUseRecord
 from .store import AttentionStore, StateConflictError
 
@@ -13,6 +14,7 @@ class MemoryManager:
         self.store = store
 
     def add_candidate(self, memory: MemoryRecord) -> MemoryRecord:
+        validate_profile(memory.applicability)
         if memory.status is not MemoryStatus.CANDIDATE:
             raise StateConflictError("new memory must start as a candidate")
         return self.store.create_memory(memory)
@@ -103,6 +105,7 @@ class MemoryManager:
         return expired
 
     def retrieve(self, context: dict[str, Any], *, now: float) -> list[MemoryRecord]:
+        validate_profile(context)
         self.expire_due(now=now)
         matches = [
             memory
@@ -117,6 +120,8 @@ class MemoryManager:
 
 
 def _matches(conditions: dict[str, Any], context: dict[str, Any]) -> bool:
+    if not profile_matches(conditions, context):
+        return False
     for key, expected in conditions.items():
         if key not in context:
             return False

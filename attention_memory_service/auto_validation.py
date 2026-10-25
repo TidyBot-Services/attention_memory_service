@@ -3,6 +3,7 @@ import json
 import sqlite3
 import time
 
+from .applicability import profile_fields
 from .dev_v2 import encoded, require
 from .seeded_notes import is_provisional, is_test_seeded
 
@@ -52,7 +53,8 @@ def validation_queue(service):
             manifest = service.dev_v2.ref(execution['catalog_id'], execution['manifest'])
             origin = dict(experiment_id=manifest['experiment_id'],
                           cell=execution['cell'], origin_version=execution['version'])
-        rows.append(dict(memory_id=mid, version=memory['version'], title=p.get('title'),
+        rows.append(dict(**profile_fields(memory['applicability']),
+                         memory_id=mid, version=memory['version'], title=p.get('title'),
                          uses=len(uses), failure_gone=sum(r['signature_present'] is False for r in uses),
                          created_at=memory['created_at'], layer='scene', source_summary=dict(
                              task=memory['applicability']['task_id'], seed=p['source_seed'],
