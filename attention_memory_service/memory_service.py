@@ -463,7 +463,10 @@ class MemoryService:
             scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
             if trusted and provenance.get('trust_scope') == 'task_scoped':
                 scope = 'task_scoped'
+            from .motion_permission import public_summary
+            motion_permission = public_summary(self.store, memory.memory_id, provenance)
             rows.append({
+                **({'motion_permission': motion_permission} if motion_permission else {}),
                 'memory_id': memory.memory_id, 'version': memory.version,
                 'layer': 'task' if scope == 'task_scoped' else 'scene',
                 'from_provisional': provenance.get('from_provisional'),

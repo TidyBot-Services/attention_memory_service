@@ -611,15 +611,22 @@ class DevV2Evidence:
         require(type(receipt['sdk_call_budget']['dispatched']) is int and 0 <= receipt['sdk_call_budget']['dispatched'] <= min(80, config['sdk_call_limit']) and type(receipt['control_steps']) is int and 0 <= receipt['control_steps'] <= min(2400, config['horizon']) and type(receipt['elapsed_seconds']) in (int, float) and math.isfinite(receipt['elapsed_seconds']) and 0 <= receipt['elapsed_seconds'] <= min(480, config['attempt_wall_seconds']) + 60, 'native resource receipt exceeds frozen bounds')
         require(job['receipt']['execution_status'] == bundle['status'] and job['actual'].get('executions') == 1 and job['actual'].get('sdk_calls') == receipt['sdk_call_budget']['dispatched'] and job['actual'].get('control_steps') == receipt['control_steps'] and job['actual'].get('execution_seconds') == receipt['elapsed_seconds'], 'native actual costs differ from original receipt')
         permission = d['permission_scope']
+        require(d.get('import_purpose') in (None, 'memory_validation'), 'unknown execution import purpose')
         require(all(permission.get(k) == v for k, v in {'run_id': bundle['run_id'], 'cell': d['cell'], 'code_version': d['version'], 'code_sha256': bundle['policy_sha256'], 'config_sha256': digest(json.dumps(config, sort_keys=True, ensure_ascii=False, allow_nan=False).encode())}.items()), 'permission scope not bound to exact run/code/config/version')
         require(type(permission.get('code_version')) is int and type(permission.get('action_version')) is int and permission['action_version'] == 1 and isinstance(permission.get('scope'), dict) and permission['scope'], 'explicit permission action/version/scope required')
-        if permission.get('action') == 'execute_bounded_motion_policy':
+        if permission.get('action') == 'dev_tier_sim_motion':
+            from .motion_permission import verify
+            verify(permission, d, config, bundle, source, require)
+        elif permission.get('action') == 'execute_bounded_motion_policy':
             with self._ledger(catalog_id, d) as db:
                 approval = self._row(db, 'v2_planner_requests', 'id=?', (d['approval_id'],))
             require(approval['request_type'] == 'approval' and approval['state'] == 'consumed' and approval['binding'] == permission and approval['consumed_by'] == job['job_id'] and approval['created_at'] <= approval['consumed_at'] <= job['claimed_at'] and approval['consumed_at'] <= approval['deadline_epoch'], 'native motion lacks exact consumed human approval receipt')
             require(approval['response']['approved'] is True and approval['response']['actor'] == 'authenticated_human' and approval['response']['response_id'] and approval['created_at'] <= approval['responded_at'] <= approval['consumed_at'], 'genuine external human decision receipt required')
         else:
             require(permission.get('action') == 'sensor_only', 'unknown permission action')
+            from .motion_permission import operations
+            require('actor' not in permission and not operations(source, require),
+                    'sensor-only evidence cannot claim motion or an approval actor')
         feedback = self.ref(catalog_id, job['receipt']['public_feedback']); public(feedback)
         projected = ({'schema_version': 'attentionbench.dev-public-feedback.v1', 'execution_status': 'condition_invalid',
                       'public_error': 'scene_contract_mismatch', 'action_trace': []}
@@ -642,6 +649,8 @@ class DevV2Evidence:
             else:
                 verify_v2_receipt(contract, config, original['state'], condition)
         evidence = {'catalog_id': catalog_id, 'descriptor': descriptor, 'context': d['context'], 'cell': d['cell'], 'version': d['version'], 'bundle': job['receipt']['bundle'], 'public_feedback': job['receipt']['public_feedback'], 'source': record['source'], 'config': d['config'], 'manifest': d['manifest'], 'ledger': d['ledger'], 'run_id': bundle['run_id'], 'attempt_id': bundle['attempt_id'], 'status': bundle['status']}
+        if d.get('import_purpose') is not None:
+            evidence.update(import_purpose=d['import_purpose'], permission=permission)
         return evidence, d, bundle, artifacts, cell
 
     def import_execution(self, *, import_id, catalog_id, descriptor):
@@ -1239,6 +1248,8 @@ class DevV2Evidence:
 
     def _result_evidence(self, grant, execution_import_id):
         execution, d, bundle, artifacts, cell = self.execution(execution_import_id)
+        from .motion_permission import require_result_permission
+        require_result_permission(d, require)
         grant_id = grant['grant_id']
         require(grant['development_id'] == f"{d['cell']}:v{d['version']}" and grant['context'] == d['context'], 'grant belongs to another run/cell/version/scope')
         catalog_id = execution['catalog_id']
