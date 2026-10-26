@@ -173,6 +173,13 @@ def scene_matches(reference, actual, path='state'):
 
 def public_trace_projection(trace):
     """The Dev v2 public projection, with no native result as an argument."""
+    # The writer (dev_loop.event_projection) omits nonfinite event timestamps.
+    # Remove only those before the strict JSON/public screen; keep the sealed
+    # input untouched and retain validation of every other field.
+    trace = {**trace, 'sdk_events': [
+        {k: v for k, v in event.items() if k != 'timestamp'}
+        if type(event.get('timestamp')) in (int, float) and not math.isfinite(event['timestamp'])
+        else event for event in trace.get('sdk_events', [])]}
     public(trace)
     events = []
     for event in trace.get('sdk_events', []):
@@ -180,6 +187,12 @@ def public_trace_projection(trace):
         if operation not in {'get_observation', 'find_objects', 'move_delta', 'open', 'close', 'move_normalized', 'move_joints'}:
             continue
         projected = {'operation': operation, 'status': event.get('status', 'unknown')}
+        # Match the sealed writer: relative/epoch, finite int/float (not bool),
+        # preserving the value and type without rounding or a sign restriction.
+        if event.get('timestamp_basis') in {'relative', 'epoch'} and type(event.get('timestamp')) in (int, float):
+            if math.isfinite(event['timestamp']):
+                projected['timestamp_basis'] = event['timestamp_basis']
+                projected['timestamp'] = event['timestamp']
         if event.get('source') in {'left_arm', 'right_arm', 'left_gripper', 'right_gripper', 'bimanual', 'sensors'}:
             projected['source'] = event['source']
         if event.get('physical_arm') in {'left', 'right', 'both'}:
