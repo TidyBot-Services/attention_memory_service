@@ -447,6 +447,10 @@ class DevV2Evidence:
         """Resolve an exact sealed ref from executor, contract or source evidence."""
         return self.ref(self._catalog_for_ref(executor_id, ref, 'contract', 'source'), ref)
 
+    def source_ref(self, executor_id, ref):
+        """Read local evidence or an exact source pin in the import's context."""
+        return self.ref(self._catalog_for_ref(executor_id, ref, 'source'), ref)
+
     def _catalog_for_ref(self, executor_id, ref, *roles):
         require(isinstance(ref, dict) and set(ref) == {'uri', 'sha256'}, 'exact artifact reference required')
         executor = self.catalog(executor_id, 'executor')
@@ -460,12 +464,15 @@ class DevV2Evidence:
             rows = db.execute('SELECT id,payload FROM dev_v2_catalogs ORDER BY id').fetchall()
         for catalog_id, payload in rows:
             catalog = json.loads(payload)
-            if catalog['role'] in roles and path.is_relative_to(catalog['root']):
+            if (catalog['role'] in roles and path.is_relative_to(catalog['root'])
+                    and (catalog['role'] != 'source' or catalog['context'] == executor['context'])):
                 name = str(path.relative_to(catalog['root']))
                 if catalog['files'].get(name) == ref['sha256']:
                     return catalog_id
         allowed = ' or '.join(role + ' catalogs' for role in roles)
-        require(False, f'artifact outside registered {allowed} or not pinned at exact digest')
+        if 'contract' in roles:
+            require(False, f'artifact outside registered {allowed} or not pinned at exact digest')
+        require(False, f'artifact outside registered root: no matching {allowed} at exact digest')
 
     def _source_set_catalog(self, executor_id, folder, expected, files):
         path = Path(folder)
@@ -473,7 +480,8 @@ class DevV2Evidence:
         executor = self.catalog(executor_id, 'executor')
         with sqlite3.connect(self.store.path) as db:
             catalogs = [json.loads(row[0]) for row in db.execute('SELECT payload FROM dev_v2_catalogs')]
-        allowed = [executor] if path.is_relative_to(executor['root']) else [c for c in catalogs if c['role'] == 'source']
+        allowed = [executor] if path.is_relative_to(executor['root']) else [
+            c for c in catalogs if c['role'] == 'source' and c['context'] == executor['context']]
         require(any(path.is_relative_to(c['root']) and all(
             Path(name).is_relative_to(path) and c['files'].get(str(Path(name).relative_to(c['root']))) == files[name]
             for name in expected) for c in allowed), 'SDK source set outside sealed source catalogs')
@@ -568,7 +576,7 @@ class DevV2Evidence:
         # Source/SDK identity bytes must be included in the registered snapshot.
         identity = manifest['identity_lock']
         lock_ref = {'uri': identity['path'], 'sha256': identity['sha256']}
-        lock = self.ref(catalog_id, lock_ref)
+        lock = self.source_ref(catalog_id, lock_ref)
         require(lock['schema'] == 'attentionbench.dev-identity-lock.v2' and lock['formal_eligible'] is False, 'frozen Dev identity lock required')
         require(lock.get('source_sets'), 'complete SDK source file sets required')
         for folder, expected in lock['source_sets'].items():
@@ -855,7 +863,7 @@ class DevV2Evidence:
                 require(packet.get('previous_complete_source') == expected_source,
                         'online help source/public failed trace mismatch')
                 modes.append(verify_feedback(packet.get('public_feedback'), feedback, audience=audience, version=version,
-                    cell=cell, manifest=manifest, read=lambda ref: self.ref(catalog_id, ref),
+                    cell=cell, manifest=manifest, read=lambda ref: self.source_ref(catalog_id, ref),
                     eval_job=eval_job, require=require))
         return 'with_eval_review' if 'with_eval_review' in modes else 'exact'
 
