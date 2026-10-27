@@ -848,10 +848,13 @@ class MemoryV2Manager:
         validation_policy_hashes: set[str] = set()
         signature_arms = []
         validation_config_hashes: set[str] = set()
+        source_drifts=[]
         generated_policy_hashes, origins, models = [], set(), set()
         for pair in pairs:
             control = self._trial(pair["control_attempt_id"])
             treatment = self._trial(pair["treatment_attempt_id"])
+            for trial in (control,treatment):
+                if trial.get('source_drift') and trial['source_drift'] not in source_drifts:source_drifts.append(trial['source_drift'])
             if provenance.get('channel') == 'dev_v2' and any(
                     trial.get('validation_memory_id') != memory_id for trial in (control, treatment)):
                 raise StateConflictError('pair arm grant belongs to another memory')
@@ -986,7 +989,7 @@ class MemoryV2Manager:
                           paired_runs=n, signature_arms=signature_arms,
                           control_signature_count=sum(a['control_signature_present'] for a in signature_arms),
                           treatment_signature_count=sum(a['treatment_signature_present'] for a in signature_arms),
-                          validation_config_hashes=sorted(validation_config_hashes),
+                          source_drift=source_drifts,validation_config_hashes=sorted(validation_config_hashes),
                           validated_scope=[{axis: plan['cases'][0][axis] for axis in axes}])
         if generated:
             report.update(arm_generation='dev_from_origin', generated_policy_hashes=generated_policy_hashes,
@@ -1154,6 +1157,7 @@ class MemoryV2Manager:
             "failed_gate_messages": [self.GATE_MESSAGES[code] for code in failures],
             "minimum_pairs": minimum_pairs, "report": report, "decided_at": time.time(),
         }
+        if report.get('source_drift'):decision['source_drift']=report['source_drift']
         if single:
             decision.update(trust_scope='scene_scoped' if not failures else None,
                             cross_scene_eligible=False,
@@ -1220,6 +1224,7 @@ class MemoryV2Manager:
                 profile='single_scene_v1', decision='rejected' if rejected else 'inconclusive',
                 failed_gates=[gate], failed_gate_messages=[reason], reason=reason, failed_check=failed,
                 minimum_pairs=5, report=report, decided_at=time.time(), trust_scope=None, cross_scene_eligible=False)
+            if verdict.get('source_drift'):decision['source_drift']=[verdict['source_drift']]
             if rejected:
                 memory = self.store._transition_memory_tx(db, memory_id, MemoryStatus.REJECTED,
                     event_key=f'memory-reject:{memory_id}', reason=reason, actor='system:validation')

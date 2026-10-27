@@ -43,6 +43,7 @@ _VIEW_WORD = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\
 _CJK_WORD = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af\U00020000-\U0002ebef]\Z')
 _VIEW_ORACLE = re.compile(r'oracle|reward|score|native|simulator|evaluator|_check_success|private|hidden|diagnos', re.I)
 _OPERATION = ContextVar('dev_v2_evidence_operation', default=None)
+_HISTORICAL_SOURCE = ContextVar('dev_v2_historical_source', default=False)
 
 
 def evidence_operation(function):
@@ -90,7 +91,7 @@ def memo_evidence(kind):
         @wraps(function)
         def wrapped(self, key, *args, **kwargs):
             state = _OPERATION.get()
-            memo_key = (kind, str(self.store.path), key)
+            memo_key = (kind, str(self.store.path), key, _HISTORICAL_SOURCE.get())
             if state is not None and memo_key in state['memo']:
                 return state['memo'][memo_key]
             result = function(self, key, *args, **kwargs)
@@ -564,6 +565,9 @@ class DevV2Evidence:
         record = self.ref(catalog_id, d['version_record'])
         source = self.ref(catalog_id, record['source'], raw=True)
         require(type(record['version']) is int and record['version'] == d['version'] and record['formal_eligible'] is False and record['valid'] is True, 'invalid adopted code version')
+        if 'source_size_limit_bytes' in manifest and record.get('model_input') is not None:
+            from .source_policy import source_limit
+            require(len(source)<=source_limit(config,manifest), 'source_size_limit_exceeded')
         require(record['config_sha256'] == d['config']['sha256'] and record['manifest'] == d['manifest'], 'version/config/manifest binding mismatch')
         require(manifest.get('schema') == 'attentionbench.dev-experiment.v3' and manifest['ledger_path'] == catalog['ledger_origin'], 'registered original ledger/manifest binding mismatch')
         require(config == manifest['configs'][f"{config['task_id']}:{config['seed']}"], 'config differs from frozen manifest')
@@ -584,15 +588,34 @@ class DevV2Evidence:
         lock_ref = {'uri': identity['path'], 'sha256': identity['sha256']}
         lock = self.source_ref(catalog_id, lock_ref)
         require(lock['schema'] == 'attentionbench.dev-identity-lock.v2' and lock['formal_eligible'] is False, 'frozen Dev identity lock required')
+        sdk_lock=lock
+        original_ref=config.get('origin_dev_lock',identity)
+        if original_ref!=identity:
+            sdk_lock=self.source_ref(catalog_id,{'uri':original_ref['path'],'sha256':original_ref['sha256']})
+        current_ref=d.get('current_lock',identity)
+        if manifest.get('validation_experiment') or config.get('origin_dev_lock'):
+            require(current_ref==identity, 'running code differs from current lock')
+        if current_ref!=identity:
+            lock=self.source_ref(catalog_id,{'uri':current_ref['path'],'sha256':current_ref['sha256']})
+        from .source_policy import drift_record
+        expected_drift=drift_record(config,sdk_lock,lock,original_ref['sha256'],current_ref['sha256'])
+        require(d.get('source_drift')==expected_drift, 'source drift record differs from sealed locks')
+        if config.get('origin_dev_lock'):
+            require(manifest.get('source_drift')==expected_drift and config['dev_lock']==identity, 'validation current lock binding differs')
+        from .source_policy import dev_tier,source_file
+        historical=(_HISTORICAL_SOURCE.get() and dev_tier(config)
+                    and not manifest.get('validation_experiment') and not config.get('origin_dev_lock'))
         require(lock.get('source_sets'), 'complete SDK source file sets required')
         for folder, expected in lock['source_sets'].items():
-            require(_source_set(folder) == expected and all(name in lock['files'] for name in expected), 'SDK source file set drift')
+            require((historical or _source_set(folder) == expected) and all(name in lock['files'] for name in expected), 'SDK source file set drift')
             self._source_set_catalog(catalog_id, folder, expected, lock['files'])
-            if _OPERATION.get() is not None:
+            if not historical and _OPERATION.get() is not None:
                 _OPERATION.get()['directories'][folder] = expected
         require(lock['files'].get(lock['planner_lock']['path']) == lock['planner_lock']['sha256'] and lock['model_sources'] and all(lock['files'].get(n) == sha for n, sha in lock['model_sources'].items()), 'planner/robot source identity incomplete')
         for name, sha in lock['files'].items():
+            if historical and source_file(lock,name):continue
             self.verify_file(catalog_id, {'uri': name, 'sha256': sha})
+        lock=sdk_lock
         sdk = d['sdk_identity']
         require(digest(json.dumps(sdk, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()) == d['context']['sdk_sha256'], 'SDK identity does not match exact context digest')
         from .applicability import interface_digest
@@ -676,6 +699,7 @@ class DevV2Evidence:
             else:
                 verify_v2_receipt(contract, config, original['state'], condition)
         evidence = {'catalog_id': catalog_id, 'descriptor': descriptor, 'context': d['context'], 'cell': d['cell'], 'version': d['version'], 'bundle': job['receipt']['bundle'], 'public_feedback': job['receipt']['public_feedback'], 'source': record['source'], 'config': d['config'], 'manifest': d['manifest'], 'ledger': d['ledger'], 'run_id': bundle['run_id'], 'attempt_id': bundle['attempt_id'], 'status': bundle['status']}
+        if d.get('source_drift') is not None:evidence['source_drift']=d['source_drift']
         if d.get('import_purpose') is not None:
             evidence.update(import_purpose=d['import_purpose'], permission=permission)
         return evidence, d, bundle, artifacts, cell
@@ -706,6 +730,7 @@ class DevV2Evidence:
         require(not bundle['infrastructure_failure'] and not bundle['outcome_unknown'] and bundle['status'] in {'completed', 'failed'}, 'infrastructure/unknown/non-evaluated outcome cannot validate memory')
         require(bundle['sandbox'] == {'process_isolated': True, 'sdk_rpc_only': True, 'deadline_enforced': True, 'action_cancellation_verified': True}, 'original sandbox/cleanup conditions did not pass')
         require(bundle['scene_condition'] and bundle['scene_condition']['matched'] is True and artifacts['native_result']['evaluated'] is True and type(bundle['native_success']) is bool, 'original native/scene gate did not pass')
+        require(v.get('source_drift')==d.get('source_drift'), 'independent source drift evidence differs')
         checks = v['checks']
         require(v['native_success'] is bundle['native_success'] and set(checks) == {'native_evaluation', 'safety', 'scene_reproduction', 'permissions', 'source_identity'} and all(type(x) is bool for x in checks.values()) and all(checks[k] for k in ('native_evaluation', 'permissions', 'source_identity')), 'independent checks incomplete')
         if for_validation:
@@ -939,6 +964,7 @@ class DevV2Evidence:
         require(json.loads(generated)['source'].encode() == repair, 'adopted source differs from actual model output')
         public(guidance); public(repair.decode())
         evidence = {'kind': 'source', 'catalog_id': catalog_id, 'descriptor': descriptor, 'failed_execution_import_id': d['failed_execution_import_id'], 'context': d['context'], 'request_id': d.get('request_id'), 'cell': d['cell'], 'version': d['version'], 'guidance': guidance, 'repair': repair.decode(), 'failure_signature': signature, 'source_policy_sha256': failed['source']['sha256'], 'repair_sha256': record['source']['sha256'], 'source_policy_id': cell['policy_id'], 'source_seed': config['seed'], 'source_run_id': bundle['run_id'], 'source_attempt_id': bundle['attempt_id']}
+        if d.get('source_drift') is not None:evidence['source_drift']=d['source_drift']
         evidence['feedback_projection'] = projection
         if mc.get('provider_identity') == 'codex_exec':
             evidence.update(provider_identity='codex_exec', provider_identities=dict(model='codex_exec', advisor='codex_exec'))
@@ -971,7 +997,11 @@ class DevV2Evidence:
     def source(self, import_id):
         old = self.get(import_id)
         require(old['kind'] == 'source', 'source import required')
-        return self.import_source(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])
+        # Reopening already imported provenance does not execute historical code.
+        # New imports/replays still require a sealed, byte-exact current lock.
+        token=_HISTORICAL_SOURCE.set(True)
+        try:return self.import_source(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])
+        finally:_HISTORICAL_SOURCE.reset(token)
 
     def create_candidate(self, *, memory_id, source_import_id, created_at, from_provisional=None):
         require(not self.store.count_memory_events(memory_id, 'memory.provisional_created'),
@@ -1251,6 +1281,7 @@ class DevV2Evidence:
         require(costs['seconds'] == artifacts['sandbox_receipt']['elapsed_seconds'], 'trial time differs from native receipt')
         trial = {'run_id': bundle['run_id'], 'run': {'suite': bundle['suite'], 'task_id': bundle['task_id'], 'seed': bundle['seed'], 'policy_id': cell['policy_id'], 'execution_target': 'simulator', 'developer_model': d['developer_model'], 'budget': d['budget']}, 'success': bundle['native_success'], 'attempt_status': 'succeeded' if bundle['native_success'] else 'failed', 'evaluator_authoritative': True, 'mode': execution['context']['perception_mode'], 'memory_ids': ids, 'exposure': exposure, 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'variation': {k: execution['context'][k] for k in (*AXES, 'camera_names', 'task_prompt')}, 'context': execution['context'], **costs}
         trial.update(generation)
+        if verdict.get('source_drift') is not None:trial['source_drift']=verdict['source_drift']
         if plan.get('profile', 'default') in {'single_scene_v1', 'cross_seed_v1'}:
             signature = manager.provenance(binding['memory_id'])['failure_signature']
             feedback = public_trace_projection(artifacts['trace'])

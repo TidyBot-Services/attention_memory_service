@@ -507,6 +507,7 @@ class MemoryService:
                 'failure_signature_summary': provenance.get('failure_signature'),
                 'validation_summary': None if seeded or provisional else {
                     'planned_pairs': None if plan is None else len(plan.get('pairs', plan['seeds'])),
+                    'source_drift': [] if decision is None else decision.get('source_drift',[]),
                     'completed_pairs': len(self.v2.list_pairs(memory.memory_id)),
                     'decision': None if decision is None else decision['decision'],
                     'failed_gates': [] if decision is None else decision['failed_gates'],

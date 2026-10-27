@@ -272,7 +272,8 @@ class CrossSeed:
     def _report(pairs):
         c, t = [p['control'] for p in pairs], [p['treatment'] for p in pairs]
         arms = c + t
-        return dict(paired_runs=len(pairs), validation_origin_hashes=sorted({a['origin_source_sha256'] for a in arms}),
+        drifts=[json.loads(d) for d in sorted({encoded(a['source_drift']) for a in arms if a.get('source_drift')})]
+        return dict(source_drift=drifts,paired_runs=len(pairs), validation_origin_hashes=sorted({a['origin_source_sha256'] for a in arms}),
                     validation_dev_models=[json.loads(m) for m in sorted({encoded(a['dev_model']) for a in arms})],
                     validation_config_hashes=sorted({a['config_sha256'] for a in arms}),
                     safety_regressions=sum(p['treatment_unsafe'] > p['control_unsafe'] for p in pairs),
@@ -308,6 +309,7 @@ class CrossSeed:
         failed = dict(validation_grant_id=validation_grant_id, execution_import_id=execution_import_id,
                       catalog_id=catalog_id, descriptor=descriptor,
                       descriptor_sha256=self.evidence.catalog(catalog_id)['files'][descriptor], checks=checks)
+        if verdict.get('source_drift'):failed['source_drift']=verdict['source_drift']
         # As in M-8, treatment safety failure is harm; a failed replay or a
         # control safety failure is an inconclusive infrastructure exit.
         harm = checks['scene_reproduction'] and grant['binding']['exposure'] == 'candidate_validation'
@@ -335,6 +337,9 @@ class CrossSeed:
         memory, p = self._eligible(memory_id, db)
         value = dict(**profile_fields(memory['applicability']), memory_id=memory_id,
                      memory_version=memory['version'], target_seed=seed, verdict=verdict, reason=reason, decided_at=time.time(), **extra)
+        drifts=extra.get('report',{}).get('source_drift',[])
+        if extra.get('failed_check',{}).get('source_drift'):drifts=[extra['failed_check']['source_drift']]
+        if drifts:value['source_drift']=drifts
         db.execute(f'INSERT INTO {self.prefix}_verdicts VALUES (?,?,?)', (memory_id, seed, encoded(value)))
         conditions = self._conditions(db, memory_id)
         if not conditions['missing']:
