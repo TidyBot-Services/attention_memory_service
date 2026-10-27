@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from .applicability import require_profile_match, validate_profile, profile_fields
 from .cross_seed import CrossSeed, task_conditions
 from .dev_v2 import DevV2Evidence, AXES, SCOPE, digest, encoded, require, evidence_operation
-from .failure_signature import derive_signature
+from .failure_signature import derive_signature, matches_frozen_derivation
 from .memory_v2 import MemoryV2Manager, validate_single_scene_plan
 from .seed_guard import classify_seed
 
@@ -181,7 +181,9 @@ class PositiveControls:
                 cell=execution['cell'], version=execution['version']), 'positive-control origin must be exact imported failed execution')
         require(spec['context'] == execution['context'] and spec['context']['seed'] == bundle['seed'], 'positive-control applicability must equal origin context')
         feedback = self.dev_v2.ref(execution['catalog_id'], execution['public_feedback'])
-        signature = derive_signature(feedback)
+        old = self._read('records', spec['control_id'])
+        signature = old['failure_signature'] if old else derive_signature(feedback)
+        require(matches_frozen_derivation(feedback, signature), 'positive-control frozen signature differs from public feedback')
         require(verdict.get('failure_signature') == signature and verdict.get('signature_present') is True,
                 'origin validator signature differs from public feedback')
         value = dict(record_kind='positive_control', label=LABEL, excluded_from_results=True, spec=spec,

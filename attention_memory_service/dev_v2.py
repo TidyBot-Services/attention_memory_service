@@ -27,6 +27,7 @@ from typing import Any
 
 from .provider_evidence import verify_provider, frozen_provider, verify_codex_record
 from .feedback_evidence import verify_feedback
+from .failure_signature import REASON_CODE, planner_reason_code, public_error_class
 from .core.models import MemoryRecord
 from .core.store import StateConflictError
 from .applicability import (PROFILE_KEY, validate_profile, require_profile_match, config_profile, profile_fields)
@@ -220,6 +221,9 @@ def signature_present(feedback, signature):
     error_class = signature['public_error_class']
     operation = signature['operation']
     error = feedback.get('public_error', '')
+    if 'reason_code' in signature and (planner_reason_code(error) != signature['reason_code']
+                                      or public_error_class(error) != error_class):
+        return False
     if not error.startswith(error_class) or error[len(error_class):len(error_class) + 1] not in {'', ':', ' ', '('}:
         return False
     return any(e.get('status') == 'failed' and
@@ -228,8 +232,10 @@ def signature_present(feedback, signature):
 
 
 def validate_signature(signature, feedback):
-    require(isinstance(signature, dict) and set(signature) == {'public_error_class', 'operation'}
+    require(isinstance(signature, dict) and set(signature) in (
+                {'public_error_class', 'operation'}, {'public_error_class', 'operation', 'reason_code'})
             and all(isinstance(v, str) and v.strip() and len(v) <= 120 for v in signature.values())
+            and ('reason_code' not in signature or REASON_CODE.fullmatch(signature['reason_code']) is not None)
             and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:: [A-Za-z_][A-Za-z0-9_]*)*',
                              signature['public_error_class']) is not None
             and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
