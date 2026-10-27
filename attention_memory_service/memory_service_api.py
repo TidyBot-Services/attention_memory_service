@@ -311,6 +311,18 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                 value.pop(key, None)
         return value
 
+    @app.get('/dev-v2/positive-controls', dependencies=[Depends(authorized)])
+    def positive_controls():
+        return {'items': guarded(service.positive_controls.public)}
+
+    @app.get('/dev-v2/positive-controls/{control_id}/{action}', dependencies=[Depends(importer_authorized)])
+    def positive_control_read(control_id: str, action: str):
+        return guarded(service.positive_controls.read, control_id, action)
+
+    @app.post('/dev-v2/positive-controls/{action}', dependencies=[Depends(importer_authorized)])
+    def positive_control_write(action: str, payload: dict):
+        return guarded(service.positive_controls.write, action, payload)
+
     @app.post('/dev-v2/cross-seed/probes', dependencies=[Depends(importer_authorized)])
     def cross_seed_probe(payload: CrossSeedProbeInput):
         return guarded(service.cross_seed.probe, **payload.model_dump())

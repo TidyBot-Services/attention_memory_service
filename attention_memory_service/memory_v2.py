@@ -251,34 +251,7 @@ class MemoryV2Manager:
         from .dev_v2 import DevV2Evidence
         context = DevV2Evidence(self.store).source(source['source_import_id'])['context']
         case.update(camera_names=context['camera_names'], task_prompt=context['task_prompt'])
-        pairs = plan.get('pairs')
-        if (plan.get('failure_signature') != provenance['failure_signature']
-                or plan.get('seeds') != [seed] or plan.get('cases') != [case]
-                or not isinstance(pairs, list) or len(pairs) < 5
-                or any(not isinstance(p, dict) or set(p) != {'pair_id', 'control_cell', 'treatment_cell'}
-                       or any(not isinstance(v, str) or not v for v in p.values()) for p in pairs)
-                or len({p['pair_id'] for p in pairs}) != len(pairs)
-                or len({cell for p in pairs for cell in (p['control_cell'], p['treatment_cell'])}) != 2 * len(pairs)):
-            raise ValueError('single-scene plan needs one exact source tuple and five distinct pairs')
-        if classify_seed(seed) != 'dev':
-            raise PermissionError('validation plan is development-only')
-        if any(plan.get(k) != context[k] for k in SCOPE if k not in AXES):
-            raise StateConflictError('single-scene plan differs from source scope')
-        generated = plan.get('arm_generation') == 'dev_from_origin'
-        policy_key = 'origin_source_sha256' if generated else 'validation_policy_sha256'
-        if any(not isinstance(plan.get(k), str) or SHA.fullmatch(plan[k]) is None
-               for k in (policy_key, 'validation_config_sha256')):
-            raise ValueError('single-scene plan needs frozen policy and config SHA-256')
-        if generated:
-            if plan['origin_source_sha256'] != provenance['source_policy_sha256']:
-                raise StateConflictError('validation origin differs from sealed note origin')
-            model = plan.get('dev_model')
-            if (not isinstance(model, dict) or set(model) != {'provider', 'model'}
-                    or any(not isinstance(v, str) or not v.strip() for v in model.values())):
-                raise ValueError('dev_model requires provider and model identifiers')
-        credits = plan.get('assistance_credits')
-        if type(credits) is not int or credits < 0:
-            raise ValueError('validation plan credits must be nonnegative')
+        validate_single_scene_plan(plan, context, seed, case, provenance['failure_signature'], provenance['source_policy_sha256'])
         encoded = _encoded(plan)
         with sqlite3.connect(self.store.path) as db:
             row = db.execute('SELECT payload FROM memory_v2_plans WHERE memory_id=?', (memory_id,)).fetchone()
@@ -1462,3 +1435,35 @@ class MemoryV2Manager:
                 "SELECT payload FROM memory_v2_provenance WHERE memory_id=?", (memory_id,)
             ).fetchone()
         return None if row is None else json.loads(row[0])
+
+
+def validate_single_scene_plan(plan, context, seed, case, signature, origin_sha):
+    from .dev_v2 import SCOPE, AXES, SHA
+    pairs = plan.get('pairs')
+    if (plan.get('failure_signature') != signature
+            or plan.get('seeds') != [seed] or plan.get('cases') != [case]
+            or not isinstance(pairs, list) or len(pairs) < 5
+            or any(not isinstance(p, dict) or set(p) != {'pair_id', 'control_cell', 'treatment_cell'}
+                   or any(not isinstance(v, str) or not v for v in p.values()) for p in pairs)
+            or len({p['pair_id'] for p in pairs}) != len(pairs)
+            or len({cell for p in pairs for cell in (p['control_cell'], p['treatment_cell'])}) != 2 * len(pairs)):
+        raise ValueError('single-scene plan needs one exact source tuple and five distinct pairs')
+    if classify_seed(seed) != 'dev':
+        raise PermissionError('validation plan is development-only')
+    if any(plan.get(k) != context[k] for k in SCOPE if k not in AXES):
+        raise StateConflictError('single-scene plan differs from source scope')
+    generated = plan.get('arm_generation') == 'dev_from_origin'
+    policy_key = 'origin_source_sha256' if generated else 'validation_policy_sha256'
+    if any(not isinstance(plan.get(k), str) or SHA.fullmatch(plan[k]) is None
+           for k in (policy_key, 'validation_config_sha256')):
+        raise ValueError('single-scene plan needs frozen policy and config SHA-256')
+    if generated:
+        if plan['origin_source_sha256'] != origin_sha:
+            raise StateConflictError('validation origin differs from sealed note origin')
+        model = plan.get('dev_model')
+        if (not isinstance(model, dict) or set(model) != {'provider', 'model'}
+                or any(not isinstance(v, str) or not v.strip() for v in model.values())):
+            raise ValueError('dev_model requires provider and model identifiers')
+    credits = plan.get('assistance_credits')
+    if type(credits) is not int or credits < 0:
+        raise ValueError('validation plan credits must be nonnegative')

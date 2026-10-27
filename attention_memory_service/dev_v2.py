@@ -1078,6 +1078,21 @@ class DevV2Evidence:
             db.execute('INSERT INTO dev_v2_validation_grants VALUES (?,?,?,?,?)', (grant['grant_id'], memory_id, cell, version, encoded(grant)))
         return grant
 
+    def validation_manager(self):
+        from .memory_v2 import MemoryV2Manager
+        return MemoryV2Manager(self.store)
+
+    def validation_candidate(self, memory_id):
+        return self.store.get_memory(memory_id)
+
+    def validation_plan(self, memory_id, target_seed=None):
+        if target_seed is None:
+            return self.validation_manager().get_plan(memory_id)
+        with sqlite3.connect(self.store.path) as db:
+            row = db.execute('SELECT payload FROM memory_cross_seed_plans WHERE memory_id=? AND seed=?',
+                             (memory_id, target_seed)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def _validation_generation(self, execution, ed, binding, plan, candidate):
         """Reconstruct arm lineage from executor files and its settled model job."""
         catalog_id = execution['catalog_id']
@@ -1112,7 +1127,7 @@ class DevV2Evidence:
         # section. Any supplied feedback, and every frozen-origin run, is checked.
         if 'public_feedback' in packet or self.ref(catalog_id, ed['manifest']).get('validation_origin'):
             from .memory_v2 import MemoryV2Manager
-            provenance = MemoryV2Manager(self.store).provenance(binding['memory_id'])
+            provenance = self.validation_manager().provenance(binding['memory_id'])
             source = self.source(provenance['source_import_id'])
             failed, *_ = self.execution(source['failed_execution_import_id'])
             require(failed['source']['sha256'] == plan['origin_source_sha256'],
@@ -1150,13 +1165,9 @@ class DevV2Evidence:
     def _verify_validation_arm(self, execution, ed, bundle, artifacts, grant, exposure, memory_id, *, historical=False):
         binding = grant['binding']
         from .memory_v2 import MemoryV2Manager
-        manager = MemoryV2Manager(self.store)
-        plan = manager.get_plan(binding['memory_id'])
+        manager = self.validation_manager()
+        plan = self.validation_plan(binding['memory_id'], binding.get('target_seed'))
         if 'target_seed' in binding:
-            with sqlite3.connect(self.store.path) as db:
-                row = db.execute('SELECT payload FROM memory_cross_seed_plans WHERE memory_id=? AND seed=?',
-                                 (binding['memory_id'], binding['target_seed'])).fetchone()
-            plan = json.loads(row[0]) if row else None
             require(plan is not None and binding['memory_version'] == plan['memory_version'], 'cross-seed version changed')
             config = self.ref(execution['catalog_id'], execution['config'])
             require(config['seed'] == binding['target_seed'] and config.get('scene_contract') == plan['cases'][0]['scene_contract_ref']
@@ -1170,7 +1181,7 @@ class DevV2Evidence:
         # not infer treatment from the eventual outcome.
         input_value = self.ref(execution['catalog_id'], ed['validation_input'])
         require(input_value == {'memory_ids': ids, 'exposure': exposure, 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'validation_grant_id': grant['grant_id']}, 'original validation exposure/config mismatch')
-        candidate = self.store.get_memory(binding['memory_id'])
+        candidate = self.validation_candidate(binding['memory_id'])
         require_profile_match(candidate.applicability, execution['context'])
         require_profile_match(candidate.applicability, plan)
         if (historical and plan.get('profile') == 'single_scene_v1' and plan.get('arm_generation') == 'dev_from_origin'

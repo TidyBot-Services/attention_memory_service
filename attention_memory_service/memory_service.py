@@ -45,6 +45,8 @@ class MemoryService:
         self.dev_v2 = DevV2Evidence(self.store, dev_v2_catalogs, dev_v2_registration_roots)
         from .cross_seed import CrossSeed
         self.cross_seed = CrossSeed(self)
+        from .positive_controls import PositiveControls
+        self.positive_controls = PositiveControls(self)
 
     def register_dev_v2_catalog(self, **payload):
         return self.dev_v2.register_online(**payload)

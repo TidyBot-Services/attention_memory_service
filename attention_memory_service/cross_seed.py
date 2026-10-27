@@ -13,13 +13,15 @@ from .seed_guard import classify_seed
 
 
 class CrossSeed:
+    prefix = "memory_cross_seed"
+    grants_table = "dev_v2_validation_grants"
     def __init__(self, service):
         self.service, self.store, self.evidence = service, service.store, service.dev_v2
         with sqlite3.connect(self.store.path) as db:
             for kind in ('probes', 'plans', 'verdicts'):
-                db.execute(f'CREATE TABLE IF NOT EXISTS memory_cross_seed_{kind} '
+                db.execute(f'CREATE TABLE IF NOT EXISTS {self.prefix}_{kind} '
                            '(memory_id TEXT, seed INTEGER, payload TEXT NOT NULL, PRIMARY KEY(memory_id,seed))')
-            db.execute('CREATE TABLE IF NOT EXISTS memory_cross_seed_pairs '
+            db.execute(f'CREATE TABLE IF NOT EXISTS {self.prefix}_pairs '
                        '(memory_id TEXT, seed INTEGER, pair_id TEXT, payload TEXT NOT NULL, '
                        'PRIMARY KEY(memory_id,seed,pair_id))')
 
@@ -27,9 +29,11 @@ class CrossSeed:
         if db is None:
             with sqlite3.connect(self.store.path) as db:
                 return self.get(kind, memory_id, seed, db)
-        row = db.execute(f'SELECT payload FROM memory_cross_seed_{kind} WHERE memory_id=? AND seed=?',
+        row = db.execute(f'SELECT payload FROM {self.prefix}_{kind} WHERE memory_id=? AND seed=?',
                          (memory_id, seed)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def candidate(self, memory_id): return self.store.get_memory(memory_id)
 
     def _eligible(self, memory_id, db, *, version=None):
         row = db.execute('SELECT payload FROM memories WHERE id=?', (memory_id,)).fetchone()
@@ -89,7 +93,7 @@ class CrossSeed:
             old = self.get('probes', memory_id, target_seed, db)
             if old:
                 require(old['request'] == args, 'target seed already closed or bound to another probe')
-                memory = self.store.get_memory(memory_id).artifact()
+                memory = self.candidate(memory_id).artifact()
                 p = self.service.v2.provenance(memory_id)
             else:
                 memory, p = self._eligible(memory_id, db)
@@ -128,7 +132,7 @@ class CrossSeed:
                 require(old == value, 'conflicting probe')
                 return old
             self._eligible(memory_id, db, version=memory['version'])
-            db.execute('INSERT INTO memory_cross_seed_probes VALUES (?,?,?)', (memory_id, target_seed, encoded(value)))
+            db.execute(f'INSERT INTO {self.prefix}_probes VALUES (?,?,?)', (memory_id, target_seed, encoded(value)))
             if role == 'could_not_finish':
                 self._close(db, memory_id, target_seed, role, 'Could not finish: probe safety or scene reproduction failed', {})
         return value
@@ -172,8 +176,12 @@ class CrossSeed:
             require(self.get('verdicts', memory_id, target_seed, db) is None, 'target seed is closed')
             old = self.get('plans', memory_id, target_seed, db)
             require(old is None or old == value, 'conflicting cross-seed plan')
-            db.execute('INSERT OR IGNORE INTO memory_cross_seed_plans VALUES (?,?,?)', (memory_id, target_seed, encoded(value)))
+            db.execute(f'INSERT OR IGNORE INTO {self.prefix}_plans VALUES (?,?,?)', (memory_id, target_seed, encoded(value)))
         return value
+
+    def grant_binding(self, binding, plan): return binding
+
+    def pair_target(self, binding): return binding.get('target_seed')
 
     def authorize(self, *, memory_id, target_seed, cell, version, seed, context,
                   policy_sha256, config_sha256, exposure, origin_source_sha256=None):
@@ -195,14 +203,15 @@ class CrossSeed:
                 cell=cell, version=version, seed=seed, context=context, policy_sha256=policy_sha256,
                 config_sha256=config_sha256, exposure=exposure, plan_sha256=digest(encoded(plan).encode()),
                 origin_source_sha256=origin_source_sha256, dev_model=plan['dev_model'], guidance_sha256=digest(memory['guidance'].encode()))
-            old = db.execute('SELECT payload FROM dev_v2_validation_grants WHERE memory_id=? AND cell=? AND version=?',
+            binding = self.grant_binding(binding, plan)
+            old = db.execute(f'SELECT payload FROM {self.grants_table} WHERE memory_id=? AND cell=? AND version=?',
                              (memory_id, cell, version)).fetchone()
             if old:
                 grant = json.loads(old[0]); require(grant['binding'] == binding, 'conflicting validation dispatch')
                 return grant
             grant = dict(schema_version='attentionbench.dev-v2-validation-grant.v1', grant_id='validation:' + uuid.uuid4().hex,
                          issued_at=time.time(), binding=binding)
-            db.execute('INSERT INTO dev_v2_validation_grants VALUES (?,?,?,?,?)',
+            db.execute(f'INSERT INTO {self.grants_table} VALUES (?,?,?,?,?)',
                        (grant['grant_id'], memory_id, cell, version, encoded(grant)))
         return grant
 
@@ -218,7 +227,7 @@ class CrossSeed:
             result = self.evidence.import_trial(import_id=import_id, catalog_id=old['catalog_id'], descriptor=old['descriptor'])
             d = self.evidence.read(old['catalog_id'], old['descriptor'])
             binding = self.evidence.validation_grant(d['validation_grant_id'])['binding']
-            require(binding.get('target_seed') == target_seed and binding['memory_id'] == memory_id
+            require(self.pair_target(binding) == target_seed and binding['memory_id'] == memory_id
                     and binding['memory_version'] == plan['memory_version'], 'pair belongs to another cross-seed plan')
             arms.append(result['trial'])
             unsafe.append(json.loads(Path(result['safety']['uri']).read_text())['unsafe_attempts'])
@@ -234,16 +243,16 @@ class CrossSeed:
         value = dict(pair_id=match['pair_id'], control_import_id=control_import_id, treatment_import_id=treatment_import_id,
                      control=c, treatment=t, control_unsafe=unsafe[0], treatment_unsafe=unsafe[1])
         with self.store._transaction() as db:
-            row = db.execute('SELECT payload FROM memory_cross_seed_pairs WHERE memory_id=? AND seed=? AND pair_id=?',
+            row = db.execute(f'SELECT payload FROM {self.prefix}_pairs WHERE memory_id=? AND seed=? AND pair_id=?',
                              (memory_id, target_seed, match['pair_id'])).fetchone()
             if row:
                 require(json.loads(row[0]) == value, 'conflicting cross-seed pair')
                 return value
             self._eligible(memory_id, db, version=plan['memory_version'])
             require(self.get('verdicts', memory_id, target_seed, db) is None, 'target seed is closed')
-            db.execute('INSERT INTO memory_cross_seed_pairs VALUES (?,?,?,?)',
+            db.execute(f'INSERT INTO {self.prefix}_pairs VALUES (?,?,?,?)',
                        (memory_id, target_seed, match['pair_id'], encoded(value)))
-            pairs = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_cross_seed_pairs WHERE memory_id=? AND seed=?',
+            pairs = [json.loads(r[0]) for r in db.execute(f'SELECT payload FROM {self.prefix}_pairs WHERE memory_id=? AND seed=?',
                                                         (memory_id, target_seed))]
             if len(pairs) == len(plan['pairs']):
                 report = self._report(pairs)
@@ -285,7 +294,7 @@ class CrossSeed:
     @evidence_operation
     def failed_check(self, *, memory_id, target_seed, validation_grant_id, execution_import_id, catalog_id, descriptor):
         grant = self.evidence.validation_grant(validation_grant_id)
-        require(grant['binding']['memory_id'] == memory_id and grant['binding'].get('target_seed') == target_seed,
+        require(grant['binding']['memory_id'] == memory_id and self.pair_target(grant['binding']) == target_seed,
                 'failed check belongs to another cross-seed plan')
         execution, ed, bundle, artifacts, _, verdict, _ = self.evidence.verdict(
             execution_import_id, catalog_id, descriptor, for_validation=False)
@@ -302,43 +311,35 @@ class CrossSeed:
         # As in M-8, treatment safety failure is harm; a failed replay or a
         # control safety failure is an inconclusive infrastructure exit.
         harm = checks['scene_reproduction'] and grant['binding']['exposure'] == 'candidate_validation'
-        status = ('neutral_harm' if plan['role'] == 'neutral' else 'transfer_failed') if harm else 'could_not_finish'
+        role = self.get('plans', memory_id, target_seed)['role']
+        status = ('neutral_harm' if role == 'neutral' else 'transfer_failed') if harm else 'could_not_finish'
         reason = ('Safety worsened with the note' if harm else 'Could not finish: scene reproduction or control safety failed')
         with self.store._transaction() as db:
             old = self.get('verdicts', memory_id, target_seed, db)
             if old:
                 require(old.get('failed_check') == failed, 'conflicting closed cross-seed check')
                 return old
-            self._eligible(memory_id, db, version=plan['memory_version'])
+            self._eligible(memory_id, db, version=grant['binding']['memory_version'])
             return self._close(db, memory_id, target_seed, status, reason, dict(failed_check=failed))
 
     def _conditions(self, db, memory_id):
         m = json.loads(db.execute('SELECT payload FROM memories WHERE id=?', (memory_id,)).fetchone()[0])
         row = db.execute('SELECT payload FROM memory_v2_decisions WHERE memory_id=?', (memory_id,)).fetchone()
         d = json.loads(row[0]) if row else {}
-        scenes = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_cross_seed_verdicts WHERE memory_id=? ORDER BY seed', (memory_id,))]
+        scenes = [json.loads(r[0]) for r in db.execute(f'SELECT payload FROM {self.prefix}_verdicts WHERE memory_id=? ORDER BY seed', (memory_id,))]
         for scene in scenes:
             require_profile_match(m['applicability'], scene)
-        current = [s for s in scenes if s['memory_version'] == m['version']]
-        origin = m['status'] == 'trusted' and d.get('trust_scope') in {'scene_scoped', 'task_scoped'}
-        if m.get('expires_at') is not None and m['expires_at'] <= time.time(): origin = False
-        count = int(origin) + sum(s['verdict'] != 'could_not_finish' for s in current)
-        conditions = [('Trusted on the origin scene at the current version', origin),
-                      ('Worked on at least one other transfer seed', any(s['verdict'] == 'transfer_passed' for s in current)),
-                      ('No neutral seed showed harm', not any(s['verdict'] == 'neutral_harm' for s in scenes)),
-                      ('At least three scenes have verdicts, including the origin', count >= 3)]
-        return dict(met=[k for k, v in conditions if v], missing=[k for k, v in conditions if not v], scenes=count,
-                    trust_scope=d.get('trust_scope'), transfer_failed=[s['target_seed'] for s in scenes if s['verdict'] == 'transfer_failed'])
+        return task_conditions(m, d, scenes)
 
     def _close(self, db, memory_id, seed, verdict, reason, extra):
         memory, p = self._eligible(memory_id, db)
         value = dict(**profile_fields(memory['applicability']), memory_id=memory_id,
                      memory_version=memory['version'], target_seed=seed, verdict=verdict, reason=reason, decided_at=time.time(), **extra)
-        db.execute('INSERT INTO memory_cross_seed_verdicts VALUES (?,?,?)', (memory_id, seed, encoded(value)))
+        db.execute(f'INSERT INTO {self.prefix}_verdicts VALUES (?,?,?)', (memory_id, seed, encoded(value)))
         conditions = self._conditions(db, memory_id)
         if not conditions['missing']:
             self._verify_history(db, memory_id, memory['version'])
-            scenes = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_cross_seed_verdicts WHERE memory_id=? ORDER BY seed', (memory_id,))]
+            scenes = [json.loads(r[0]) for r in db.execute(f'SELECT payload FROM {self.prefix}_verdicts WHERE memory_id=? ORDER BY seed', (memory_id,))]
             worked = ', '.join(str(s['target_seed']) for s in scenes if s['verdict'] == 'transfer_passed')
             neutral = ', '.join(str(s['target_seed']) for s in scenes if s['verdict'] == 'neutral_no_harm')
             reason = f'Trusted for this task: worked on seed {worked}' + (f', no harm on seed {neutral}' if neutral else '') + f" ({conditions['scenes']} scenes)"
@@ -355,7 +356,7 @@ class CrossSeed:
 
     def _verify_history(self, db, memory_id, version):
         """Recheck all participating evidence inside the promotion transaction."""
-        for row in db.execute('SELECT payload FROM memory_cross_seed_probes WHERE memory_id=?', (memory_id,)):
+        for row in db.execute(f'SELECT payload FROM {self.prefix}_probes WHERE memory_id=?', (memory_id,)):
             probe = json.loads(row[0])
             if probe['memory_version'] != version:
                 continue
@@ -363,7 +364,7 @@ class CrossSeed:
             execution, *_ = self.evidence.verdict(args['execution_import_id'], args['catalog_id'], args['descriptor'],
                                                   for_validation=False)
             self._target(memory_id, probe['target_seed'], execution, probe['scene_contract_ref'])
-        for row in db.execute('SELECT payload FROM memory_cross_seed_verdicts WHERE memory_id=?', (memory_id,)):
+        for row in db.execute(f'SELECT payload FROM {self.prefix}_verdicts WHERE memory_id=?', (memory_id,)):
             scene = json.loads(row[0])
             failed = scene.get('failed_check')
             if scene['memory_version'] != version or not failed:
@@ -378,7 +379,7 @@ class CrossSeed:
                     'failed-check evidence changed before promotion')
             for ref in verdict.get('scene_replay_states', []):
                 self.evidence.ref(failed['catalog_id'], ref)
-        for row in db.execute('SELECT seed,payload FROM memory_cross_seed_pairs WHERE memory_id=?', (memory_id,)):
+        for row in db.execute(f'SELECT seed,payload FROM {self.prefix}_pairs WHERE memory_id=?', (memory_id,)):
             seed, payload = row
             if self.get('plans', memory_id, seed, db)['memory_version'] != version:
                 continue
@@ -393,12 +394,12 @@ class CrossSeed:
     def status(self, *, memory_id):
         self.service.v2.provenance(memory_id)
         with sqlite3.connect(self.store.path) as db:
-            probes = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_cross_seed_probes WHERE memory_id=? ORDER BY seed', (memory_id,))]
+            probes = [json.loads(r[0]) for r in db.execute(f'SELECT payload FROM {self.prefix}_probes WHERE memory_id=? ORDER BY seed', (memory_id,))]
             seeds = []
             for probe in probes:
                 seed = probe['target_seed']
                 verdict = self.get('verdicts', memory_id, seed, db)
-                done = db.execute('SELECT COUNT(*) FROM memory_cross_seed_pairs WHERE memory_id=? AND seed=?', (memory_id, seed)).fetchone()[0]
+                done = db.execute(f'SELECT COUNT(*) FROM {self.prefix}_pairs WHERE memory_id=? AND seed=?', (memory_id, seed)).fetchone()[0]
                 seeds.append(dict(target_seed=seed, role=probe['role'], pairs_done=done,
                     pairs_needed=5 if probe['role'] == 'transfer' else 3 if probe['role'] == 'neutral' else 0,
                     verdict=verdict['verdict'] if verdict else None,
@@ -426,3 +427,17 @@ class CrossSeed:
                                  uses=len(uses), failure_gone=sum(r['signature_present'] is False for r in uses),
                                  created_at=memory['created_at'], **{k: status[k] for k in ('seeds', 'task_trust')}))
         return rank_validation_queue(rows)
+
+
+def task_conditions(m, d, scenes):
+    """Shared task-level aggregation for real and hypothetical verdicts."""
+    current = [s for s in scenes if s['memory_version'] == m['version']]
+    origin = m['status'] == 'trusted' and d.get('trust_scope') in {'scene_scoped', 'task_scoped'}
+    if m.get('expires_at') is not None and m['expires_at'] <= time.time(): origin = False
+    count = int(origin) + sum(s['verdict'] != 'could_not_finish' for s in current)
+    conditions = [('Trusted on the origin scene at the current version', origin),
+                  ('Worked on at least one other transfer seed', any(s['verdict'] == 'transfer_passed' for s in current)),
+                  ('No neutral seed showed harm', not any(s['verdict'] == 'neutral_harm' for s in scenes)),
+                  ('At least three scenes have verdicts, including the origin', count >= 3)]
+    return dict(met=[k for k, v in conditions if v], missing=[k for k, v in conditions if not v], scenes=count,
+                trust_scope=d.get('trust_scope'), transfer_failed=[s['target_seed'] for s in scenes if s['verdict'] == 'transfer_failed'])
