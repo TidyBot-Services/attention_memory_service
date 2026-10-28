@@ -173,7 +173,16 @@ def scene_matches(reference, actual, path='state'):
     return type(reference) in (int, float) and type(actual) in (int, float) and math.isfinite(reference - actual) and abs(reference - actual) <= 1e-6
 
 
-def public_trace_projection(trace):
+def public_base_yaw_visible(bundle, config):
+    """Use only the sealed writer decision, bounded by the frozen H1 config."""
+    visible = bundle.get('public_base_yaw_visible', False)
+    require(type(visible) is bool, 'public_base_yaw_visible must be a bool')
+    require(not visible or (config.get('budget_tier') == 'dev' and config.get('dev_version_history') is True),
+            'public_base_yaw_visible requires Dev version history')
+    return visible
+
+
+def public_trace_projection(trace, *, base_yaw_visible=False):
     """The Dev v2 public projection, with no native result as an argument."""
     # The writer (dev_loop.event_projection) omits nonfinite event timestamps.
     # Remove only those before the strict JSON/public screen; keep the sealed
@@ -202,7 +211,9 @@ def public_trace_projection(trace):
         if projected['status'] not in ('completed', 'failed', 'started', 'succeeded', 'unknown'):
             projected['status'] = 'unknown'
         projected['arguments'] = {k: numeric(v) for k, v in (event.get('arguments') or {}).items()
-                                  if k in {'dx', 'dy', 'dz', 'rotation_delta', 'settle_steps', 'values', 'command', 'target_qpos'}}
+                                  if k in {'dx', 'dy', 'dz', 'rotation_delta', 'settle_steps', 'values', 'command', 'target_qpos'}
+                                  or (base_yaw_visible and k == 'dyaw' and operation == 'move_delta'
+                                      and event.get('source') in (None, 'base'))}
         error = event.get('error')
         if error:
             projected['error'] = {k: str(error[k])[:1200] for k in ('type', 'message') if k in error} if isinstance(error, dict) else {'message': str(error)[:1200]}
@@ -646,6 +657,7 @@ class DevV2Evidence:
         with self._ledger(catalog_id, d) as db:
             job = self._job(db, d['execute_job_id'], d['cell'], d['version'], 'execute')
         bundle = self.ref(catalog_id, job['receipt']['bundle'])
+        base_yaw_visible = public_base_yaw_visible(bundle, config)
         require(bundle['schema_version'] == 'attentionbench.formal-runner-result.v1' and bundle['channel'] == 'dev_v2' and bundle['formal_eligible'] is False and type(bundle['dev_version']) is int and bundle['dev_version'] == d['version'], 'unsupported real Dev v2 bundle')
         require(bundle['policy_sha256'] == record['source']['sha256'] and bundle['config_sha256'] == d['config']['sha256'] and bundle['config_lock'] == d['config'] and bundle['policy_id'] == cell['policy_id'], 'bundle/code/config binding mismatch')
         require(bundle['run_id'] == 'run:' + d['cell'] and bundle['attempt_id'] == f"attempt:{d['cell']}:{d['version']-1}" and bundle['task_id'] == config['task_id'] and bundle['seed'] == config['seed'] and bundle['suite'] == d['context']['suite'], 'bundle identity/scope mismatch')
@@ -681,7 +693,7 @@ class DevV2Evidence:
         feedback = self.ref(catalog_id, job['receipt']['public_feedback']); public(feedback)
         projected = ({'schema_version': 'attentionbench.dev-public-feedback.v1', 'execution_status': 'condition_invalid',
                       'public_error': 'scene_contract_mismatch', 'action_trace': []}
-                     if bundle['status'] == 'condition_invalid' else public_trace_projection(trace))
+                     if bundle['status'] == 'condition_invalid' else public_trace_projection(trace, base_yaw_visible=base_yaw_visible))
         for label, ref in d.get('public_observations', {}).items():
             require(label in {'initial', 'final'}, 'unknown public observation label')
             observation = self.ref(catalog_id, ref); public(observation)
@@ -1288,7 +1300,8 @@ class DevV2Evidence:
         if verdict.get('source_drift') is not None:trial['source_drift']=verdict['source_drift']
         if plan.get('profile', 'default') in {'single_scene_v1', 'cross_seed_v1'}:
             signature = manager.provenance(binding['memory_id'])['failure_signature']
-            feedback = public_trace_projection(artifacts['trace'])
+            config = self.ref(execution['catalog_id'], execution['config'])
+            feedback = public_trace_projection(artifacts['trace'], base_yaw_visible=public_base_yaw_visible(bundle, config))
             present = signature_present(feedback, signature)
             position = stop_position(artifacts['trace'])
             require(verdict.get('failure_signature') == signature and

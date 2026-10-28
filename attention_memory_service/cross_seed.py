@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .applicability import require_profile_match, validate_profile, config_profile, profile_fields
 from .auto_validation import lifecycle, rank_validation_queue
-from .dev_v2 import AXES, SCOPE, SHA, digest, encoded, evidence_operation, require, public_trace_projection, signature_present
+from .dev_v2 import AXES, SCOPE, SHA, digest, encoded, evidence_operation, require, public_base_yaw_visible, public_trace_projection, signature_present
 from .scene_contract import V2
 from .seed_guard import classify_seed
 
@@ -106,7 +106,7 @@ class CrossSeed:
         self.service.v2.verify_source_evidence(memory_id)
         execution, ed, bundle, artifacts, _, verdict, safety = self.evidence.verdict(
             execution_import_id, catalog_id, descriptor, for_validation=False)
-        self._target(memory_id, target_seed, execution, scene_contract_ref)
+        config = self._target(memory_id, target_seed, execution, scene_contract_ref)
         for ref in verdict.get('scene_replay_states', []):
             self.evidence.ref(catalog_id, ref)
         p = self.target_provenance(memory_id, target_seed, p)
@@ -122,7 +122,7 @@ class CrossSeed:
         require(all(j['kind'] == 'execute' for j in jobs)
                 and not artifacts['trace'].get('memory_validation') and not artifacts['trace'].get('memory_uses'),
                 'probe must execute origin directly with clean Memory')
-        present = signature_present(public_trace_projection(artifacts['trace']), p['failure_signature'])
+        present = signature_present(public_trace_projection(artifacts['trace'], base_yaw_visible=public_base_yaw_visible(bundle, config)), p['failure_signature'])
         unsafe = json.loads(safety.read_text())['unsafe_attempts']
         role = ('could_not_finish' if not verdict['checks']['scene_reproduction'] or not verdict['checks']['safety'] or unsafe
                 else 'transfer' if present else 'neutral')
