@@ -245,6 +245,8 @@ class DevMemoryUse:
             # No private bundle/native result pointers leave the offline side.
             record['result'] = {k: result[k] for k in ('schema_version', 'execution_import_id',
                 'run_id', 'cell', 'version', 'source_policy_sha256', 'result_policy_sha256', 'claim')}
+            if result.get('channel') == 'dev_agent':
+                record['result']['channel'] = 'dev_agent'
         elif result is not None:
             artifact = Path(result["artifact_uri"])
             if (not artifact.is_file()
@@ -266,4 +268,6 @@ def _online_grant(record):
     if result and result.get('schema_version') == 'attentionbench.dev-v2-memory-result.v1':
         record['result'] = {k: result[k] for k in ('schema_version', 'execution_import_id', 'run_id',
             'cell', 'version', 'source_policy_sha256', 'result_policy_sha256', 'claim')}
+        if result.get('channel') == 'dev_agent':
+            record['result']['channel'] = 'dev_agent'
     return record

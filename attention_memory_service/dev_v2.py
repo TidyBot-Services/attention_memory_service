@@ -658,7 +658,11 @@ class DevV2Evidence:
             job = self._job(db, d['execute_job_id'], d['cell'], d['version'], 'execute')
         bundle = self.ref(catalog_id, job['receipt']['bundle'])
         base_yaw_visible = public_base_yaw_visible(bundle, config)
-        require(bundle['schema_version'] == 'attentionbench.formal-runner-result.v1' and bundle['channel'] == 'dev_v2' and bundle['formal_eligible'] is False and type(bundle['dev_version']) is int and bundle['dev_version'] == d['version'], 'unsupported real Dev v2 bundle')
+        if bundle.get('channel') == 'dev_agent':
+            from .agent_execution import verify as verify_agent_execution
+            verify_agent_execution(self, catalog_id, d, bundle, config, manifest, record, cell, job)
+        else:
+            require(bundle['schema_version'] == 'attentionbench.formal-runner-result.v1' and bundle['channel'] == 'dev_v2' and bundle['formal_eligible'] is False and type(bundle['dev_version']) is int and bundle['dev_version'] == d['version'], 'unsupported real Dev v2 bundle')
         require(bundle['policy_sha256'] == record['source']['sha256'] and bundle['config_sha256'] == d['config']['sha256'] and bundle['config_lock'] == d['config'] and bundle['policy_id'] == cell['policy_id'], 'bundle/code/config binding mismatch')
         require(bundle['run_id'] == 'run:' + d['cell'] and bundle['attempt_id'] == f"attempt:{d['cell']}:{d['version']-1}" and bundle['task_id'] == config['task_id'] and bundle['seed'] == config['seed'] and bundle['suite'] == d['context']['suite'], 'bundle identity/scope mismatch')
         require(bundle['status'] in {'completed', 'failed', 'timeout', 'cancelled', 'condition_invalid'}, 'nonterminal native bundle')
@@ -677,7 +681,10 @@ class DevV2Evidence:
         require(d.get('import_purpose') in (None, 'memory_validation'), 'unknown execution import purpose')
         require(all(permission.get(k) == v for k, v in {'run_id': bundle['run_id'], 'cell': d['cell'], 'code_version': d['version'], 'code_sha256': bundle['policy_sha256'], 'config_sha256': digest(json.dumps(config, sort_keys=True, ensure_ascii=False, allow_nan=False).encode())}.items()), 'permission scope not bound to exact run/code/config/version')
         require(type(permission.get('code_version')) is int and type(permission.get('action_version')) is int and permission['action_version'] == 1 and isinstance(permission.get('scope'), dict) and permission['scope'], 'explicit permission action/version/scope required')
-        if permission.get('action') == 'dev_tier_sim_motion':
+        if permission.get('action') == 'agent_dev_tier_motion':
+            from .motion_permission import verify_agent
+            verify_agent(permission, d, config, bundle, source, job, require)
+        elif permission.get('action') == 'dev_tier_sim_motion':
             from .motion_permission import verify
             verify(permission, d, config, bundle, source, require)
         elif permission.get('action') == 'execute_bounded_motion_policy':
@@ -712,6 +719,8 @@ class DevV2Evidence:
             else:
                 verify_v2_receipt(contract, config, original['state'], condition)
         evidence = {'catalog_id': catalog_id, 'descriptor': descriptor, 'context': d['context'], 'cell': d['cell'], 'version': d['version'], 'bundle': job['receipt']['bundle'], 'public_feedback': job['receipt']['public_feedback'], 'source': record['source'], 'config': d['config'], 'manifest': d['manifest'], 'ledger': d['ledger'], 'run_id': bundle['run_id'], 'attempt_id': bundle['attempt_id'], 'status': bundle['status']}
+        if bundle.get('channel') == 'dev_agent':
+            evidence.update(channel='dev_agent', permission=permission)
         if d.get('source_drift') is not None:evidence['source_drift']=d['source_drift']
         if d.get('import_purpose') is not None:
             evidence.update(import_purpose=d['import_purpose'], permission=permission)
@@ -732,6 +741,7 @@ class DevV2Evidence:
 
     def verdict(self, import_id, validator_id, descriptor, *, for_validation=True):
         execution, d, bundle, artifacts, cell = self.execution(import_id)
+        require(bundle.get('channel') != 'dev_agent', 'agent offline validation and source evidence are unsupported')
         validator = self.catalog(validator_id, 'validator')
         executor = self.catalog(execution['catalog_id'], 'executor')
         require(not Path(validator['root']).is_relative_to(executor['root']) and not Path(executor['root']).is_relative_to(validator['root']), 'validator root must be independent of executor')
@@ -1081,6 +1091,8 @@ class DevV2Evidence:
                 exposure=exposure, origin_source_sha256=origin_source_sha256)
         from .memory_v2 import MemoryV2Manager
         manager = MemoryV2Manager(self.store)
+        require((manager._provenance(memory_id) or {}).get('channel') != 'dev_agent',
+                'offline validation grant requires a Dev v2 candidate')
         provenance = manager.provenance(memory_id)
         memory = self.store.get_memory(memory_id)
         require(provenance.get('channel') == 'dev_v2' and memory.status.value == 'candidate', 'offline validation grant requires a Dev v2 candidate')
@@ -1338,6 +1350,9 @@ class DevV2Evidence:
         require_result_permission(d, require)
         grant_id = grant['grant_id']
         require(grant['development_id'] == f"{d['cell']}:v{d['version']}" and grant['context'] == d['context'], 'grant belongs to another run/cell/version/scope')
+        if bundle.get('channel') == 'dev_agent':
+            from .agent_execution import result_evidence
+            return result_evidence(self, grant, execution_import_id, execution, d, bundle)
         catalog_id = execution['catalog_id']
         record = self.ref(catalog_id, d['version_record'])
         with self._ledger(catalog_id, d) as db:

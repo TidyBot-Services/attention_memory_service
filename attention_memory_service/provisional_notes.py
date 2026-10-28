@@ -147,10 +147,22 @@ def initialize(store):
                    'grant_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, payload TEXT NOT NULL)')
 
 
-def record_outcome(service, *, grant_id, development_id, public_feedback_text, public_feedback_sha256):
+def record_outcome(service, *, grant_id, development_id, public_feedback_text, public_feedback_sha256,
+                   execution_import_id=None):
     observed = feedback(public_feedback_text, public_feedback_sha256)
     request = dict(grant_id=grant_id, development_id=development_id,
                    public_feedback_text=public_feedback_text, public_feedback_sha256=public_feedback_sha256)
+    execution_provenance = {}
+    if execution_import_id is not None:
+        execution, d, bundle, *_ = service.dev_v2.execution(execution_import_id)
+        from .dev_v2 import require
+        require(bundle.get('channel') == 'dev_agent', 'execution-linked outcome requires agent evidence')
+        require(development_id == f"{d['cell']}:v{d['version']}"
+                and observed == service.dev_v2.ref(execution['catalog_id'], execution['public_feedback']),
+                'agent outcome differs from sealed execution feedback')
+        request['execution_import_id'] = execution_import_id
+        execution_provenance = dict(channel='dev_agent', execution_import_id=execution_import_id,
+                                    provenance=dict(channel='dev_agent', execution_import_id=execution_import_id))
     fingerprint = digest(encoded(request).encode())
     # Sealed-source verification may reopen immutable imports. Do it before
     # acquiring the outcome write lock, then recheck provenance in that lock.
@@ -159,6 +171,8 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
     if row is None:
         raise StateConflictError('unknown Dev Memory grant')
     grant = json.loads(row[0])
+    if execution_import_id is not None:
+        require(grant['context'] == d['context'], 'agent outcome grant scope mismatch')
     provenance = service.v2.provenance(grant['memory_id'])
     require_profile_match(provenance['artifact']['applicability'], grant['context'])
     plan = service.v2.get_plan(grant['memory_id'])
@@ -168,7 +182,21 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
         if old:
             record = json.loads(old[0])
             if record['request_sha256'] != fingerprint:
-                raise StateConflictError('provisional outcome is immutable')
+                # An attested observation may already have been auto-imported.
+                # Attach verified execution provenance only to those exact bytes;
+                # do not replace its observation, timing, or original metrics.
+                unlinked = {k: v for k, v in request.items() if k != 'execution_import_id'}
+                if (execution_import_id is not None and 'execution_import_id' not in record
+                        and record['request_sha256'] == digest(encoded(unlinked).encode())):
+                    record.update(execution_provenance, request_sha256=fingerprint)
+                    db.execute('UPDATE memory_provisional_outcomes SET payload=? WHERE grant_id=?',
+                               (encoded(record), grant_id))
+                elif (execution_import_id is None and record.get('execution_import_id') is not None
+                        and record['request_sha256'] == digest(encoded(dict(request,
+                            execution_import_id=record['execution_import_id'])).encode())):
+                    pass  # Idempotent retry of the original observational request.
+                else:
+                    raise StateConflictError('provisional outcome is immutable')
             return record
         current = json.loads(db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?',
                                         (grant['memory_id'],)).fetchone()[0])
@@ -185,7 +213,7 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
                       signature_present=signature_present(observed, provenance['failure_signature']),
                       progress=progress(observed), origin_progress=provenance.get('origin_progress'),
                       observational=True, attested_by='offline_importer', recorded_at=time.time(),
-                      request_sha256=fingerprint, **flags(provenance))
+                      request_sha256=fingerprint, **flags(provenance), **execution_provenance)
         db.execute('INSERT INTO memory_provisional_outcomes(grant_id,memory_id,payload) VALUES (?,?,?)',
                    (grant_id, grant['memory_id'], encoded(record)))
         from .auto_validation import demote_if_due

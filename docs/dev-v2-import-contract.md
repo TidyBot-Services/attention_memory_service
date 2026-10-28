@@ -634,3 +634,62 @@ source seed. It records lineage only and adds no validation authority. Omitting
 it leaves candidate provenance unchanged. Public catalogue lineage contains only
 `origin_summary` (experiment, helped version, policy), `from_run_note`, and
 `from_provisional`; guidance and private evidence are not exposed.
+
+## Agent development execution imports (D7-svc)
+
+`verify_execution` has a separate `dev_agent` branch. It requires the frozen
+agent config, cell `agent_export=v1`, a valid formal version and a settled execute
+job that mirrors the same settled `v2_agent_jobs` request, timing and physical
+usage. The formal identity remains `run:<cell>` / `attempt:<cell>:<version-1>`.
+The original Dev v2 raw trace/native/sandbox/safety checks, frozen resource limits,
+source locks and public feedback projection also apply. Agent bundles must seal
+an explicit boolean `public_base_yaw_visible` and `formal_eligible=false`.
+
+Motion uses `agent_dev_tier_motion`, version 1, only for the frozen Dev tier and
+`dev_loop` boundary. Its inventory is computed with the same AST inventory as
+`dev_tier_sim_motion`. The exact run/cell/version/source/config scope and
+`agent_execution.request_id` must match the settled job. No actor or approval ID
+is permitted. Sources without motion retain `sensor_only`.
+
+Agent result imports attest generation exposure, not one-call model authorship.
+The bundle pins the private generation Memory packet and, after v1, the preceding
+formal source. The verifier checks the original retrieval event before execution,
+the initial/preceding source binding, and exact issued grant content, authority,
+version and context. Existing provisional/test-seeded result exclusions remain.
+Execution imports and result provenance use `channel: dev_agent`; online grant
+result projections preserve the channel while withholding private artifact refs.
+
+`POST /dev-v2/provisional-outcomes` accepts optional `execution_import_id` for an
+already verified agent execution. It binds the exact generation, context and
+public feedback and records agent channel/provenance. Omitting this field keeps
+the existing importer-attested observational API. Its channel cannot be inferred
+from feedback alone. Agent result imports automatically pass this linkage when
+also recording single-scene outcomes. The existing harness auto-import path does
+not create execution imports and continues to use the observational API.
+
+### Channel filter audit
+
+No agent-origin Memory candidate creation is introduced. Agent executions cannot
+be source/validator inputs, receive validation grants, or enter offline trials.
+The following existing Dev v2 filters deliberately remain Dev v2-only:
+
+- `dev_v2.create_candidate` and `authorize_validation`: source authority and
+  candidate validation are deferred to D8; `verdict` explicitly refuses agents.
+- `memory_v2` (all provenance/plan/promotion/retrieval/demotion filters),
+  `cross_seed`, `auto_validation`, `family`, and `seeded_notes`: these classify
+  Memory **origin/trust**, not the execution channel of an exposure result.
+- `dev_use` authorization/revocation/result guards and `memory_service_api`
+  lifecycle filters: these also classify the originating Memory note. An agent
+  can consume existing eligible notes without changing their origin channel.
+- `provisional_notes` eligibility and `memory_artifacts` publication: these
+  classify note origins. Execution-linked outcomes carry their own agent channel.
+- `memory_service.list_memories` and `list_dev_v2_memories`, plus
+  `motion_permission.public_summary`: these list/summarize originating Memory
+  candidates and their source/validation permissions, not execution imports.
+  D7-svc creates no agent-origin candidate rows, so there is no omitted agent
+  candidate to display. Result projections in `dev_use` now preserve agent channel;
+  `provisional_notes.uses_summary` counts outcomes without filtering their channel.
+
+No simulator, planner, provider, or live Memory service is required by the
+cross-repo test `tests/test_dev_agent_import.py`. Put the D7 harness checkout on
+`PYTHONPATH` after the service checkout when running it.

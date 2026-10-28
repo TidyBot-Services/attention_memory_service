@@ -121,7 +121,8 @@ class MemoryService:
             execution = self.dev_v2.get(payload['execution_import_id'])
             data = self.dev_v2.ref(execution['catalog_id'], execution['public_feedback'], raw=True)
             self.record_provisional_outcome(grant_id=result['grant_id'], development_id=result['development_id'],
-                public_feedback_text=data.decode('utf-8'), public_feedback_sha256=hashlib.sha256(data).hexdigest())
+                public_feedback_text=data.decode('utf-8'), public_feedback_sha256=hashlib.sha256(data).hexdigest(),
+                **({'execution_import_id': payload['execution_import_id']} if execution.get('channel') == 'dev_agent' else {}))
         return result
 
     @evidence_operation

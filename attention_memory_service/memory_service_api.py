@@ -255,6 +255,7 @@ class MemoryQueryInput(BaseModel):
 
 class ProvisionalOutcomeInput(BaseModel):
     model_config = {'extra': 'forbid'}
+    execution_import_id: str | None = None
     grant_id: str
     development_id: str
     public_feedback_text: str

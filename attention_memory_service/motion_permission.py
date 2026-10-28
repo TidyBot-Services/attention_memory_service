@@ -47,6 +47,32 @@ def verify(permission, descriptor, config, bundle, source, require):
     require(permission == expected, 'simulated Dev motion scope differs from frozen source/config binding')
 
 
+def verify_agent(permission, descriptor, config, bundle, source, job, require):
+    """Bounded Dev agent motion carries no human/planner approval identity."""
+    require(config.get('budget_tier') == 'dev' and config.get('runner_boundary') == 'dev_loop'
+            and config.get('budget_boundary', 'dev_loop') == 'dev_loop'
+            and config.get('dev_mode') == 'agent' and bundle.get('runner_boundary') == 'dev_loop'
+            and bundle.get('channel') == 'dev_agent' and bundle.get('formal_eligible') is False
+            and bundle.get('entry_lock') is None, 'agent motion requires frozen agent dev tier and boundary')
+    require(bundle.get('suite') == 'robocasa365'
+            and all(v.get('execution_target', 'robocasa365_sim') == 'robocasa365_sim' for v in (config, bundle)),
+            'agent motion requires robocasa365_sim')
+    require(not any(k in obj for obj in (descriptor, permission) for k in ('actor', 'approval_id')),
+            'agent motion cannot carry actor or approval_id')
+    require(descriptor.get('agent_execution') == dict(request_id=job['receipt'].get('agent_request_id')),
+            'agent motion request differs from execute job')
+    inventory = operations(source, require)
+    require(bool(inventory), 'agent motion requires a motion inventory')
+    expected = dict(run_id='run:' + descriptor['cell'], cell=descriptor['cell'], code_version=descriptor['version'],
+                    code_sha256=hashlib.sha256(source).hexdigest(),
+                    config_sha256=hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest(),
+                    action='agent_dev_tier_motion', action_version=1, execution_target='robocasa365_sim',
+                    risk='bounded simulated robot motion under existing SDK safety limits',
+                    scope=dict(operations=inventory, robot=config['robot'], task_id=config['task_id'], seed=config['seed'],
+                               sdk_calls=config['sdk_call_limit'], control_steps=config['horizon'], wall_seconds=config['attempt_wall_seconds']))
+    require(permission == expected, 'agent motion scope differs from frozen source/config binding')
+
+
 def require_result_permission(descriptor, require):
     require(descriptor.get('import_purpose') != PURPOSE
             and descriptor.get('permission_scope', {}).get('action') != ACTION,
