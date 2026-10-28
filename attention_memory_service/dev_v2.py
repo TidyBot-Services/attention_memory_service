@@ -658,7 +658,8 @@ class DevV2Evidence:
         require(native == bundle['native_evaluator'] and native['native_success'] == bundle['native_success'], 'native result differs from original bundle')
         for key in ('trace', 'native_result'):
             require(job['receipt'][key] == bundle['artifacts'][key], 'ledger raw receipt mismatch')
-        require(type(receipt['sdk_call_budget']['dispatched']) is int and 0 <= receipt['sdk_call_budget']['dispatched'] <= min(80, config['sdk_call_limit']) and type(receipt['control_steps']) is int and 0 <= receipt['control_steps'] <= min(2400, config['horizon']) and type(receipt['elapsed_seconds']) in (int, float) and math.isfinite(receipt['elapsed_seconds']) and 0 <= receipt['elapsed_seconds'] <= min(480, config['attempt_wall_seconds']) + 60, 'native resource receipt exceeds frozen bounds')
+        from .resource_receipt import valid as valid_resource_receipt
+        require(valid_resource_receipt(config, receipt), 'native resource receipt exceeds frozen bounds')
         require(job['receipt']['execution_status'] == bundle['status'] and job['actual'].get('executions') == 1 and job['actual'].get('sdk_calls') == receipt['sdk_call_budget']['dispatched'] and job['actual'].get('control_steps') == receipt['control_steps'] and job['actual'].get('execution_seconds') == receipt['elapsed_seconds'], 'native actual costs differ from original receipt')
         permission = d['permission_scope']
         require(d.get('import_purpose') in (None, 'memory_validation'), 'unknown execution import purpose')
@@ -1129,6 +1130,9 @@ class DevV2Evidence:
                              (memory_id, target_seed)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def generation_source(self, provenance, binding):
+        return self.source(provenance['source_import_id'])
+
     def _validation_generation(self, execution, ed, binding, plan, candidate):
         """Reconstruct arm lineage from executor files and its settled model job."""
         catalog_id = execution['catalog_id']
@@ -1164,7 +1168,7 @@ class DevV2Evidence:
         if 'public_feedback' in packet or self.ref(catalog_id, ed['manifest']).get('validation_origin'):
             from .memory_v2 import MemoryV2Manager
             provenance = self.validation_manager().provenance(binding['memory_id'])
-            source = self.source(provenance['source_import_id'])
+            source = self.generation_source(provenance, binding)
             failed, *_ = self.execution(source['failed_execution_import_id'])
             require(failed['source']['sha256'] == plan['origin_source_sha256'],
                     'generation feedback origin differs from plan')

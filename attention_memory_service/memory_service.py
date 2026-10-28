@@ -47,6 +47,8 @@ class MemoryService:
         self.cross_seed = CrossSeed(self)
         from .positive_controls import PositiveControls
         self.positive_controls = PositiveControls(self)
+        from .family import Family
+        self.family = Family(self)
 
     def register_dev_v2_catalog(self, **payload):
         return self.dev_v2.register_online(**payload)
@@ -74,6 +76,7 @@ class MemoryService:
                 'source_kind': 'advisor_proxy', **flags(self.v2.provenance(memory.memory_id))}
 
     def record_provisional_outcome(self, **payload) -> dict[str, Any]:
+        if payload['grant_id'].startswith('familyref:'):return self.family.outcome(**payload)
         return provisional_notes.record_outcome(self, **payload)
 
     def create_test_seeded_note(self, **payload) -> dict[str, Any]:
@@ -259,6 +262,8 @@ class MemoryService:
         source_policy_sha256: str, now: float, memory_version: int | None = None,
     ) -> dict[str, Any]:
         """Issue a separately tracked, scope-checked Dev guidance exposure."""
+        if self.family._read('candidates',memory_id) is not None:
+            return self.family.authorize_reference(memory_id=memory_id,development_id=development_id,context=context,source_policy_sha256=source_policy_sha256,now=now,memory_version=memory_version)
         return self.dev_use.authorize(
             memory_id=memory_id, development_id=development_id,
             context=context, source_policy_sha256=source_policy_sha256,
@@ -267,6 +272,7 @@ class MemoryService:
 
     @evidence_operation
     def get_dev_use(self, grant_id: str) -> dict[str, Any]:
+        if grant_id.startswith('familyref:'):return self.family.reference(grant_id)
         return self.dev_use.get(grant_id)
 
     @evidence_operation

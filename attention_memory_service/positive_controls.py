@@ -40,6 +40,20 @@ def validate_spec(spec):
     return digest(encoded(spec).encode())
 
 
+def origin_evidence(evidence, spec, execution_import_id, catalog_id, descriptor, old=None):
+    execution, ed, bundle, artifacts, cell, verdict, _ = evidence.verdict(execution_import_id, catalog_id, descriptor)
+    manifest = evidence.ref(execution['catalog_id'], execution['manifest'])
+    require(bundle['native_success'] is False and spec['origin'] == dict(experiment_id=manifest['experiment_id'],
+            cell=execution['cell'], version=execution['version']), 'positive-control origin must be exact imported failed execution')
+    require(spec['context'] == execution['context'] and spec['context']['seed'] == bundle['seed'], 'positive-control applicability must equal origin context')
+    feedback = evidence.ref(execution['catalog_id'], execution['public_feedback'])
+    signature = old['failure_signature'] if old else derive_signature(feedback)
+    require(matches_frozen_derivation(feedback, signature), 'positive-control frozen signature differs from public feedback')
+    require(verdict.get('failure_signature') == signature and verdict.get('signature_present') is True,
+            'origin validator signature differs from public feedback')
+    return execution, cell, signature
+
+
 class ControlView(SimpleNamespace):
     """Runtime input shape only; never a MemoryRecord or persisted memory status."""
     def artifact(self):
@@ -175,17 +189,7 @@ class PositiveControls:
     @evidence_operation
     def create(self, *, spec, spec_sha256, execution_import_id, catalog_id, descriptor):
         require(validate_spec(spec) == spec_sha256, 'positive-control spec digest mismatch')
-        execution, ed, bundle, artifacts, cell, verdict, _ = self.dev_v2.verdict(execution_import_id, catalog_id, descriptor)
-        manifest = self.dev_v2.ref(execution['catalog_id'], execution['manifest'])
-        require(bundle['native_success'] is False and spec['origin'] == dict(experiment_id=manifest['experiment_id'],
-                cell=execution['cell'], version=execution['version']), 'positive-control origin must be exact imported failed execution')
-        require(spec['context'] == execution['context'] and spec['context']['seed'] == bundle['seed'], 'positive-control applicability must equal origin context')
-        feedback = self.dev_v2.ref(execution['catalog_id'], execution['public_feedback'])
-        old = self._read('records', spec['control_id'])
-        signature = old['failure_signature'] if old else derive_signature(feedback)
-        require(matches_frozen_derivation(feedback, signature), 'positive-control frozen signature differs from public feedback')
-        require(verdict.get('failure_signature') == signature and verdict.get('signature_present') is True,
-                'origin validator signature differs from public feedback')
+        execution, cell, signature = origin_evidence(self.dev_v2, spec, execution_import_id, catalog_id, descriptor, self._read('records', spec['control_id']))
         value = dict(record_kind='positive_control', label=LABEL, excluded_from_results=True, spec=spec,
                      spec_sha256=spec_sha256, execution_import_id=execution_import_id, catalog_id=catalog_id,
                      descriptor=descriptor, failure_signature=signature, source_policy_sha256=execution['source']['sha256'],

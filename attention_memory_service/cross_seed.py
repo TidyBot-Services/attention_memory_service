@@ -67,6 +67,10 @@ class CrossSeed:
         require_profile_match(ctx, config_profile(config))
         require(config['seed'] == seed and config.get('scene_contract') == contract_ref,
                 'target seed/scene contract ref mismatch')
+        self.require_contract(contract_ref, seed, ctx)
+        return config
+
+    def require_contract(self, contract_ref, seed, ctx):
         # Deliberately require the M-8 contract role, even when an executor or
         # source catalog also happens to contain these bytes.
         with sqlite3.connect(self.store.path) as db:
@@ -83,7 +87,9 @@ class CrossSeed:
         require(found is not None, 'target needs a registered contract catalog at the exact digest')
         require(found.get('schema') == V2 and str(seed) in found.get('tasks', {}).get(ctx['task_id'], {}).get('seeds', {}),
                 'target requires a seed-keyed scene contract')
-        return config
+
+    def target_provenance(self, memory_id, seed, provenance):
+        return provenance
 
     @evidence_operation
     def probe(self, *, memory_id, target_seed, execution_import_id, catalog_id, descriptor, scene_contract_ref):
@@ -103,6 +109,7 @@ class CrossSeed:
         self._target(memory_id, target_seed, execution, scene_contract_ref)
         for ref in verdict.get('scene_replay_states', []):
             self.evidence.ref(catalog_id, ref)
+        p = self.target_provenance(memory_id, target_seed, p)
         require(execution['source']['sha256'] == p['source_policy_sha256'], 'probe must execute frozen origin source')
         clean = self.evidence.ref(execution['catalog_id'], ed['validation_input'])
         require(clean == dict(memory_ids=[], exposure='none', context=execution['context'],
@@ -161,6 +168,7 @@ class CrossSeed:
         request = probe['request']
         execution, *_ = self.evidence.verdict(request['execution_import_id'], request['catalog_id'], request['descriptor'])
         self._target(memory_id, target_seed, execution, probe['scene_contract_ref'])
+        p = self.target_provenance(memory_id, target_seed, p)
         origin_plan = self.service.v2.get_plan(memory_id)
         ctx = execution['context']
         value = dict(**profile_fields(ctx), profile='cross_seed_v1', memory_id=memory_id, memory_version=memory['version'],

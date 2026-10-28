@@ -311,6 +311,18 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                 value.pop(key, None)
         return value
 
+    @app.get('/dev-v2/family', dependencies=[Depends(authorized)])
+    def family_public():
+        return guarded(service.family.public)
+
+    @app.get('/dev-v2/family/{key}/{action}', dependencies=[Depends(importer_authorized)])
+    def family_read(key: str, action: str):
+        return guarded(service.family.read, key, action)
+
+    @app.post('/dev-v2/family/{action}', dependencies=[Depends(importer_authorized)])
+    def family_write(action: str, payload: dict):
+        return guarded(service.family.write, action, payload)
+
     @app.get('/dev-v2/positive-controls', dependencies=[Depends(authorized)])
     def positive_controls():
         return {'items': guarded(service.positive_controls.public)}
@@ -457,6 +469,8 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
             value.update(marker(level, trusted_here(item, level, provenance, payload.context)), source_seed=provenance.get('source_seed'),
                          source_task_id=item.applicability.get('task_id'))
             rows.append(value)
+        if 'same_family' in getattr(payload, 'match_levels', ['same_scene']):
+            rows.extend(guarded(service.family.references,payload.context))
         return rows
 
     @app.post("/use-grants", dependencies=[Depends(authorized)])
