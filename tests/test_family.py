@@ -234,3 +234,20 @@ def test_importer_only(tmp_path):
     app=create_app(s.store.path,api_key=key,importer_key=imp)
     assert sync_request(app,'/dev-v2/family/fixture-create',method='POST',key=key,payload=args)[0]==403
     assert sync_request(app,'/dev-v2/family/fixture-create',method='POST',key=key,importer_key=imp,payload=args)[0]==200
+
+
+@pytest.mark.parametrize('credits', [0, 2])
+def test_family_plan_maps_native_ledger_help_budget(tmp_path, monkeypatch, credits):
+    f,s,*_=setup(tmp_path);candidate(f,s)
+    f.task=TARGET;p=proxy(f,s)
+    args,_=target(f,p,114,failure=False)
+    p.cross_seed.probe(**args)
+    # Keep real imported evidence and alter only the returned allocation to
+    # exercise both zero and positive native ledger budgets.
+    execution=s.family.dev_v2.execution
+    def native_cell(import_id):
+        values=list(execution(import_id))
+        values[-1]=dict(values[-1],budget=dict(help_credits=credits))
+        return tuple(values)
+    monkeypatch.setattr(s.family.dev_v2,'execution',native_cell)
+    assert s.family.get_plan(f.mid)==dict(policy_id='full_trace_aware_attention_planner',assistance_credits=credits)

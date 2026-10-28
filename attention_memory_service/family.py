@@ -272,7 +272,7 @@ class Family:
         require(row is not None,'target probe required')
         probe=json.loads(row[0])
         _,_,_,_,cell=self.dev_v2.execution(probe['request']['execution_import_id'])
-        return dict(policy_id=cell['policy_id'],assistance_credits=cell['budget']['assistance_credits'])
+        return dict(policy_id=cell['policy_id'],assistance_credits=cell['budget']['help_credits'])
     def check(self,mid):
         r=self._read('checks',mid);require(r is not None,'frozen family check required');return r
     def target(self,mid,seed):

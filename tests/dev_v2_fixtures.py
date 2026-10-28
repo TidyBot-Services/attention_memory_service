@@ -75,7 +75,7 @@ class Fixture:
         bref = self.write(directory / 'bundle.json', bundle)
         feedback = self.write(directory / 'feedback.json', {**public_trace_projection(trace_value), 'evidence_kind': 'controlled_test'})
         validation_input = self.write(directory / 'validation-input.json', {'memory_ids': [] if exposure == 'none' else [memory_id], 'exposure': exposure, 'context': ctx, 'policy_sha256': source['sha256'], 'config_sha256': config_ref['sha256']})
-        cell = {'experiment_id': name, 'policy_id': bundle['policy_id'], 'budget': budget}
+        cell = {'experiment_id': name, 'policy_id': bundle['policy_id'], 'budget': {'help_credits': budget['assistance_credits']}}
         job = {'job_id': name + '-execute', 'cell': name, 'version': 1, 'kind': 'execute', 'claimed_at': 1.0, 'settled_at': 2.0, 'actual': {'executions': 1, 'sdk_calls': 1, 'control_steps': 1, 'execution_seconds': 1.0}, 'receipt': {'bundle': bref, 'trace': trace, 'native_result': native, 'execution_status': 'completed', 'public_feedback': feedback}}
         with sqlite3.connect(ledger) as db:
             db.executescript('CREATE TABLE v2_cells(id TEXT,exp TEXT,payload TEXT); CREATE TABLE v2_experiments(id TEXT,payload TEXT); CREATE TABLE v2_versions(cell TEXT,version INTEGER,payload TEXT); CREATE TABLE v2_jobs(id TEXT,cell TEXT,version INTEGER,kind TEXT,state TEXT,payload TEXT); CREATE TABLE v2_planner_requests(id TEXT,cell TEXT,payload TEXT);')
