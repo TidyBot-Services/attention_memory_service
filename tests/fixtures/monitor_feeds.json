@@ -1,0 +1,38 @@
+{
+  "family": {
+    "fixtures": [{
+      "fixture_id": "fixture-heading", "title": "Origin heading",
+      "guidance": "Rotate the grasp then lift.",
+      "label": "test · not counted in results",
+      "statement": "Operator preset; same-scene and cross-seed validation were skipped",
+      "statement_zh": "操作员预置，跳过了同场景和跨 seed 验证",
+      "user_quotes": ["Operator test confirmation"],
+      "operator_preset": true, "preset_levels": {"scene": "trusted", "task": "trusted"},
+      "revoked_at": null, "status": "operator_preset"
+    }],
+    "candidates": [{
+      "candidate_id": "family-heading", "title": "Grasp heading",
+      "guidance": "Adjust the grasp heading and lift in small increments.",
+      "original_guidance": "Rotate the grasp then lift.",
+      "from_source": {"kind": "fixture", "id": "fixture-heading", "title": "Origin heading", "version": 1},
+      "status": "candidate", "label": "test · not counted in results",
+      "decision": {"decision": "would be trusted for the family", "excluded_from_results": true},
+      "scenes": [{"target_seed": 114, "role": "neutral", "pairs_done": 3, "pairs_needed": 3, "verdict": "neutral_no_harm", "reason": "No harm"}],
+      "conditions": {"evidence_strength": "no harm only", "met": ["Source active"], "missing": ["Two scenes"], "neutral_only": true}
+    }],
+    "events": [{"kind": "fixture_created", "reason": "Operator preset", "fixture_id": "fixture-heading"}]
+  },
+  "cross_seed_queue": {
+    "queue": [{
+      "memory_id": "note /+&?中文", "version": 1, "title": "Exact cup", "source_seed": 102,
+      "uses": 2, "failure_gone": 1, "created_at": 1,
+      "seeds": [{"target_seed": 114, "role": "transfer", "pairs_done": 5, "pairs_needed": 5, "verdict": "transfer_passed", "reason": "Worked here"}],
+      "task_trust": {"trust_scope": "scene_scoped", "scenes": 2, "missing": ["One more scene"]}
+    }]
+  },
+  "cross_seed_status": {
+    "memory_id": "note /+&?中文",
+    "seeds": [{"target_seed": 114, "role": "transfer", "pairs_done": 5, "pairs_needed": 5, "verdict": "transfer_passed", "reason": "Worked here"}],
+    "task_trust": {"trust_scope": "scene_scoped", "scenes": 2, "missing": ["One more scene"]}
+  }
+}
