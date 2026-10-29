@@ -47,7 +47,7 @@ def progress(value):
 
 def create(service, *, actor, memory_id, context, guidance, failure_signature, origin,
            origin_public_feedback_text, help_public_feedback_text,
-           title=None, summary=None, group=None, ttl_days=14, from_run_note=None):
+           title=None, summary=None, group=None, ttl_days=14, from_run_note=None, agent_evidence=None):
     for name, value in (('actor', actor), ('memory_id', memory_id), ('guidance', guidance)):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'{name} is required')
@@ -62,7 +62,8 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
     display = {key: validate(value) for key, value, validate in (
         ('title', title, validate_title), ('summary', summary, validate_summary),
         ('group', group, validate_group)) if value is not None}
-    if not isinstance(origin, dict) or set(origin) != ORIGIN_KEYS:
+    agent = isinstance(origin, dict) and origin.get('channel') == 'dev_agent'
+    if not isinstance(origin, dict) or set(origin) != (ORIGIN_KEYS | {'channel'} if agent else ORIGIN_KEYS):
         raise ValueError('origin requires exactly the documented fields')
     if any(not isinstance(origin[k], str) or not origin[k].strip()
            for k in ('experiment_id', 'cell', 'policy_id', 'eval_reason_class')):
@@ -75,9 +76,18 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
             or origin['effective_reason'] not in ('signature_changed', 'progressed')):
         raise ValueError('invalid origin provider or effective_reason')
     digests = origin['digests']
-    if (not isinstance(digests, dict) or set(digests) != DIGEST_KEYS
+    keys = (DIGEST_KEYS - {'help_model_input'} | {'agent_help_evidence'}) if agent else DIGEST_KEYS
+    if (not isinstance(digests, dict) or set(digests) != keys
             or any(not isinstance(v, str) or not SHA.fullmatch(v) for v in digests.values())):
         raise ValueError('origin digests must be SHA-256 hex strings')
+    if agent:
+        from .agent_provisional import verify
+        verify(origin, guidance, agent_evidence)
+        if (agent_evidence['refs']['origin_public_feedback'] != origin_public_feedback_text
+                or agent_evidence['refs']['help_public_feedback'] != help_public_feedback_text):
+            raise StateConflictError('agent feedback differs from evidence')
+    elif agent_evidence is not None:
+        raise ValueError('agent evidence requires dev_agent origin')
     before = feedback(origin_public_feedback_text, digests['origin_public_feedback'])
     after = feedback(help_public_feedback_text, digests['help_public_feedback'])
     validate_signature(failure_signature, before)
@@ -93,6 +103,8 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
                      origin_public_feedback_text=origin_public_feedback_text,
                      help_public_feedback_text=help_public_feedback_text, ttl_days=ttl_days,
                      title=title, summary=summary, group=group)
+    if agent:
+        requested['agent_evidence'] = agent_evidence
     if from_run_note is not None:
         if (not isinstance(from_run_note, dict)
                 or set(from_run_note) != {'experiment_id', 'cell', 'version', 'run_note_id'}
@@ -118,7 +130,7 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
         artifact = dict(kind='text_hint', guidance=guidance, repair='Importer-attested guidance; no validated repair.',
                         applicability=context, failure_signature=failure_signature)
         provenance = dict(schema_version='attentionbench.memory-provenance.v2',
-                          channel='dev_v2_provisional', source_kind='advisor_proxy',
+                          channel='dev_agent' if agent else 'dev_v2_provisional', source_kind='advisor_proxy',
                           trust_scope='provisional', unvalidated=True, excluded_from_results=True,
                           attested_by='offline_importer', origin=origin, layer='scene',
                           **({'from_run_note': from_run_note} if from_run_note is not None else {}),

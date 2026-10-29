@@ -101,7 +101,7 @@ class DevMemoryUse:
                 level == SAME_SCENE or trusted_here(memory, level, provenance, context))
             marker = {**marker, **level_marker(level, trusted),
                       'source_task_id': current.get('applicability', context).get('task_id')}
-            if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
+            if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional', 'dev_agent'}:
                 marker.update(source_seed=provenance.get('source_seed'),
                               note_sdk_sha256=memory.applicability.get('sdk_sha256'))
             row = db.execute(
@@ -224,7 +224,7 @@ class DevMemoryUse:
             raise StateConflictError("unknown Dev Memory grant")
         record = json.loads(row[0])
         provenance = self.service.v2._provenance(record['memory_id'])
-        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
+        if provenance and provenance.get('channel') in {'dev_v2', 'test_seeded', 'dev_v2_provisional', 'dev_agent'}:
             # New-channel reads release guidance again. Preserve the legacy
             # historical-read API; enforce live eligibility on Dev v2 grants.
             with sqlite3.connect(self.service.store.path) as db:
@@ -257,7 +257,7 @@ class DevMemoryUse:
             # Layered grants have just rechecked their source note. Legacy
             # grants were exact-task reads and retain their original context.
             record['source_task_id'] = (found.applicability if provenance and provenance.get('channel')
-                in {'dev_v2', 'test_seeded', 'dev_v2_provisional'} else record['context']).get('task_id')
+                in {'dev_v2', 'test_seeded', 'dev_v2_provisional', 'dev_agent'} else record['context']).get('task_id')
         return _online_grant(record)
 
 

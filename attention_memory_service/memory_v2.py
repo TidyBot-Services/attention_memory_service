@@ -430,7 +430,7 @@ class MemoryV2Manager:
                     or value['artifact'].get('failure_signature') != source.get('failure_signature')):
                 raise StateConflictError("Dev v2 source/Memory binding changed")
             return value
-        if value.get('channel') == 'dev_v2_provisional':
+        if value.get('channel') in {'dev_v2_provisional', 'dev_agent'}:
             if (not is_provisional(value)
                     or memory.applicability != value['artifact']['applicability']
                     or memory.source_trace_id != value['source_trace_id']

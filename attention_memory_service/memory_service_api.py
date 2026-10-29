@@ -239,6 +239,7 @@ class ProvisionalNoteInput(BaseModel):
     failure_signature: dict[str, Any]
     origin: dict[str, Any]
     from_run_note: dict | None = None
+    agent_evidence: dict | None = None
     origin_public_feedback_text: str
     help_public_feedback_text: str
     title: str | None = None
