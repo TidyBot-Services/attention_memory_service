@@ -417,9 +417,11 @@ class MemoryV2Manager:
             raise StateConflictError("memory artifact differs from core record")
         if _digest(_encoded(value["artifact"]).encode()) != value["artifact_sha256"]:
             raise StateConflictError("memory artifact digest mismatch")
-        if value.get("channel") == "dev_v2":
+        if value.get("channel") == "dev_v2" or value.get("channel") == "dev_agent" and value.get("source_import_id"):
             from .dev_v2 import DevV2Evidence, SCOPE
             source = DevV2Evidence(self.store).source(value["source_import_id"])
+            if value.get("channel") == "dev_agent" and source.get("channel") != "dev_agent":
+                raise StateConflictError("agent source channel differs")
             if (memory.applicability != value["artifact"]["applicability"]
                     or not profile_matches(memory.applicability, source["context"])
                     or any(memory.applicability.get(k) != source["context"][k] for k in SCOPE)

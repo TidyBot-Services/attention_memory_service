@@ -1,4 +1,4 @@
-"""Agent execution evidence only; validation/source authority remains Dev v2-only."""
+"""Agent execution evidence only; origin replay uses a separate import purpose."""
 import json
 
 from .dev_v2 import digest, require
@@ -15,7 +15,7 @@ def verify(importer, catalog_id, d, bundle, config, manifest, record, cell, job)
             'agent public_base_yaw_visible must be a sealed bool')
     require(not any(k in obj for obj in (d, d['permission_scope'], d.get('agent_execution', {}), bundle)
                     for k in ('actor', 'approval_id')), 'agent evidence cannot carry actor or approval_id')
-    require(d.get('import_purpose') is None and 'validation_input' not in d
+    require(d.get('import_purpose') in (None, 'memory_origin') and 'validation_input' not in d
             and not any(obj.get(k) for obj in (cell, config, manifest, manifest.get('selection', {}))
                         for k in ('validation_experiment', 'positive_control', 'origin_dev_lock')),
             'agent offline validation and positive controls are unsupported')

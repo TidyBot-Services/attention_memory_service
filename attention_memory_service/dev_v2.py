@@ -658,6 +658,7 @@ class DevV2Evidence:
             job = self._job(db, d['execute_job_id'], d['cell'], d['version'], 'execute')
         bundle = self.ref(catalog_id, job['receipt']['bundle'])
         base_yaw_visible = public_base_yaw_visible(bundle, config)
+        require((bundle.get('channel') == 'dev_agent') == (cell.get('dev_mode') == 'agent'), 'bundle channel differs from frozen cell mode')
         if bundle.get('channel') == 'dev_agent':
             from .agent_execution import verify as verify_agent_execution
             verify_agent_execution(self, catalog_id, d, bundle, config, manifest, record, cell, job)
@@ -678,7 +679,8 @@ class DevV2Evidence:
         require(valid_resource_receipt(config, receipt), 'native resource receipt exceeds frozen bounds')
         require(job['receipt']['execution_status'] == bundle['status'] and job['actual'].get('executions') == 1 and job['actual'].get('sdk_calls') == receipt['sdk_call_budget']['dispatched'] and job['actual'].get('control_steps') == receipt['control_steps'] and job['actual'].get('execution_seconds') == receipt['elapsed_seconds'], 'native actual costs differ from original receipt')
         permission = d['permission_scope']
-        require(d.get('import_purpose') in (None, 'memory_validation'), 'unknown execution import purpose')
+        require(d.get('import_purpose') in (None, 'memory_validation', 'memory_origin'), 'unknown execution import purpose')
+        if d.get('import_purpose') == 'memory_origin':require(bundle.get('channel') == 'dev_agent', 'agent origin purpose required')
         require(all(permission.get(k) == v for k, v in {'run_id': bundle['run_id'], 'cell': d['cell'], 'code_version': d['version'], 'code_sha256': bundle['policy_sha256'], 'config_sha256': digest(json.dumps(config, sort_keys=True, ensure_ascii=False, allow_nan=False).encode())}.items()), 'permission scope not bound to exact run/code/config/version')
         require(type(permission.get('code_version')) is int and type(permission.get('action_version')) is int and permission['action_version'] == 1 and isinstance(permission.get('scope'), dict) and permission['scope'], 'explicit permission action/version/scope required')
         if permission.get('action') == 'agent_dev_tier_motion':
@@ -741,7 +743,8 @@ class DevV2Evidence:
 
     def verdict(self, import_id, validator_id, descriptor, *, for_validation=True):
         execution, d, bundle, artifacts, cell = self.execution(import_id)
-        require(bundle.get('channel') != 'dev_agent', 'agent offline validation and source evidence are unsupported')
+        if bundle.get('channel') == 'dev_agent':
+            require(d.get('import_purpose') == 'memory_origin', 'agent offline validation is restricted to origin purpose')
         validator = self.catalog(validator_id, 'validator')
         executor = self.catalog(execution['catalog_id'], 'executor')
         require(not Path(validator['root']).is_relative_to(executor['root']) and not Path(executor['root']).is_relative_to(validator['root']), 'validator root must be independent of executor')
@@ -775,6 +778,13 @@ class DevV2Evidence:
                 else:
                     matched = [verify_v2_receipt(contract, config, receipt['state'], receipt['validation']) for receipt in states]
                 require(all(matched), 'full fixture/robot/object scene reproduction failed')
+        if bundle.get('channel') == 'dev_agent':
+            from .agent_origin import verify_replays
+            config = self.ref(execution['catalog_id'], execution['config'])
+            if d.get('source_drift') is not None:
+                config = dict(config, dev_lock=d.get('current_lock', self.ref(execution['catalog_id'], d['manifest'])['identity_lock']), origin_dev_lock=config['dev_lock'])
+            verify_replays(v.get('agent_policy_replays'), lambda ref,raw=False: self.ref(validator_id, ref,raw=raw),
+                           config, bundle['policy_sha256'], validator['root'])
         safety_path = self._path(validator, str(Path(v['safety']['uri']).relative_to(validator['root'])))
         self.ref(validator_id, v['safety'])
         from .memory_v2 import MemoryV2Manager
@@ -929,6 +939,8 @@ class DevV2Evidence:
         _, manifest, config, record, repair, cell = self._base(catalog_id, d)
         failed, fd, bundle, artifacts, _, verdict, _ = self.verdict(d['failed_execution_import_id'], d['validator_id'], d['validation_descriptor'], for_validation=False)
         require(bundle['native_success'] is False and failed['cell'] == d['cell'] and failed['version'] == d['version'] - 1 and failed['context'] == d['context'], 'source must be previous independent native-confirmed failed attempt in exact scope')
+        if cell.get('dev_mode') == 'agent':
+            return self._agent_source(import_id, catalog_id, descriptor, d, manifest, config, record, repair, cell, failed, bundle)
         with self._ledger(catalog_id, d) as db:
             advisor = self._job(db, d['advisor_job_id'], d['cell'], d['version'], 'advisor')
             model = self._job(db, d['model_job_id'], d['cell'], d['version'], 'model')
@@ -1016,6 +1028,35 @@ class DevV2Evidence:
         self._put('dev_v2_imports', import_id, stored, kind='source')
         return evidence
 
+    def _agent_source(self, import_id, catalog_id, descriptor, d, manifest, config, record, repair, cell, failed, bundle):
+        from .agent_origin import verify_source, PURPOSE
+        require(d.get('import_purpose') == PURPOSE and failed.get('channel') == 'dev_agent'
+                and bundle.get('channel') == 'dev_agent' and 'request_id' not in d
+                and not {'model_job_id', 'advisor_job_id'} & set(d), 'agent source requires origin purpose')
+        refs = d['agent_origin']
+        read = lambda ref, raw=False: self.ref(catalog_id, ref, raw=raw)
+        with self._ledger(catalog_id, d) as db:
+            projection = verify_source(refs, read, db, dict(cell, key=d['cell']), record, manifest, config)
+        require(d.get('feedback_projection') == projection['feedback_projection'], 'agent feedback projection differs')
+        require(refs['origin_source']['sha256'] == failed['source']['sha256']
+                and refs['origin_public_feedback']['sha256'] == failed['public_feedback']['sha256'], 'agent source origin differs from failed execution')
+        guidance = read(refs['help'])['content']
+        signature = d.get('failure_signature')
+        require(signature is not None, 'agent source failure signature required')
+        validate_signature(signature, self.ref(failed['catalog_id'], failed['public_feedback']))
+        public(guidance); public(repair.decode())
+        evidence = dict(kind='source', channel='dev_agent', catalog_id=catalog_id, descriptor=descriptor,
+            failed_execution_import_id=d['failed_execution_import_id'], context=d['context'], request_id=None,
+            cell=d['cell'], version=d['version'], guidance=guidance, repair=repair.decode(), failure_signature=signature,
+            source_policy_sha256=failed['source']['sha256'], repair_sha256=record['source']['sha256'],
+            source_policy_id=cell['policy_id'], source_seed=config['seed'], source_run_id=bundle['run_id'],
+            source_attempt_id=bundle['attempt_id'], advisor_evidence='agent_help_evidence', origin_digests={k:r['sha256'] for k,r in refs.items()}, **projection)
+        if d.get('source_drift') is not None:evidence['source_drift']=d['source_drift']
+        for k, validate in (('title', validate_title), ('summary', validate_summary), ('group', validate_group)):
+            if k in d:evidence[k]=validate(d[k])
+        self._put('dev_v2_imports', import_id, evidence, kind='source')
+        return evidence
+
     @memo_evidence('source')
     def source(self, import_id):
         old = self.get(import_id)
@@ -1035,6 +1076,7 @@ class DevV2Evidence:
         if s['failure_signature'] is not None:
             artifact['failure_signature'] = s['failure_signature']
         provenance = {'schema_version': 'attentionbench.memory-provenance.v2', 'channel': 'dev_v2', 'source_import_id': source_import_id, 'memory_id': memory_id, 'source_kind': 'advisor_proxy', 'human_attention_seconds': 0.0, 'assistance_credits': 1, 'source_trace_id': 'dev-v2-source:' + source_import_id, 'source_raw_trace_id': 'dev-v2-source:' + source_import_id, 'raw_evidence_refs': [], 'artifact': artifact, 'artifact_sha256': digest(encoded(artifact).encode()), **{k: s[k] for k in ('source_policy_id', 'source_policy_sha256', 'source_seed', 'source_run_id', 'source_attempt_id')}}
+        if s.get('channel') == 'dev_agent':provenance['channel']='dev_agent'
         if from_provisional is not None:
             from .seeded_notes import is_provisional
             require(isinstance(from_provisional, str) and from_provisional,
@@ -1047,6 +1089,13 @@ class DevV2Evidence:
             require(is_provisional(prior) and note is not None
                     and note.applicability.get('task_id') == s['context']['task_id']
                     and prior.get('source_seed') == s['source_seed'], 'from_provisional scope mismatch')
+            if s.get('channel') == 'dev_agent':
+                origin = prior.get('origin', {})
+                require(prior.get('channel') == origin.get('channel') == 'dev_agent'
+                        and origin.get('cell') == s['cell'] and origin.get('help_version') == s['version']
+                        and origin.get('digests') == s['origin_digests']
+                        and prior.get('failure_signature') == s['failure_signature']
+                        and prior['artifact']['guidance'] == s['guidance'], 'agent provisional source differs')
             require_profile_match(note.applicability, s['context'])
             require(re.fullmatch(r'p-[0-9a-f]{24}', from_provisional) or prior.get('demoted_at') is not None,
                     'invalid from_provisional id')

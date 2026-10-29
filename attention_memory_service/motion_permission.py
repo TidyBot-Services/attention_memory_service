@@ -74,7 +74,7 @@ def verify_agent(permission, descriptor, config, bundle, source, job, require):
 
 
 def require_result_permission(descriptor, require):
-    require(descriptor.get('import_purpose') != PURPOSE
+    require(descriptor.get('import_purpose') not in (PURPOSE, 'memory_origin')
             and descriptor.get('permission_scope', {}).get('action') != ACTION,
             'Memory validation-only evidence cannot record results or trusted use')
 
