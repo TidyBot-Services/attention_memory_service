@@ -7,7 +7,7 @@ ARM_BUDGET=dict(formal_versions=1,moving_executions=5,read_only_probes=60,eval_r
     execution_wall_seconds=1920,active_wall_seconds=1920,model_turns=None,tokens=None)
 
 
-def shape(manifest,cell,config):
+def shape(importer,catalog_id,manifest,cell,config):
     selection=manifest.get('selection',{});origin=manifest.get('validation_origin',{})
     require(manifest.get('schema')=='attentionbench.dev-experiment.v3' and manifest.get('formal_eligible') is False
         and config.get('budget_tier')=='dev' and config.get('runner_boundary')=='dev_loop'
@@ -17,8 +17,17 @@ def shape(manifest,cell,config):
         and set(origin)=={'manifest','config','source','cell','version'}
         and manifest.get('agent_budget')==ARM_BUDGET
         and all(type(manifest['agent_budget'].get(k)) is type(v) for k,v in ARM_BUDGET.items()), 'exact agent validation manifest/budget required')
+    # Resolve and digest-check the origin independently through registered evidence.
+    ref=origin['manifest']
+    original=importer.ref(importer._catalog_for_ref(catalog_id,ref,'executor'),ref)
+    models={k:original.get(k) for k in ('dev_model','dev_reasoning_effort','eval_model')}
+    allowed={'gpt-6.1-sol','gpt-6-astra','gpt-6-sol'}
+    require(original.get('dev_mode')=='agent' and all(type(v) is str for v in models.values())
+        and models['dev_model'] in allowed and models['eval_model'] in allowed
+        and models['dev_reasoning_effort'] in ('low','medium','high'), 'unsupported agent validation origin models')
+    require(all(manifest.get(k)==selection.get(k)==v for k,v in models.items()), 'agent validation models differ from origin')
     expected=dict(mode='diagnostic',help_budget=0,run_notes=False,memory_family=False,target_depth=1,
-        target_valid_executions=1,max_versions=1,reproducible_reset=True,attempt_wall_seconds=1920,dev_model='gpt-6-astra')
+        target_valid_executions=1,max_versions=1,reproducible_reset=True,attempt_wall_seconds=1920)
     require(all(selection.get(k)==v and type(selection.get(k)) is type(v) for k,v in expected.items()) and config.get('attempt_wall_seconds')==1920
         and selection.get('tasks')==[config['task_id']] and selection.get('seeds')==[config['seed']]
         and selection.get('policies')==[cell['policy_id']] and selection.get('scene_contract')==config.get('scene_contract')
@@ -34,7 +43,7 @@ def shape(manifest,cell,config):
 
 
 def usage(importer,catalog_id,d,manifest,record,cell,job):
-    config=importer.ref(catalog_id,d['config']);shape(manifest,cell,config)
+    config=importer.ref(catalog_id,d['config']);shape(importer,catalog_id,manifest,cell,config)
     require(type(d['version']) is int and d['version']==1,'agent validation requires one formal version')
     limits={k:ARM_BUDGET[k] for k in ('formal_versions','moving_executions','read_only_probes','eval_runs','help','trial_runs')}
     with importer._ledger(catalog_id,d) as db:
@@ -119,7 +128,7 @@ def invalid(manager,evidence,*,memory_id,validation_grant_id,execution_import_id
                 if json.loads(p)['resources'].get('formal_versions')==1 and state=='settled']
             require(len(original)==1 and len(formal)==1 and formal[0]['receipt'].get('version_id')=='v0001'
                 and grant['issued_at']<=original[0]<=formal[0]['claimed_at'],'invalid submission lacks its original dispatch binding')
-    shape(manifest,cell,config)
+    shape(evidence,cid,manifest,cell,config)
     require(experiment['manifest']==value['manifest'] and cell.get('state')=='invalid_generation' and cell.get('reason')==value['reason']
         and cell.get('owner') is None and cell.get('experiment_eligible') is False
         and value['config']['sha256']==binding['config_sha256'] and config['seed']==binding['seed'], 'original invalid agent state required')

@@ -41,7 +41,7 @@ def test_service_refuses_non_arm_manifests(tmp_path,monkeypatch,fault):
     f=fixture(tmp_path,monkeypatch)
     try:
         with synthetic_creation(f.native):
-            batch=f.provision(f.note,'service-operation-001')
+            batch=f.runner.begin(dict(f.note,created_at=f.service.get_memory(f.note['memory_id']).created_at),'service-operation-001')
             store=DevV2Store(next(iter(batch['cells'].values()))['ledger'])
             manifest=dev_experiment.verify_manifest(dev_experiment.snapshot(store,batch['experiment_id']))
             cell=store.cell(batch['pairs'][0]['control_cell']);config=next(iter(manifest['configs'].values()))
@@ -53,7 +53,8 @@ def test_service_refuses_non_arm_manifests(tmp_path,monkeypatch,fault):
             elif fault=='notes':cell['run_notes']=True
             elif fault=='mixed':manifest['cells'][1]['seed']+=1
             else:cell['excluded_from_results']=False
-            with pytest.raises(StateConflictError):agent_validation.shape(manifest,cell,config)
+            with pytest.raises(StateConflictError):
+                agent_validation.shape(f.service.dev_v2,batch['failed_execution']['catalog_id'],manifest,cell,config)
     finally:f.runner.pool.shutdown()
 
 
@@ -73,4 +74,36 @@ def test_missing_formal_is_inconclusive_never_a_trial(tmp_path,monkeypatch):
             from benchmarks.attention_harness.tests.autovalidate_fakes import outcome
             outcome(f.service,f.note['memory_id'],1,ctx=dict(f.context,namespace='offline-agent-origin'))
             assert [n['memory_id'] for n in f.service.validation_queue()]==[f.note['memory_id']]
+    finally:f.runner.pool.shutdown()
+
+
+@pytest.mark.parametrize('field',['dev_model','dev_reasoning_effort','eval_model'])
+@pytest.mark.parametrize('fault',['selection','manifest','both','unsupported_origin','origin_digest'])
+def test_service_independently_checks_origin_models(tmp_path,monkeypatch,field,fault):
+    f=fixture(tmp_path,monkeypatch)
+    try:
+        with synthetic_creation(f.native):
+            batch=f.runner.begin(dict(f.note,created_at=f.service.get_memory(f.note['memory_id']).created_at),'service-models-001')
+            store=DevV2Store(next(iter(batch['cells'].values()))['ledger'])
+            experiment=dev_experiment.snapshot(store,batch['experiment_id'])
+            manifest=dev_experiment.verify_manifest(experiment)
+            cell=store.cell(batch['pairs'][0]['control_cell']);config=next(iter(manifest['configs'].values()))
+            evidence=f.service.dev_v2
+            cid=batch['failed_execution']['catalog_id']
+            assert agent_validation.shape(evidence,cid,manifest,cell,config) is None
+            value='medium' if field=='dev_reasoning_effort' else 'gpt-6-sol'
+            if fault in ('selection','both'):manifest['selection'][field]=value
+            if fault in ('manifest','both'):manifest[field]=value
+            if fault=='unsupported_origin':
+                ref=evidence.ref
+                def changed(catalog_id,artifact,**kw):
+                    original=ref(catalog_id,artifact,**kw)
+                    if artifact==manifest['validation_origin']['manifest']:
+                        original=deepcopy(original);original[field]='unsupported'
+                    return original
+                monkeypatch.setattr(evidence,'ref',changed)
+            if fault=='origin_digest':
+                path=Path(manifest['validation_origin']['manifest']['uri']);path.chmod(0o600);path.write_text('{}')
+            with pytest.raises(StateConflictError,match='origin models|models differ from origin|digest changed'):
+                agent_validation.shape(evidence,cid,manifest,cell,config)
     finally:f.runner.pool.shutdown()
