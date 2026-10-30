@@ -20,6 +20,11 @@ def shape(importer,catalog_id,manifest,cell,config):
     # Resolve and digest-check the origin independently through registered evidence.
     ref=origin['manifest']
     original=importer.ref(importer._catalog_for_ref(catalog_id,ref,'executor'),ref)
+    version=original.get('agent_policy_version','agent-policy-v1')
+    require(version in ('agent-policy-v1','agent-policy-v2')
+        and all(row.get('agent_policy_version','agent-policy-v1')==version
+            for row in (manifest,selection,cell,config,*manifest['cells'],*manifest['configs'].values())),
+        'agent validation policy version differs from origin')
     models={k:original.get(k) for k in ('dev_model','dev_reasoning_effort','eval_model')}
     allowed={'gpt-6.1-sol','gpt-6-astra','gpt-6-sol'}
     require(original.get('dev_mode')=='agent' and all(type(v) is str for v in models.values())

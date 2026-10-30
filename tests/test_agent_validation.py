@@ -107,3 +107,24 @@ def test_service_independently_checks_origin_models(tmp_path,monkeypatch,field,f
             with pytest.raises(StateConflictError,match='origin models|models differ from origin|digest changed'):
                 agent_validation.shape(evidence,cid,manifest,cell,config)
     finally:f.runner.pool.shutdown()
+
+
+@pytest.mark.parametrize('origin_version',[None,'agent-policy-v2'])
+@pytest.mark.parametrize('fault',['selection','manifest','config','cell','both'])
+def test_service_independently_checks_origin_policy_epoch(tmp_path,monkeypatch,fault,origin_version):
+    f=fixture(tmp_path,monkeypatch,policy_version=origin_version)
+    wrong='agent-policy-v1' if origin_version=='agent-policy-v2' else 'agent-policy-v2'
+    try:
+        with synthetic_creation(f.native):
+            batch=f.runner.begin(dict(f.note,created_at=f.service.get_memory(f.note['memory_id']).created_at),'service-policy-epoch-001')
+            store=DevV2Store(next(iter(batch['cells'].values()))['ledger'])
+            manifest=dev_experiment.verify_manifest(dev_experiment.snapshot(store,batch['experiment_id']))
+            cell=store.cell(batch['pairs'][0]['control_cell']);config=next(iter(manifest['configs'].values()))
+            row={'selection':manifest['selection'],'manifest':manifest,'config':config,'cell':cell}.get(fault)
+            if fault=='both':
+                for row in (manifest,manifest['selection'],cell,config,*manifest['cells']):
+                    row['agent_policy_version']=wrong
+            else:row['agent_policy_version']=wrong
+            with pytest.raises(StateConflictError,match='policy version differs from origin'):
+                agent_validation.shape(f.service.dev_v2,batch['failed_execution']['catalog_id'],manifest,cell,config)
+    finally:f.runner.pool.shutdown()
