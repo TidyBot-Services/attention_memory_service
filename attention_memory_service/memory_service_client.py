@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord
@@ -84,6 +84,15 @@ class MemoryServiceClient:
 
     def validation_queue(self):
         return self._call('GET', '/dev-v2/validation-queue')['items']
+
+    def family_list(self) -> dict[str, Any]:
+        return self._call('GET', '/dev-v2/family')
+
+    def cross_seed_queue(self) -> list[dict[str, Any]]:
+        return self._call('GET', '/dev-v2/cross-seed/queue')['queue']
+
+    def cross_seed_status(self, *, memory_id: str) -> dict[str, Any]:
+        return self._call('GET', '/dev-v2/cross-seed/status?' + urlencode({'memory_id': memory_id}))
 
     def memory_events(self, *, after=0):
         if type(after) is not int or after < 0:
