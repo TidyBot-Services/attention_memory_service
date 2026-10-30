@@ -161,11 +161,13 @@ class MemoryV2Manager:
         provenance = self.provenance(memory_id)
         self.verify_source_evidence(memory_id)
         memory = self.store.get_memory(memory_id)
+        if provenance.get('channel')=='dev_agent' and (plan.get('profile')!='single_scene_v1' or plan.get('arm_generation')!='dev_from_origin'):
+            raise StateConflictError('agent validation is single-scene dev_from_origin only')
         if memory is None or memory.status is not MemoryStatus.CANDIDATE:
             raise StateConflictError("validation plan requires a candidate memory")
         applicability = provenance["artifact"]["applicability"]
         require_profile_match(applicability, plan)
-        if provenance.get('channel') == 'dev_v2':
+        if provenance.get('channel') in {'dev_v2','dev_agent'}:
             from .dev_v2 import SCOPE, AXES
             if any(plan.get(k) != applicability[k] for k in SCOPE if k not in AXES):
                 raise StateConflictError('validation plan needs exact SDK/namespace/robot scope')
@@ -241,7 +243,7 @@ class MemoryV2Manager:
 
     def _record_single_scene_plan(self, memory_id, plan, provenance):
         from .dev_v2 import SCOPE, AXES, SHA
-        if provenance.get('channel') != 'dev_v2' or not provenance.get('failure_signature'):
+        if provenance.get('channel') not in {'dev_v2','dev_agent'} or not provenance.get('source_import_id') or not provenance.get('failure_signature'):
             raise StateConflictError('single-scene profile needs a frozen Dev v2 failure signature')
         seed = provenance['source_seed']
         case = {'seed': seed, **{k: provenance['artifact']['applicability'][k] for k in AXES}}
@@ -252,6 +254,8 @@ class MemoryV2Manager:
         context = DevV2Evidence(self.store).source(source['source_import_id'])['context']
         case.update(camera_names=context['camera_names'], task_prompt=context['task_prompt'])
         validate_single_scene_plan(plan, context, seed, case, provenance['failure_signature'], provenance['source_policy_sha256'])
+        if provenance.get('channel')=='dev_agent' and plan.get('arm_generation')!='dev_from_origin':
+            raise StateConflictError('agent validation requires dev_from_origin')
         encoded = _encoded(plan)
         with sqlite3.connect(self.store.path) as db:
             row = db.execute('SELECT payload FROM memory_v2_plans WHERE memory_id=?', (memory_id,)).fetchone()
@@ -565,7 +569,7 @@ class MemoryV2Manager:
                 continue
             provenance = self._provenance(memory.memory_id)
             if (memory.status is MemoryStatus.TRUSTED and provenance
-                    and provenance.get('channel') in {'dev_v2', 'test_seeded'}
+                    and provenance.get('channel') in {'dev_v2', 'dev_agent', 'test_seeded'}
                     or memory.status is MemoryStatus.PROVISIONAL and is_provisional(provenance)):
                 matches.append(memory)
         result = []
@@ -585,7 +589,7 @@ class MemoryV2Manager:
         if not profile_matches(item.applicability, context):
             return None
         from .dev_v2 import SCOPE
-        if is_provisional(provenance) and provenance.get('channel') == 'dev_v2':
+        if is_provisional(provenance) and (provenance.get('channel') == 'dev_v2' or provenance.get('channel')=='dev_agent' and provenance.get('source_import_id')):
             plan = self.get_plan(item.memory_id)
             case = plan['cases'][0]
             if not set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}:
@@ -635,7 +639,7 @@ class MemoryV2Manager:
                     or context.get('task_prompt') != plan['cases'][0]['task_prompt']):
                 return False
         if 'sdk_sha256' in context or 'namespace' in context:
-            if provenance.get('channel') != 'dev_v2' or not same_scene(item.applicability, context, SCOPE):
+            if provenance.get('channel') not in {'dev_v2','dev_agent'} or not same_scene(item.applicability, context, SCOPE):
                 return False
         elif not _matches(item.applicability, context):
             # Legacy notes keep the core exact-condition match.
@@ -734,7 +738,7 @@ class MemoryV2Manager:
         for trial in (control, treatment):
             require_profile_match(provenance["artifact"]["applicability"],
                                   trial.get("context") or trial.get("memory_context") or {})
-        if provenance.get("channel") == "dev_v2":
+        if provenance.get("channel") in {"dev_v2","dev_agent"}:
             from .dev_v2 import SCOPE, AXES
             for trial in (control, treatment):
                 if trial.get('validation_memory_id') != memory_id:
@@ -857,7 +861,7 @@ class MemoryV2Manager:
             treatment = self._trial(pair["treatment_attempt_id"])
             for trial in (control,treatment):
                 if trial.get('source_drift') and trial['source_drift'] not in source_drifts:source_drifts.append(trial['source_drift'])
-            if provenance.get('channel') == 'dev_v2' and any(
+            if provenance.get('channel') in {'dev_v2','dev_agent'} and any(
                     trial.get('validation_memory_id') != memory_id for trial in (control, treatment)):
                 raise StateConflictError('pair arm grant belongs to another memory')
             if not control["policy_sha256"] or (not generated and control["policy_sha256"] != treatment["policy_sha256"]):
@@ -1186,6 +1190,10 @@ class MemoryV2Manager:
         """Close an inadmissible arm without storing a trial or permitting promotion."""
         from .dev_v2 import DevV2Evidence, require
         evidence = DevV2Evidence(self.store)
+        if evidence.read(catalog_id,descriptor).get('schema_version')=='attentionbench.agent-validation-invalid.v1':
+            from .agent_validation import invalid
+            return invalid(self,evidence,memory_id=memory_id,validation_grant_id=validation_grant_id,
+                execution_import_id=execution_import_id,catalog_id=catalog_id,descriptor=descriptor)
         grant = evidence.validation_grant(validation_grant_id)
         require(grant['binding']['memory_id'] == memory_id, 'failed check grant belongs to another memory')
         execution, ed, bundle, artifacts, _, verdict, _ = evidence.verdict(
@@ -1273,7 +1281,7 @@ class MemoryV2Manager:
         lifecycle(db, memory.artifact(), provenance, decision['decision'],
                   validation_reason(decision), 'system:validation', at=decision['decided_at'])
         linked_id = provenance.get('from_provisional')
-        if provenance.get('channel') != 'dev_v2' or linked_id is None:
+        if provenance.get('channel') not in {'dev_v2','dev_agent'} or linked_id is None:
             return
         linked = db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?', (linked_id,)).fetchone()
         prior = json.loads(linked[0]) if linked else None
@@ -1323,7 +1331,7 @@ class MemoryV2Manager:
         provenance = self.provenance(memory_id)
         if is_test_seeded(provenance):
             raise StateConflictError('test-seeded notes are excluded from validation evidence')
-        if provenance.get("channel") == "dev_v2":
+        if provenance.get("channel") in {"dev_v2","dev_agent"}:
             # provenance() reopens the sealed ledger and all original receipts.
             return
         refs = provenance["raw_evidence_refs"]

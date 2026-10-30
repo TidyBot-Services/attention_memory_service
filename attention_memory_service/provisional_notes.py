@@ -215,7 +215,7 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
         if current != provenance:
             raise StateConflictError('memory provenance changed while recording outcome; retry')
         eligible = (is_provisional(provenance) and grant.get('trust_scope') == 'provisional'
-                    or provenance.get('channel') == 'dev_v2'
+                    or provenance.get('channel') in {'dev_v2','dev_agent'}
                     and plan and plan.get('profile') == 'single_scene_v1')
         if (not eligible or grant['development_id'] != development_id):
             raise StateConflictError('outcome requires a matching provisional development grant')

@@ -26,7 +26,8 @@ def is_provisional(provenance):
     return bool(provenance and (provenance.get('channel') == 'dev_v2_provisional'
                                or provenance.get('channel') == 'dev_agent'
                                and provenance.get('origin', {}).get('channel') == 'dev_agent'
-                               or provenance.get('channel') == 'dev_v2' and provenance.get('demoted_at') is not None)
+                               or (provenance.get('channel') == 'dev_v2' or provenance.get('channel')=='dev_agent' and provenance.get('source_import_id'))
+                               and provenance.get('demoted_at') is not None)
                 and provenance.get('trust_scope') == 'provisional'
                 and provenance.get('unvalidated') is True
                 and provenance.get('excluded_from_results') is True)

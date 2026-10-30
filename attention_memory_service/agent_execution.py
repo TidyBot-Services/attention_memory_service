@@ -15,9 +15,10 @@ def verify(importer, catalog_id, d, bundle, config, manifest, record, cell, job)
             'agent public_base_yaw_visible must be a sealed bool')
     require(not any(k in obj for obj in (d, d['permission_scope'], d.get('agent_execution', {}), bundle)
                     for k in ('actor', 'approval_id')), 'agent evidence cannot carry actor or approval_id')
-    require(d.get('import_purpose') in (None, 'memory_origin') and 'validation_input' not in d
+    validation=d.get('import_purpose')=='memory_validation' and manifest.get('validation_experiment') is True
+    require(validation or d.get('import_purpose') in (None, 'memory_origin') and 'validation_input' not in d
             and not any(obj.get(k) for obj in (cell, config, manifest, manifest.get('selection', {}))
-                        for k in ('validation_experiment', 'positive_control', 'origin_dev_lock')),
+                        for k in ('validation_experiment', 'positive_control', 'origin_dev_lock','agent_validation','validation_origin')),
             'agent offline validation and positive controls are unsupported')
     require(d['permission_scope'].get('action') in ('sensor_only', 'agent_dev_tier_motion'),
             'agent execution requires an agent permission action')
@@ -51,6 +52,9 @@ def verify(importer, catalog_id, d, bundle, config, manifest, record, cell, job)
             and job['actual'] == dict(executions=1, sdk_calls=usage.get('sdk_calls'),
                 control_steps=usage.get('control_steps'), execution_seconds=usage.get('wall_seconds')),
             'agent mirror actual costs differ from ledger')
+    if validation:
+        from .agent_validation import usage as verify_usage
+        verify_usage(importer,catalog_id,d,manifest,record,cell,job)
 
 
 def result_evidence(importer, grant, execution_id, execution, d, bundle):

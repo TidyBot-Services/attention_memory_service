@@ -744,7 +744,7 @@ class DevV2Evidence:
     def verdict(self, import_id, validator_id, descriptor, *, for_validation=True):
         execution, d, bundle, artifacts, cell = self.execution(import_id)
         if bundle.get('channel') == 'dev_agent':
-            require(d.get('import_purpose') == 'memory_origin', 'agent offline validation is restricted to origin purpose')
+            require(d.get('import_purpose') in {'memory_origin','memory_validation'}, 'agent offline validation is restricted to origin or validation purpose')
         validator = self.catalog(validator_id, 'validator')
         executor = self.catalog(execution['catalog_id'], 'executor')
         require(not Path(validator['root']).is_relative_to(executor['root']) and not Path(executor['root']).is_relative_to(validator['root']), 'validator root must be independent of executor')
@@ -1140,15 +1140,17 @@ class DevV2Evidence:
                 exposure=exposure, origin_source_sha256=origin_source_sha256)
         from .memory_v2 import MemoryV2Manager
         manager = MemoryV2Manager(self.store)
-        require((manager._provenance(memory_id) or {}).get('channel') != 'dev_agent',
-                'offline validation grant requires a Dev v2 candidate')
+        raw=manager._provenance(memory_id) or {}
+        if raw.get('channel')=='dev_agent':
+            require(raw.get('source_import_id') and manager.get_plan(memory_id) is not None,'offline validation grant requires a Dev v2 candidate with a frozen agent plan')
         provenance = manager.provenance(memory_id)
         memory = self.store.get_memory(memory_id)
-        require(provenance.get('channel') == 'dev_v2' and memory.status.value == 'candidate', 'offline validation grant requires a Dev v2 candidate')
+        require(provenance.get('channel') in {'dev_v2','dev_agent'} and provenance.get('source_import_id') and memory.status.value == 'candidate', 'offline validation grant requires a Dev v2 candidate')
         plan = manager.get_plan(memory_id)
         require(plan is not None, 'freeze a validation plan before dispatch')
         require(manager.get_decision(memory_id) is None, 'validation batch is closed')
         generated = plan.get('arm_generation') == 'dev_from_origin'
+        if provenance.get('channel')=='dev_agent':require(generated and plan.get('profile')=='single_scene_v1' and target_seed is None and type(version) is int and version==1,'agent validation requires single-scene single-version agent arms')
         require(generated or origin_source_sha256 is None, 'origin binding requires dev_from_origin plan')
         scope(context)
         require_profile_match(memory.applicability, context)
@@ -1208,6 +1210,9 @@ class DevV2Evidence:
 
     def _validation_generation(self, execution, ed, binding, plan, candidate):
         """Reconstruct arm lineage from executor files and its settled model job."""
+        if execution.get('channel')=='dev_agent':
+            from .agent_validation import generation
+            return generation(self,execution,ed,binding,plan,candidate)
         catalog_id = execution['catalog_id']
         record = self.ref(catalog_id, ed['version_record'])
         require({'parent_source', 'model_input', 'model_output', 'dev_memory_exposure'} <= set(record)
@@ -1295,6 +1300,10 @@ class DevV2Evidence:
         input_value = self.ref(execution['catalog_id'], ed['validation_input'])
         require(input_value == {'memory_ids': ids, 'exposure': exposure, 'context': execution['context'], 'policy_sha256': bundle['policy_sha256'], 'config_sha256': bundle['config_sha256'], 'validation_grant_id': grant['grant_id']}, 'original validation exposure/config mismatch')
         candidate = self.validation_candidate(binding['memory_id'])
+        provenance=MemoryV2Manager(self.store)._provenance(binding['memory_id']) or {}
+        if execution.get('channel')=='dev_agent' or provenance.get('channel')=='dev_agent':
+            require(execution.get('channel')==provenance.get('channel')=='dev_agent' and 'target_seed' not in binding,
+                    'mixed or cross-seed agent validation is unsupported')
         require_profile_match(candidate.applicability, execution['context'])
         require_profile_match(candidate.applicability, plan)
         if (historical and plan.get('profile') == 'single_scene_v1' and plan.get('arm_generation') == 'dev_from_origin'

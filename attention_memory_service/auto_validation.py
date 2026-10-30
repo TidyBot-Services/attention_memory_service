@@ -47,7 +47,7 @@ def validation_queue(service):
                              grants.get(r['grant_id'], {}).get('exposed_at', 0) > after for r in uses):
             continue
         origin = p.get('origin', {})
-        if p.get('channel') == 'dev_v2':
+        if p.get('channel') == 'dev_v2' or p.get('channel')=='dev_agent' and p.get('source_import_id'):
             source = service.dev_v2.get(p['source_import_id'])
             execution = service.dev_v2.get(source['failed_execution_import_id'])
             manifest = service.dev_v2.ref(execution['catalog_id'], execution['manifest'])
@@ -98,7 +98,7 @@ def demote_if_due(db, memory_id):
         return
     p = json.loads(db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?', (memory_id,)).fetchone()[0])
     plan = db.execute('SELECT payload FROM memory_v2_plans WHERE memory_id=?', (memory_id,)).fetchone()
-    if p.get('channel') != 'dev_v2' or not plan or json.loads(plan[0]).get('profile') != 'single_scene_v1':
+    if p.get('channel') not in {'dev_v2','dev_agent'} or not plan or json.loads(plan[0]).get('profile') != 'single_scene_v1':
         return
     uses = [json.loads(r[0]) for r in db.execute(
         'SELECT payload FROM memory_provisional_outcomes WHERE memory_id=? ORDER BY rowid', (memory_id,))]

@@ -72,7 +72,7 @@ class DevMemoryUse:
             raise StateConflictError("memory is not trusted or applicable to Dev context")
         provenance = self.service.v2._provenance(memory_id)
         marker = flags(provenance)
-        if provenance and provenance.get('channel') == 'dev_v2':
+        if provenance and (provenance.get('channel') == 'dev_v2' or provenance.get('channel')=='dev_agent' and provenance.get('source_import_id')):
             if type(memory_version) is not int or memory_version != memory.version:
                 raise StateConflictError('explicit exact trusted Memory version required')
         elif memory_version is not None and (type(memory_version) is not int or memory_version != memory.version):
@@ -161,7 +161,7 @@ class DevMemoryUse:
                 raise StateConflictError('reference exposure is excluded from Dev results')
             if is_test_seeded(provenance):
                 raise StateConflictError('test-seeded exposure is excluded from Dev results')
-            if provenance and provenance.get('channel') == 'dev_v2':
+            if provenance and (provenance.get('channel') == 'dev_v2' or provenance.get('channel')=='dev_agent' and provenance.get('source_import_id')):
                 raise StateConflictError('Dev v2 results require offline sealed bundle import')
         run = self.service.store.get_run(run_id)
         if run is None or run.get("status") not in {"failed", "completed", "cancelled"}:
