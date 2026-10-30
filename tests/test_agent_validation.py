@@ -128,3 +128,25 @@ def test_service_independently_checks_origin_policy_epoch(tmp_path,monkeypatch,f
             with pytest.raises(StateConflictError,match='policy version differs from origin'):
                 agent_validation.shape(f.service.dev_v2,batch['failed_execution']['catalog_id'],manifest,cell,config)
     finally:f.runner.pool.shutdown()
+
+
+@pytest.mark.parametrize('policy',['reactive_help','trace_aware_hint_only'])
+@pytest.mark.parametrize('fault',['manifest','config','cell','all'])
+def test_service_independently_checks_visibility_override(tmp_path,monkeypatch,policy,fault):
+    f=fixture(tmp_path,monkeypatch,policy_version='agent-policy-v2',policy=policy)
+    try:
+        with synthetic_creation(f.native):
+            batch=f.runner.begin(dict(f.note,created_at=f.service.get_memory(f.note['memory_id']).created_at),'service-visibility-001')
+            store=DevV2Store(next(iter(batch['cells'].values()))['ledger'])
+            manifest=dev_experiment.verify_manifest(dev_experiment.snapshot(store,batch['experiment_id']))
+            cell=store.cell(batch['pairs'][0]['control_cell']);config=next(iter(manifest['configs'].values()))
+            evidence=f.service.dev_v2;cid=batch['failed_execution']['catalog_id']
+            assert agent_validation.shape(evidence,cid,manifest,cell,config) is None
+            rows=([manifest,cell,config,*manifest['cells'],*manifest['configs'].values()] if fault=='all' else
+                [dict(manifest=manifest,cell=cell,config=config)[fault]])
+            for row in rows:
+                if policy=='trace_aware_hint_only' and fault!='config':row.pop('memory_visibility',None)
+                else:row['memory_visibility']='validation_override'
+            with pytest.raises(StateConflictError,match='visibility differs from origin'):
+                agent_validation.shape(evidence,cid,manifest,cell,config)
+    finally:f.runner.pool.shutdown()

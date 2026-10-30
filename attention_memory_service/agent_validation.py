@@ -21,6 +21,17 @@ def shape(importer,catalog_id,manifest,cell,config):
     ref=origin['manifest']
     original=importer.ref(importer._catalog_for_ref(catalog_id,ref,'executor'),ref)
     version=original.get('agent_policy_version','agent-policy-v1')
+    original_cell=next((c for c in original['cells'] if c['key']==origin['cell']),None)
+    require(original_cell is not None,'agent validation origin cell missing')
+    # Independent policy rule: only v2 hint-only hides Memory. Never trust the
+    # arm's claimed policy or visibility marker as the authority for this bypass.
+    visibility=('validation_override' if version=='agent-policy-v2'
+                and original_cell['policy_id']=='trace_aware_hint_only' else None)
+    require(all(row.get('memory_visibility')==visibility
+        and ('memory_visibility' in row)==(visibility is not None)
+        for row in (manifest,cell,*manifest['cells']))
+        and all('memory_visibility' not in row for row in (config,*manifest['configs'].values())),
+        'agent validation memory visibility differs from origin')
     require(version in ('agent-policy-v1','agent-policy-v2')
         and all(row.get('agent_policy_version','agent-policy-v1')==version
             for row in (manifest,selection,cell,config,*manifest['cells'],*manifest['configs'].values())),
