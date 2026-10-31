@@ -419,12 +419,12 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
 
     @app.get('/dev-v2/memories', dependencies=[Depends(authorized)])
     def dev_v2_memories(status: str | None = None):
-        return {'memories': guarded(service.list_dev_v2_memories, status=status)}
+        return guarded(service.dev_v2_memory_listing, status=status)
 
     @app.post('/dev-v2/memories/query', dependencies=[Depends(authorized)])
     def dev_v2_memories_query(payload: MemoryQueryInput):
-        return {'memories': guarded(service.list_dev_v2_memories, status=payload.status,
-                                    context=payload.context)}
+        return guarded(service.dev_v2_memory_listing, status=payload.status,
+                       context=payload.context)
 
     @app.get('/dev-v2/memories/{memory_id}', dependencies=[Depends(authorized)])
     def dev_v2_memory(memory_id: str):

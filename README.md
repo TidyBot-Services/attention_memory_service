@@ -178,6 +178,25 @@ The additive tables are `memory_cross_seed_probes`, `memory_cross_seed_plans`,
 provenance separately from origin plans and evidence; service restart preserves
 all checks and decisions. No feasible target seeds are assumed by this feature.
 
+### Dev listing evidence diagnostics
+
+`GET /dev-v2/memories` and `POST /dev-v2/memories/query` return
+`{"memories": [...], "unavailable": [...]}`. Each unavailable entry contains
+`memory_id`, `error_class`, and `reason` (the verification error message). A row
+whose evidence raises `StateConflictError`, or whose pinned file disappears
+(`FileNotFoundError`), is omitted entirely and logged as a warning. Healthy rows
+retain their public fields and order. The projection includes Dev agent notes;
+agent provisional notes retain their unvalidated/excluded-from-results flags.
+Each row has a separate evidence verification scope, including context matching.
+Invalid query contexts and programming errors still fail the request.
+
+In-process `MemoryService.list_dev_v2_memories` keeps returning a list; callers
+that need diagnostics can use `MemoryService.dev_v2_memory_listing`. Diagnostics
+are local to each response. Existing clients reading the `memories` key work
+unchanged. Retrieval, authorization, trusted use, provisional outcomes and
+validation remain strict. A frozen-harness follow-up can display `unavailable`
+in its client/UI; consuming that field is optional and needs no service change.
+
 ### Automatic validation service hooks
 
 Evidence catalogs can be registered at startup, plus the importer-only registration

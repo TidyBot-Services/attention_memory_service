@@ -8,6 +8,7 @@ also used by the local HTTP facade; it does not require a daemon for tests.
 from __future__ import annotations
 
 import math
+import logging
 import hashlib
 import time
 from pathlib import Path
@@ -21,9 +22,12 @@ from .dev_use import DevMemoryUse
 from .dev_v2 import evidence_operation
 from .memory_artifacts import MemoryArtifactStore
 from .memory_v2 import MemoryV2Manager, trusted_here
-from .applicability import require_profile_match, validate_profile, profile_fields, LAYER, LEVELS, SAME_SCENE, marker
+from .applicability import require_profile_match, validate_profile, profile_fields, LAYER, LEVELS, SAME_SCENE, marker, valid_interface
 from . import provisional_notes
 from .seeded_notes import create as create_test_seeded, flags, is_test_seeded, is_provisional
+
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryService:
@@ -444,96 +448,137 @@ class MemoryService:
 
     def list_dev_v2_memories(self, *, status: str | None = None,
                              context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Explicit public allowlist; importer evidence never enters this projection.
+        """Public rows only; unavailable evidence is diagnosed in the service log.
 
-        With a Dev context, each row also says at which level it would be read
-        there (``match_level``) and whether it is trusted there; without one
-        both are None.
+        Use ``dev_v2_memory_listing`` for request-local diagnostics as well.
         """
-        levels = None
+        return self.dev_v2_memory_listing(status=status, context=context)['memories']
+
+    def dev_v2_memory_listing(self, *, status: str | None = None,
+                              context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Fail closed per public row, retaining healthy rows in their original order.
+
+        Diagnostics are local to this response, never shared between requests.
+        Retrieval, grants and validation retain their strict evidence checks.
+        """
+        expired = set()
         if context is not None:
-            levels = {memory.memory_id: level for memory, level in
-                      self.retrieve_levels(context, now=time.time(), levels=LEVELS)}
-        rows = []
+            validate_profile(context)
+            if context.get('perception_mode') not in {'sim_gt', 'vision'}:
+                raise ValueError('retrieval requires explicit perception mode')
+            if not valid_interface(context):
+                raise ValueError('sdk_interface_sha256 must be SHA-256')
+            expired = {memory.memory_id for memory in
+                       MemoryManager(self.store).expire_due(now=time.time())}
+        rows, unavailable = [], []
         for memory in self.store.list_memories():
             if status is not None and memory.status.value != status:
                 continue
-            provenance = self.v2._provenance(memory.memory_id)
-            if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
+            try:
+                row = self._dev_v2_memory_public_row(
+                    memory, context=context, expired=memory.memory_id in expired)
+            except (StateConflictError, FileNotFoundError) as exc:
+                # Verification guards use StateConflictError; disappearing
+                # pinned files can also raise FileNotFoundError during reads.
+                # Programming errors deliberately propagate.
+                diagnostic = {'memory_id': memory.memory_id,
+                              'error_class': type(exc).__name__, 'reason': str(exc)}
+                unavailable.append(diagnostic)
+                logger.warning('Dev Memory row unavailable: %s', diagnostic)
                 continue
-            plan = self.v2.get_plan(memory.memory_id)
-            decision = self.v2.get_decision(memory.memory_id)
-            seeded = is_test_seeded(provenance)
-            provisional = is_provisional(provenance)
-            case = plan['cases'][0] if plan and plan.get('profile') == 'single_scene_v1' else None
-            if seeded or provisional and provenance.get('channel') == 'dev_v2_provisional':
-                case = memory.applicability
-            trusted = not provisional and memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
-            scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
-            if trusted and provenance.get('trust_scope') == 'task_scoped':
-                scope = 'task_scoped'
-            from .motion_permission import public_summary
-            motion_permission = public_summary(self.store, memory.memory_id, provenance)
-            rows.append({
-                **({'motion_permission': motion_permission} if motion_permission else {}),
-                'memory_id': memory.memory_id, 'version': memory.version,
-                'layer': 'task' if scope == 'task_scoped' else 'scene',
-                'from_provisional': provenance.get('from_provisional'),
-                **({'decision_link': provenance['decision_link']} if 'decision_link' in provenance else {}),
-                **({'read_layer': LAYER.get(levels.get(memory.memory_id))} if levels is not None else {}),
-                **({'origin_summary': {k: provenance['origin'][k] for k in ('experiment_id', 'help_version', 'policy_id')},
-                    'from_run_note': provenance.get('from_run_note')} if provisional and 'origin' in provenance else {}),
-                'title': provenance.get('title'),
-                'summary': provenance.get('summary'),
-                'group': provenance.get('group'),
-                'status': memory.status.value, 'trust_scope': scope,
-                'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped'
-                                 else 'task_scoped_trusted' if scope == 'task_scoped' else None,
-                'profile': None if plan is None else plan.get('profile', 'default'),
+            if row is not None:
+                rows.append(row)
+        return {'memories': rows, 'unavailable': unavailable}
+
+    @evidence_operation
+    def _dev_v2_memory_public_row(self, memory: MemoryRecord, *,
+                                  context: dict[str, Any] | None,
+                                  expired: bool = False) -> dict[str, Any] | None:
+        """One explicit public allowlist, with its own evidence verification scope."""
+        provenance = self.v2._provenance(memory.memory_id)
+        if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded', 'dev_v2_provisional', 'dev_agent'}:
+            return None
+        if expired:
+            self._publish_if_validated_source(memory.memory_id)
+        plan = self.v2.get_plan(memory.memory_id)
+        levels = None
+        if context is not None:
+            # Use retrieval's strict per-memory matcher inside this row's
+            # verification boundary, without a catalogue-wide lookup.
+            level = (self.v2._match_level(memory, provenance, context)
+                     if memory.status.value in {'trusted', 'provisional'} else None)
+            levels = {memory.memory_id: level} if level in LEVELS else {}
+        decision = self.v2.get_decision(memory.memory_id)
+        seeded = is_test_seeded(provenance)
+        provisional = is_provisional(provenance)
+        case = plan['cases'][0] if plan and plan.get('profile') == 'single_scene_v1' else None
+        if seeded or provisional and not provenance.get('source_import_id'):
+            case = memory.applicability
+        trusted = not provisional and memory.status.value in {'trusted', 'disabled', 'expired', 'rolled_back'}
+        scope = ('test_seeded' if seeded else 'scene_scoped' if plan and plan.get('profile') == 'single_scene_v1' else 'multi_scene') if trusted else None
+        if trusted and provenance.get('trust_scope') == 'task_scoped':
+            scope = 'task_scoped'
+        from .motion_permission import public_summary
+        motion_permission = public_summary(self.store, memory.memory_id, provenance)
+        return {
+            **({'motion_permission': motion_permission} if motion_permission else {}),
+            'memory_id': memory.memory_id, 'version': memory.version,
+            'layer': 'task' if scope == 'task_scoped' else 'scene',
+            'from_provisional': provenance.get('from_provisional'),
+            **({'decision_link': provenance['decision_link']} if 'decision_link' in provenance else {}),
+            **({'read_layer': LAYER.get(levels.get(memory.memory_id))} if levels is not None else {}),
+            **({'origin_summary': {k: provenance['origin'][k] for k in ('experiment_id', 'help_version', 'policy_id')},
+                'from_run_note': provenance.get('from_run_note')} if provisional and 'origin' in provenance else {}),
+            'title': provenance.get('title'),
+            'summary': provenance.get('summary'),
+            'group': provenance.get('group'),
+            'status': memory.status.value, 'trust_scope': scope,
+            'trust_display': 'seeded_for_tests' if seeded else 'scene_scoped_trusted' if scope == 'scene_scoped'
+                             else 'task_scoped_trusted' if scope == 'task_scoped' else None,
+            'profile': None if plan is None else plan.get('profile', 'default'),
+            **profile_fields(memory.applicability),
+            'applicability_summary': {
                 **profile_fields(memory.applicability),
-                'applicability_summary': {
-                    **profile_fields(memory.applicability),
-                    'benchmark': memory.applicability['benchmark'],
-                    'suite': memory.applicability['suite'],
-                    'task_id': memory.applicability['task_id'], 'seed': provenance['source_seed'],
-                    'scene_id': None if case is None else case['scene_id'],
-                    'object_set_id': None if case is None else case['object_set_id'],
-                    'robot': memory.applicability['robot'],
-                    'controller': memory.applicability['controller'],
-                    'perception_mode': memory.applicability['perception_mode'],
-                    'camera_config_id': None if case is None else case['camera_config_id'],
-                    'task_variant_id': None if case is None else case['task_variant_id'],
-                    'camera_names': None if case is None else case['camera_names'],
-                    'task_prompt': None if case is None else case['task_prompt'],
-                    'scene_contract_ref': memory.applicability.get('scene_contract_ref') if seeded or provisional else None,
-                    'sdk_sha256': memory.applicability['sdk_sha256'],
-                    'sdk_interface_sha256': memory.applicability.get('sdk_interface_sha256'),
-                    'namespace': memory.applicability['namespace'],
-                    'planned_cases': None if plan is None else plan['cases'],
-                },
-                'failure_signature_summary': provenance.get('failure_signature'),
-                'validation_summary': None if seeded or provisional else {
-                    'planned_pairs': None if plan is None else len(plan.get('pairs', plan['seeds'])),
-                    'source_drift': [] if decision is None else decision.get('source_drift',[]),
-                    'completed_pairs': len(self.v2.list_pairs(memory.memory_id)),
-                    'decision': None if decision is None else decision['decision'],
-                    'failed_gates': [] if decision is None else decision['failed_gates'],
-                    'control_signature_count': None if decision is None else decision['report'].get('control_signature_count'),
-                    'treatment_signature_count': None if decision is None else decision['report'].get('treatment_signature_count'),
-                },
-                'source_label': 'seeded for tests' if seeded else provenance['source_kind'],
-                'excluded_from_results': seeded or provisional,
-                'seeded_for_tests': seeded,
-                'source_seed': provenance['source_seed'],
-                'match_level': None if levels is None else levels.get(memory.memory_id),
-                'trusted_here': None if levels is None else (
-                    memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id], provenance, context)),
-                'guidance_length': len(memory.guidance) if seeded else None,
-                'guidance_sha256': hashlib.sha256(memory.guidance.encode()).hexdigest() if seeded else None,
-                **({'expires_at': memory.expires_at, 'uses': provisional_notes.uses_summary(self.store, memory.memory_id),
-                    **flags(provenance)} if provisional else {}),
-            })
-        return rows
+                'benchmark': memory.applicability['benchmark'],
+                'suite': memory.applicability['suite'],
+                'task_id': memory.applicability['task_id'], 'seed': provenance['source_seed'],
+                'scene_id': None if case is None else case['scene_id'],
+                'object_set_id': None if case is None else case['object_set_id'],
+                'robot': memory.applicability['robot'],
+                'controller': memory.applicability['controller'],
+                'perception_mode': memory.applicability['perception_mode'],
+                'camera_config_id': None if case is None else case['camera_config_id'],
+                'task_variant_id': None if case is None else case['task_variant_id'],
+                'camera_names': None if case is None else case['camera_names'],
+                'task_prompt': None if case is None else case['task_prompt'],
+                'scene_contract_ref': memory.applicability.get('scene_contract_ref') if seeded or provisional else None,
+                'sdk_sha256': memory.applicability['sdk_sha256'],
+                'sdk_interface_sha256': memory.applicability.get('sdk_interface_sha256'),
+                'namespace': memory.applicability['namespace'],
+                'planned_cases': None if plan is None else plan['cases'],
+            },
+            'failure_signature_summary': provenance.get('failure_signature'),
+            'validation_summary': None if seeded or provisional else {
+                'planned_pairs': None if plan is None else len(plan.get('pairs', plan['seeds'])),
+                'source_drift': [] if decision is None else decision.get('source_drift',[]),
+                'completed_pairs': len(self.v2.list_pairs(memory.memory_id)),
+                'decision': None if decision is None else decision['decision'],
+                'failed_gates': [] if decision is None else decision['failed_gates'],
+                'control_signature_count': None if decision is None else decision['report'].get('control_signature_count'),
+                'treatment_signature_count': None if decision is None else decision['report'].get('treatment_signature_count'),
+            },
+            'source_label': 'seeded for tests' if seeded else provenance['source_kind'],
+            'excluded_from_results': seeded or provisional,
+            'seeded_for_tests': seeded,
+            'source_seed': provenance['source_seed'],
+            'match_level': None if levels is None else levels.get(memory.memory_id),
+            'trusted_here': None if levels is None else (
+                memory.memory_id in levels and trusted_here(memory, levels[memory.memory_id], provenance, context)),
+            'guidance_length': len(memory.guidance) if seeded else None,
+            'guidance_sha256': hashlib.sha256(memory.guidance.encode()).hexdigest() if seeded else None,
+            **({'expires_at': memory.expires_at, 'uses': provisional_notes.uses_summary(self.store, memory.memory_id),
+                **flags(provenance)} if provisional else {}),
+        }
 
     def get_dev_v2_memory_public(self, memory_id: str) -> dict[str, Any]:
         row = next((item for item in self.list_dev_v2_memories() if item['memory_id'] == memory_id), None)
