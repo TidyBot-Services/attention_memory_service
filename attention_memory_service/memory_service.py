@@ -496,7 +496,7 @@ class MemoryService:
                                   expired: bool = False) -> dict[str, Any] | None:
         """One explicit public allowlist, with its own evidence verification scope."""
         provenance = self.v2._provenance(memory.memory_id)
-        if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded', 'dev_v2_provisional', 'dev_agent'}:
+        if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
             return None
         if expired:
             self._publish_if_validated_source(memory.memory_id)

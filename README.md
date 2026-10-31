@@ -185,8 +185,8 @@ all checks and decisions. No feasible target seeds are assumed by this feature.
 `memory_id`, `error_class`, and `reason` (the verification error message). A row
 whose evidence raises `StateConflictError`, or whose pinned file disappears
 (`FileNotFoundError`), is omitted entirely and logged as a warning. Healthy rows
-retain their public fields and order. The projection includes Dev agent notes;
-agent provisional notes retain their unvalidated/excluded-from-results flags.
+retain their public fields and order. The listing allowlist is unchanged (Dev agent
+notes stay out of this projection and are delivered only through retrieval grants).
 Each row has a separate evidence verification scope, including context matching.
 Invalid query contexts and programming errors still fail the request.
 

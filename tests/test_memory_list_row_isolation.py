@@ -155,9 +155,9 @@ def test_http_shape_and_unchanged_client(service, monkeypatch):
     assert client.list_dev_v2_memories(context=context()) == expected['memories']
 
 
-def test_agent_provisional_row_is_verified_and_projected(service):
-    # Agent provisional notes use the same bound public fields. Their channel
-    # was missing from the listing allowlist even though retrieval supports it.
+def test_agent_provisional_rows_stay_out_of_the_listing(service):
+    # Isolation only: the listing allowlist is unchanged, so dev_agent rows stay
+    # out of this public projection (they are delivered only via retrieval grants).
     with sqlite3.connect(service.store.path) as db:
         raw, = db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?', ('p-healthy',)).fetchone()
         value = json.loads(raw)
@@ -166,13 +166,8 @@ def test_agent_provisional_row_is_verified_and_projected(service):
         db.execute('UPDATE memory_v2_provenance SET payload=? WHERE memory_id=?',
                    (json.dumps(value), 'p-healthy'))
     result = service.dev_v2_memory_listing(context=context())
-    row = next(row for row in result['memories'] if row['memory_id'] == 'p-healthy')
+    assert all(row['memory_id'] != 'p-healthy' for row in result['memories'])
     assert result['unavailable'] == []
-    assert row['match_level'] == 'same_scene'
-    assert row['applicability_summary']['camera_names'] == context()['camera_names']
-    assert row['unvalidated'] and row['excluded_from_results']
-    corrupt(service, 'p-healthy')
-    assert any(row['memory_id'] == 'p-healthy' for row in service.dev_v2_memory_listing()['unavailable'])
 
 
 @pytest.mark.parametrize('with_context', [False, True])
