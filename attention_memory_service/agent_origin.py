@@ -45,9 +45,13 @@ def verify_source(refs, read, db, cell, version, manifest, config):
             require(len(rows) == 1 and rows[0][0] == 'settled' and dict(json.loads(rows[0][1]), id=sealed['id'], state=rows[0][0]) == sealed,
                     'agent execution differs from live ledger')
     job = values['help_job']
-    rows = db.execute('SELECT state,payload FROM v2_agent_jobs WHERE cell=? AND id=?', (cell['key'], job['id'])).fetchall()
-    require(len(rows) == 1 and rows[0][0] == 'settled' and dict(json.loads(rows[0][1]), id=job['id'], state=rows[0][0]) == job,
-            'agent help differs from live ledger')
+    if manifest.get('agent_policy_version') == 'agent-policy-v2' and 'execution_job' in job:
+        from .agent_help_interval import verify_help
+        verify_help(db, cell['key'], version['version'], job, json.loads(texts['help']), values['delivery'])
+    else:
+        rows = db.execute('SELECT state,payload FROM v2_agent_jobs WHERE cell=? AND id=?', (cell['key'], job['id'])).fetchall()
+        require(len(rows) == 1 and rows[0][0] == 'settled' and dict(json.loads(rows[0][1]), id=job['id'], state=rows[0][0]) == job,
+                'agent help differs from live ledger')
     require(values['help_record'] == version, 'agent helped version differs')
     return dict(feedback_projection='exact')
 
