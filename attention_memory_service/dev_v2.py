@@ -46,6 +46,25 @@ _OPERATION = ContextVar('dev_v2_evidence_operation', default=None)
 _HISTORICAL_SOURCE = ContextVar('dev_v2_historical_source', default=False)
 
 
+def is_frame_image(name):
+    """The shared catalog boundary for disposable per-frame RGB images."""
+    path = Path(name)
+    if path.name in {'camera_initial.png', 'camera_final.png'}:
+        return False
+    parts = path.parts
+    return (path.suffix.lower() in {'.png', '.jpg', '.jpeg'} and
+            bool(set(parts) & {'frames', 'live', 'recording_frames', 'recording_views'}))
+
+
+def without_frame_images(catalog):
+    files = catalog.get('files', {})
+    excluded = sum(is_frame_image(name) for name in files)
+    value = dict(catalog, files={name: sha for name, sha in files.items() if not is_frame_image(name)})
+    if excluded:
+        value['excluded_frame_images'] = excluded
+    return value
+
+
 def evidence_operation(function):
     """Verify each pinned file once per authority call, never across calls.
 
@@ -329,6 +348,12 @@ class DevV2Evidence:
         require(root.is_absolute() and root.resolve() == root and root.is_dir(), 'catalog needs a canonical existing root')
         scope(catalog['context'])
         require(isinstance(catalog.get('files'), dict) and catalog['files'], 'sealed file list required')
+        for kind in ('links', 'symlinks'):
+            require(not any(is_frame_image(name) or (isinstance(pin, str) and is_frame_image(pin))
+                            or (isinstance(pin, dict) and any(is_frame_image(pin.get(k, '')) for k in ('target', 'target_name')))
+                            for name, pin in catalog.get(kind, {}).items()),
+                    'frame images cannot be catalog links or symlinks')
+        catalog = without_frame_images(catalog)
         links = catalog.get('links', {})
         require(isinstance(links, dict) and (not links or catalog['role'] == 'source')
                 and set(links) <= set(catalog['files']) and not set(links) & set(catalog.get('symlinks', {})),
@@ -416,6 +441,7 @@ class DevV2Evidence:
 
     def read(self, catalog_id, name, *, raw=False):
         catalog = self.catalog(catalog_id)
+        require(not is_frame_image(name), 'registered evidence file missing: per-frame images are not registered evidence')
         require(name in catalog['files'], 'file is not in preregistered source list')
         path = self._path(catalog, name)
         state = _OPERATION.get()
@@ -437,6 +463,7 @@ class DevV2Evidence:
         path = Path(ref['uri'])
         require(path.is_absolute() and path.is_relative_to(Path(catalog['root'])), 'artifact outside registered root')
         name = str(path.relative_to(catalog['root']))
+        require(not is_frame_image(name), 'registered evidence file missing: per-frame images are not registered evidence')
         require(catalog['files'].get(name) == ref['sha256'], 'artifact is not preregistered at exact digest')
         return self.read(catalog_id, name, raw=raw)
 
@@ -511,7 +538,9 @@ class DevV2Evidence:
             db.execute('BEGIN IMMEDIATE')
             old = db.execute(f'SELECT payload FROM {table} WHERE id=?', (key,)).fetchone()
             if old:
-                require(old[0] == payload, 'immutable import/catalog ID conflict')
+                previous = (encoded(without_frame_images(json.loads(old[0])))
+                            if table == 'dev_v2_catalogs' else old[0])
+                require(previous == payload, 'immutable import/catalog ID conflict')
                 return
             try:
                 if table == 'dev_v2_imports':
@@ -860,6 +889,8 @@ class DevV2Evidence:
                     and (relative.parts[:1] == ('recording_frames',) and frame['view'] == 'overview'
                          or relative.parts[:2] == ('recording_views', frame['view'])),
                     'request_view frame path/view mismatch')
+            require(str((episode / relative).relative_to(self.catalog(catalog_id)['root'])) in self.catalog(catalog_id)['files'],
+                    'visual Advisor frame not sealed: per-frame images are not registered evidence')
             raw_frame = self.ref(catalog_id, {'uri': str(episode / relative), 'sha256': frame['sha256']}, raw=True)
             # The archived data URL is a JPEG projection of the pinned frame,
             # not the original frame bytes. Reproduce the producer's transform.

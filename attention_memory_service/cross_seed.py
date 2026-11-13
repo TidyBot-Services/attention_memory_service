@@ -8,6 +8,7 @@ from pathlib import Path
 from .applicability import require_profile_match, validate_profile, config_profile, profile_fields
 from .auto_validation import lifecycle, rank_validation_queue
 from .dev_v2 import AXES, SCOPE, SHA, digest, encoded, evidence_operation, require, public_base_yaw_visible, public_trace_projection, signature_present
+from .core.store import StateConflictError
 from .scene_contract import V2
 from .seed_guard import classify_seed
 
@@ -425,13 +426,19 @@ class CrossSeed:
             memories = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memories')]
             for memory in memories:
                 mid = memory['memory_id']
-                p = self.service.v2._provenance(mid) or {}
-                d = self.service.v2.get_decision(mid) or {}
-                if (memory['status'] != 'trusted' or p.get('channel') != 'dev_v2' or d.get('trust_scope') != 'scene_scoped'
-                        or (self.service.v2.get_plan(mid) or {}).get('profile') != 'single_scene_v1'
-                        or memory.get('expires_at') is not None and memory['expires_at'] <= time.time()):
+                try:
+                    p = self.service.v2._provenance(mid) or {}
+                    d = self.service.v2.get_decision(mid) or {}
+                    if (memory['status'] != 'trusted' or p.get('channel') != 'dev_v2' or d.get('trust_scope') != 'scene_scoped'
+                            or (self.service.v2.get_plan(mid) or {}).get('profile') != 'single_scene_v1'
+                            or memory.get('expires_at') is not None and memory['expires_at'] <= time.time()):
+                        continue
+                    status = self.status(memory_id=mid)
+                except (StateConflictError, FileNotFoundError) as exc:
+                    rows.append(dict(memory_id=mid, status='isolated', reason=str(exc),
+                                     error_class=type(exc).__name__, uses=0, failure_gone=0,
+                                     created_at=memory['created_at']))
                     continue
-                status = self.status(memory_id=mid)
                 if 'No neutral seed showed harm' in status['task_trust']['missing']:
                     continue
                 uses = [json.loads(r[0]) for r in db.execute('SELECT payload FROM memory_provisional_outcomes WHERE memory_id=?', (mid,))]

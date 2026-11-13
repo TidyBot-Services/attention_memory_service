@@ -5,6 +5,7 @@ import time
 
 from .applicability import profile_fields
 from .dev_v2 import encoded, require
+from .core.store import StateConflictError
 from .seeded_notes import is_provisional, is_test_seeded
 
 
@@ -47,12 +48,18 @@ def validation_queue(service):
                              grants.get(r['grant_id'], {}).get('exposed_at', 0) > after for r in uses):
             continue
         origin = p.get('origin', {})
-        if p.get('channel') == 'dev_v2' or p.get('channel')=='dev_agent' and p.get('source_import_id'):
-            source = service.dev_v2.get(p['source_import_id'])
-            execution = service.dev_v2.get(source['failed_execution_import_id'])
-            manifest = service.dev_v2.ref(execution['catalog_id'], execution['manifest'])
-            origin = dict(experiment_id=manifest['experiment_id'],
-                          cell=execution['cell'], origin_version=execution['version'])
+        try:
+            if p.get('channel') == 'dev_v2' or p.get('channel')=='dev_agent' and p.get('source_import_id'):
+                source = service.dev_v2.get(p['source_import_id'])
+                execution = service.dev_v2.get(source['failed_execution_import_id'])
+                manifest = service.dev_v2.ref(execution['catalog_id'], execution['manifest'])
+                origin = dict(experiment_id=manifest['experiment_id'],
+                              cell=execution['cell'], origin_version=execution['version'])
+        except (StateConflictError, FileNotFoundError) as exc:
+            rows.append(dict(memory_id=mid, status='isolated', reason=str(exc),
+                             error_class=type(exc).__name__, uses=len(uses), failure_gone=0,
+                             created_at=memory['created_at']))
+            continue
         rows.append(dict(**profile_fields(memory['applicability']),
                          memory_id=mid, version=memory['version'], title=p.get('title'),
                          uses=len(uses), failure_gone=sum(r['signature_present'] is False for r in uses),

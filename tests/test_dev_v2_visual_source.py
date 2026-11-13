@@ -111,26 +111,22 @@ def visual_source(tmp_path, defect=None):
     return service
 
 
-def test_visual_source_and_candidate_provenance(tmp_path):
+def test_visual_source_requires_sealed_frames_and_fails_closed(tmp_path):
     service = visual_source(tmp_path)
-    source = service.import_dev_v2_source(import_id='visual', catalog_id='failed', descriptor='failed/source.json')
-    assert source['provider'] == 'human_proxy' and source['advisor_mode'] == 'vision'
-    service.create_dev_v2_candidate(memory_id='visual', source_import_id='visual', created_at=1.0)
-    provenance = MemoryV2Manager(service.store).provenance('visual')
-    assert provenance['provider'] == 'human_proxy'
-    assert provenance['request_view'] == source['request_view']
-    assert provenance['advisor_model'] == 'controlled_test_visual_advisor'
+    assert service.dev_v2.catalog('failed')['excluded_frame_images'] == 5
+    with pytest.raises(StateConflictError, match='visual Advisor frame not sealed: per-frame images are not registered evidence'):
+        service.import_dev_v2_source(import_id='visual', catalog_id='failed', descriptor='failed/source.json')
 
 
 @pytest.mark.parametrize(('defect', 'reason'), [
     ('late', 'settled after Dev model'),
-    ('not_adopted', 'guidance not actually present'),
+    ('not_adopted', 'visual Advisor frame not sealed'),
     ('bad_view_hash', 'request_view/ledger reference mismatch|preregistered'),
-    ('bad_frame_hash', 'artifact is not preregistered'),
-    ('bad_image', 'image differs from pinned frame projection'),
+    ('bad_frame_hash', 'visual Advisor frame not sealed'),
+    ('bad_image', 'visual Advisor frame not sealed'),
     ('missing_frames', 'request_view frames required'),
     ('oracle', 'oracle field'),
-    ('bad_cost', 'logical human time receipt disagrees'),
+    ('bad_cost', 'visual Advisor frame not sealed'),
 ])
 def test_visual_source_rejects_invalid_receipts(tmp_path, defect, reason):
     service = visual_source(tmp_path, defect)
