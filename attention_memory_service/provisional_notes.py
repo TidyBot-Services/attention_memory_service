@@ -47,7 +47,7 @@ def progress(value):
 
 def create(service, *, actor, memory_id, context, guidance, failure_signature, origin,
            origin_public_feedback_text, help_public_feedback_text,
-           title=None, summary=None, group=None, ttl_days=14, from_run_note=None, agent_evidence=None):
+           title=None, summary=None, group=None, ttl_days=14, from_run_note=None, agent_evidence=None, source_version_evidence=None):
     for name, value in (('actor', actor), ('memory_id', memory_id), ('guidance', guidance)):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'{name} is required')
@@ -88,6 +88,12 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
             raise StateConflictError('agent feedback differs from evidence')
     elif agent_evidence is not None:
         raise ValueError('agent evidence requires dev_agent origin')
+    from .reuse_notes import metadata
+    from .skill_tags import tags_for
+    reuse = metadata(origin, context, source_version_evidence) if tags_for(context['task_id']) else {}
+    if agent and source_version_evidence is not None:
+        if source_version_evidence['raw_version'] != agent_evidence['help']['help_record']:
+            raise StateConflictError('source version differs from sealed agent evidence')
     before = feedback(origin_public_feedback_text, digests['origin_public_feedback'])
     after = feedback(help_public_feedback_text, digests['help_public_feedback'])
     validate_signature(failure_signature, before)
@@ -103,6 +109,8 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
                      origin_public_feedback_text=origin_public_feedback_text,
                      help_public_feedback_text=help_public_feedback_text, ttl_days=ttl_days,
                      title=title, summary=summary, group=group)
+    if source_version_evidence is not None:
+        requested['source_version_evidence'] = source_version_evidence
     if agent:
         requested['agent_evidence'] = agent_evidence
     if from_run_note is not None:
@@ -137,7 +145,7 @@ def create(service, *, actor, memory_id, context, guidance, failure_signature, o
                           failure_signature=failure_signature, origin_progress=origin_progress,
                           help_progress=help_progress, source_trace_id=trace, source_seed=context['seed'],
                           request_sha256=fingerprint, artifact=artifact,
-                          artifact_sha256=digest(encoded(artifact).encode()), **display)
+                          artifact_sha256=digest(encoded(artifact).encode()), **reuse, **display)
         memory = MemoryRecord(memory_id=memory_id, version=1, source_trace_id=trace,
                               guidance=guidance, candidate_repair='Importer-attested guidance; no validated repair.', applicability=context,
                               evidence_refs=(trace,), created_at=created_at,

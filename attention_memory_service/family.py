@@ -36,26 +36,47 @@ def validate_spec(spec):
     return digest(encoded(spec).encode())
 
 
-def validate_rewrite(source, rewrite):
-    require(isinstance(rewrite,dict) and set(rewrite)=={'title','guidance','receipt'}, 'complete model rewrite required')
+def validate_rewrite(source, rewrite, *, instruction=REWRITE_PROMPT, generalized=False):
+    require(isinstance(rewrite,dict) and set(rewrite)==({'title','guidance','receipt','applies_when'} if generalized else {'title','guidance','receipt'}), 'complete model rewrite required')
     title, text = rewrite['title'], rewrite['guidance']
     require(isinstance(title,str) and 0 < len(title.strip()) <= 100 and isinstance(text,str) and 0 < len(text.strip()) <= 600, 'short title and nonempty guidance <= 600 characters required')
-    combined = (title+' '+text).casefold()
+    if generalized:
+        from .note_title import validate_title
+        validate_title(title)
+        require(title.strip().casefold() not in {'note','hint','untitled','untitled note','unvalidated: note'},
+                'informative action title required')
+        require(isinstance(rewrite['applies_when'], str) and 0 < len(rewrite['applies_when'].strip()) <= 240,
+                'short applies_when required')
+    combined = (title+' '+text+(' '+rewrite['applies_when'] if generalized else '')).casefold()
     task = source['context']['task_id']
     words = set(re.findall(r'[a-z]+', source['context']['task_prompt'].casefold())) - SHARED_WORDS
     words |= set(task.split('_')) - SHARED_WORDS
+    if generalized:
+        from .skill_tags import tags_for
+        # Fixture and skill names belong in a conditional generalized note.
+        words -= {w for tag in tags_for(task) for w in re.findall(r'[a-z]+', tag)}
+        words -= {'cabinet', 'door', 'interior', 'counter', 'cup', 'mug', 'object', 'objects',
+                  'turn', 'off', 'open', 'close', 'push', 'pull', 'press', 'release', 'inside', 'outside', 'carrying', 'carried'}
+        for key in ('scene_id', 'object_set_id', 'task_variant_id', 'camera_config_id'):
+            value = source['context'].get(key)
+            require(not isinstance(value, str) or not value or value.casefold() not in combined,
+                    'rewrite contains source scene identity')
+        measurement = re.search(r'[-+]?\d+\.\d+\s*(?:m\b|cm\b|mm\b)', combined)
+        sdk_limit = ('sdk' in combined and re.search(r'at most|maximum|limit|per (?:call|step)', combined))
+        require(not re.search(r'\bseed\b', combined) and (not measurement or sdk_limit),
+                'rewrite contains scene-specific measurement or seed')
     require(task.casefold() not in combined and not words.intersection(re.findall(r'[a-z]+',combined)), 'rewrite contains source task or task-specific target words')
     require(not re.search(r'\bseed\s*[:=#-]?\s*\d+|\b1(?:0\d|1\d|2[0-5])\b',combined), 'rewrite contains seed numbers')
     require(not re.search(r'(?:world|absolute|coordinate|\b[xyz]\s*[=:])[^.;\n]*[-+]?\d|[\[(]\s*[-+]?\d+(?:\.\d+)?\s*,\s*[-+]?\d+(?:\.\d+)?\s*,\s*[-+]?\d',combined), 'rewrite contains absolute world coordinates')
     r=rewrite['receipt']
     require(isinstance(r,dict) and {'provider','model','prompt','prompt_sha256','response_sha256','raw_response','started_at','finished_at'}<=set(r), 'complete model receipt required')
     require(r['provider']=='codex' and isinstance(r['model'],str) and r['model'].strip(), 'Codex model receipt required')
-    require(r['prompt']==dict(instruction=REWRITE_PROMPT,title=source['title'],guidance=source['guidance'],task_id=task), 'rewrite prompt differs from fixed source prompt')
+    require(r['prompt']==dict(instruction=instruction,title=source['title'],guidance=source['guidance'],task_id=task), 'rewrite prompt differs from fixed source prompt')
     require(r['prompt_sha256']==digest(encoded(r['prompt']).encode()) and isinstance(r['raw_response'],str) and r['response_sha256']==digest(r['raw_response'].encode()), 'rewrite receipt digest mismatch')
     require(all(type(r[k]) in (int,float) and math.isfinite(r[k]) for k in ('started_at','finished_at')) and 0<=r['started_at']<=r['finished_at'], 'invalid model timestamps')
     raw=r['raw_response'].strip()
     if raw.startswith('```'):raw=re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
-    require(json.loads(raw)==dict(title=title,guidance=text), 'rewrite differs from raw model response')
+    require(json.loads(raw)==dict(title=title,guidance=text, **({'applies_when': rewrite['applies_when']} if generalized else {})), 'rewrite differs from raw model response')
 
 
 def family_conditions(source_active, scenes):

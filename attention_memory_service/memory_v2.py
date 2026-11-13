@@ -21,7 +21,7 @@ from .core.models import MemoryRecord, MemoryStatus, MemoryUseRecord, RequestTyp
 from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
 from .seeded_notes import is_test_seeded, is_provisional, flags, TUPLE_KEYS
-from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, SAME_FAMILY, same_family, same_scene,
+from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, SAME_FAMILY, SAME_SKILL, GENERAL, same_skill, reusable_identity, same_family, same_scene,
                             same_task, valid_interface, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY, profile_matches, validate_profile,
                             require_profile_match, profile_fields, exact_profile_matches)
 
@@ -444,6 +444,9 @@ class MemoryV2Manager:
                     or value['failure_signature'] != value['artifact']['failure_signature']
                     or value['source_seed'] != memory.applicability['seed']):
                 raise StateConflictError('provisional provenance binding changed')
+            if 'level' in value:
+                from .reuse_notes import verify
+                verify(self, memory, value)
             return value
         if value.get('channel') == 'test_seeded':
             if (not is_test_seeded(value)
@@ -590,6 +593,19 @@ class MemoryV2Manager:
         if not profile_matches(item.applicability, context):
             return None
         from .dev_v2 import SCOPE
+        if provenance.get('generalized_from'):
+            parent = self.store.get_memory(provenance['generalized_from'])
+            if (parent is None or parent.status is not MemoryStatus.PROVISIONAL
+                    or parent.expires_at is not None and parent.expires_at <= time.time()):
+                return None
+            if not set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY} == TUPLE_KEYS:
+                return None
+            level = provenance['level']
+            if level == SAME_SKILL:
+                return SAME_SKILL if same_skill(item.applicability, context, provenance['skill_tags']) else None
+            if level == GENERAL:
+                return GENERAL if reusable_identity(item.applicability, context) else None
+            return SAME_TASK if same_task(item.applicability, context, {item.applicability['task_prompt']}) else None
         if is_provisional(provenance) and (provenance.get('channel') == 'dev_v2' or provenance.get('channel')=='dev_agent' and provenance.get('source_import_id')):
             plan = self.get_plan(item.memory_id)
             case = plan['cases'][0]
@@ -601,7 +617,7 @@ class MemoryV2Manager:
                 return SAME_SCENE
             if same_task(item.applicability, context, {case['task_prompt']}):
                 return SAME_TASK
-            if same_family(item.applicability, context):
+            if 'level' not in provenance and same_family(item.applicability, context):
                 return SAME_FAMILY
             return None
         if is_test_seeded(provenance) or is_provisional(provenance):
@@ -611,7 +627,7 @@ class MemoryV2Manager:
                 return SAME_SCENE
             if same_task(item.applicability, context, {item.applicability.get('task_prompt')}):
                 return SAME_TASK
-            if same_family(item.applicability, context):
+            if 'level' not in provenance and same_family(item.applicability, context):
                 return SAME_FAMILY
             return None
         if self._trusted_exact(item, provenance, context):

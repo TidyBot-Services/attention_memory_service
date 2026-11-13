@@ -27,7 +27,7 @@ def validation_queue(service):
     for memory in memories:
         mid = memory['memory_id']
         p = provenance.get(mid, {})
-        if (memory['status'] != 'provisional' or not is_provisional(p) or is_test_seeded(p)
+        if (memory['status'] != 'provisional' or not is_provisional(p) or is_test_seeded(p) or p.get('generalized_from')
                 or (p.get('decision_link') or {}).get('decision') not in {None, 'inconclusive'}
                 or memory.get('expires_at') is not None and memory['expires_at'] <= now):
             continue

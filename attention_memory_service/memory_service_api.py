@@ -240,6 +240,7 @@ class ProvisionalNoteInput(BaseModel):
     origin: dict[str, Any]
     from_run_note: dict | None = None
     agent_evidence: dict | None = None
+    source_version_evidence: dict | None = None
     origin_public_feedback_text: str
     help_public_feedback_text: str
     title: str | None = None
@@ -401,6 +402,22 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
     def test_seeded_note(payload: SeededNoteInput):
         return guarded(service.create_test_seeded_note, **payload.model_dump())
 
+    @app.get('/dev-v2/reuse', dependencies=[Depends(authorized)])
+    def reuse_notes_list():
+        return guarded(service.reuse_notes_list)
+
+    @app.get('/dev-v2/reuse/{memory_id}', dependencies=[Depends(authorized)])
+    def reuse_note_detail(memory_id: str):
+        return guarded(service.reuse_note_detail, memory_id)
+
+    @app.post('/dev-v2/reuse/generalize', dependencies=[Depends(importer_authorized)])
+    def generalize_note(payload: dict):
+        return guarded(service.generalize_note, **payload)
+
+    @app.post('/dev-v2/reuse/confirm', dependencies=[Depends(operator_authorized)])
+    def confirm_note_level(payload: dict):
+        return guarded(service.confirm_note_level, **payload)
+
     @app.post('/dev-v2/provisional-notes', dependencies=[Depends(importer_authorized)])
     def provisional_note(payload: ProvisionalNoteInput):
         return guarded(service.create_provisional_note, **payload.model_dump())
@@ -468,6 +485,8 @@ def create_app(store_path: Path, *, api_key: str, operator_key: str | None = Non
                                    levels=tuple(getattr(payload, 'match_levels', ['same_scene']))):
             value = online_memory(item)
             provenance = service.v2._provenance(item.memory_id) or {}
+            from .reuse_notes import FIELDS
+            value.update({k:provenance[k] for k in FIELDS if k in provenance})
             value.update(marker(level, trusted_here(item, level, provenance, payload.context)), source_seed=provenance.get('source_seed'),
                          source_task_id=item.applicability.get('task_id'))
             rows.append(value)

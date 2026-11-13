@@ -79,6 +79,31 @@ class MemoryService:
                 'status': memory.status.value, 'expires_at': memory.expires_at,
                 'source_kind': 'advisor_proxy', **flags(self.v2.provenance(memory.memory_id))}
 
+    def generalize_note(self, **payload):
+        from .reuse_notes import generalize
+        return generalize(self, **payload)
+
+    def reuse_notes_list(self):
+        # Dedicated provisional-note view: historical Dev listing allowlist stays unchanged.
+        rows, errors = [], []
+        for memory in self.store.list_memories():
+            p = self.v2._provenance(memory.memory_id)
+            if not is_provisional(p) or 'level' not in p or p.get('generalized_from'):
+                continue
+            try:
+                rows.append(self.reuse_note_detail(memory.memory_id))
+            except (StateConflictError, FileNotFoundError) as exc:
+                errors.append(dict(memory_id=memory.memory_id, error=str(exc)))
+        return dict(notes=rows, errors=errors)
+
+    def reuse_note_detail(self, memory_id):
+        from .reuse_notes import detail
+        return detail(self, memory_id)
+
+    def confirm_note_level(self, **payload):
+        from .reuse_notes import confirm
+        return confirm(self, **payload)
+
     def record_provisional_outcome(self, **payload) -> dict[str, Any]:
         if payload['grant_id'].startswith('familyref:'):return self.family.outcome(**payload)
         return provisional_notes.record_outcome(self, **payload)
@@ -498,6 +523,7 @@ class MemoryService:
         provenance = self.v2._provenance(memory.memory_id)
         if not provenance or provenance.get('channel') not in {'dev_v2', 'test_seeded', 'dev_v2_provisional'}:
             return None
+        provenance = self.v2.provenance(memory.memory_id)
         if expired:
             self._publish_if_validated_source(memory.memory_id)
         plan = self.v2.get_plan(memory.memory_id)
@@ -524,6 +550,7 @@ class MemoryService:
             **({'motion_permission': motion_permission} if motion_permission else {}),
             'memory_id': memory.memory_id, 'version': memory.version,
             'layer': 'task' if scope == 'task_scoped' else 'scene',
+            **{k:provenance[k] for k in ('level','skill_tags','applies_when','source_run','source_version','source_verified','generalized_from','generalized_copy') if k in provenance},
             'from_provisional': provenance.get('from_provisional'),
             **({'decision_link': provenance['decision_link']} if 'decision_link' in provenance else {}),
             **({'read_layer': LAYER.get(levels.get(memory.memory_id))} if levels is not None else {}),

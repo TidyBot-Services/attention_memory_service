@@ -120,6 +120,18 @@ class MemoryServiceClient:
     def create_provisional_note(self, **payload) -> dict[str, Any]:
         return self._call('POST', '/dev-v2/provisional-notes', payload, importer=True)
 
+    def generalize_note(self, **payload):
+        return self._call('POST', '/dev-v2/reuse/generalize', payload, importer=True)
+
+    def reuse_notes_list(self):
+        return self._call('GET', '/dev-v2/reuse')
+
+    def reuse_note_detail(self, memory_id):
+        return self._call('GET', '/dev-v2/reuse/' + quote(memory_id, safe=''))
+
+    def confirm_note_level(self, **payload):
+        return self._call('POST', '/dev-v2/reuse/confirm', payload, operator=True)
+
     def record_provisional_outcome(self, **payload) -> dict[str, Any]:
         return self._call('POST', '/dev-v2/provisional-outcomes', payload, importer=True)
 

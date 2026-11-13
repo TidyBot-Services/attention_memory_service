@@ -20,7 +20,7 @@ from .core.models import MemoryStatus
 from .memory_v2 import trusted_here
 from .core.store import StateConflictError
 from .seeded_notes import flags, is_test_seeded, is_provisional
-from .applicability import profile_fields, require_profile_match, SAME_SCENE, SAME_TASK, SAME_FAMILY, layer_of, marker as level_marker
+from .applicability import profile_fields, require_profile_match, SAME_SCENE, SAME_TASK, SAME_FAMILY, SAME_SKILL, GENERAL, layer_of, marker as level_marker
 
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -44,7 +44,7 @@ class DevMemoryUse:
                 return item, SAME_SCENE
         if 'sdk_sha256' not in context:
             return None, None  # Legacy contexts have no layered levels.
-        for item, level in self.service.retrieve_levels(context, now=now, levels=(SAME_TASK, SAME_FAMILY)):
+        for item, level in self.service.retrieve_levels(context, now=now, levels=(SAME_TASK, SAME_SKILL, GENERAL, SAME_FAMILY)):
             if item.memory_id == memory_id:
                 return item, level
         return None, None
@@ -94,7 +94,16 @@ class DevMemoryUse:
                     or current.get("expires_at") is not None
                     and current["expires_at"] <= time.time()):
                 raise StateConflictError("memory was revoked or expired before Dev exposure")
+            if provenance and provenance.get('generalized_from'):
+                from .dev_v2 import require
+                stored = json.loads(db.execute('SELECT payload FROM memory_v2_provenance WHERE memory_id=?', (memory_id,)).fetchone()[0])
+                parent = json.loads(db.execute('SELECT payload FROM memories WHERE id=?', (provenance['generalized_from'],)).fetchone()[0])
+                require(stored == provenance and parent['status'] == 'provisional'
+                        and (parent.get('expires_at') is None or parent['expires_at'] > time.time()),
+                        'generalized source changed before Dev exposure')
             require_profile_match(current.get('applicability', {}), context, for_reuse=True)
+            from .reuse_notes import FIELDS
+            marker.update({k:provenance[k] for k in FIELDS if provenance and k in provenance})
             marker.update(profile_fields(current.get('applicability', {})))
             # Scene and task authority share one trust predicate.
             trusted = current['status'] == MemoryStatus.TRUSTED.value and (

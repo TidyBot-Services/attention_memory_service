@@ -27,8 +27,10 @@ import re
 SAME_SCENE = 'same_scene'
 SAME_TASK = 'same_task'
 SAME_FAMILY = 'same_family'
-LEVELS = (SAME_SCENE, SAME_TASK, SAME_FAMILY)
-LAYER = {SAME_SCENE: 'scene', SAME_TASK: 'task', SAME_FAMILY: 'family'}
+SAME_SKILL = 'same_skill'
+GENERAL = 'general'
+LEVELS = (SAME_SCENE, SAME_TASK, SAME_SKILL, GENERAL, SAME_FAMILY)
+LAYER = {SAME_SCENE: 'scene', SAME_TASK: 'task', SAME_FAMILY: 'family', SAME_SKILL: 'skill', GENERAL: 'general'}
 
 PROFILE_KEY = 'execution_profile'
 DEV_LOCAL_KEY = 'planner_dev_local_sha256'
@@ -153,3 +155,21 @@ def marker(level, trusted_here):
     if not trusted_here:
         value['excluded_from_results'] = True
     return value
+
+
+# Reuse across tasks retains every non-scene identity axis. Task prompt and
+# scene/seed axes describe a different task; they cannot be equal across tasks.
+REUSE_KEYS = ('benchmark', 'suite', 'robot', 'controller', 'perception_mode', 'namespace')
+
+
+def reusable_identity(applicability, context):
+    return (profile_matches(applicability, context) and sdk_matches(applicability, context)
+            and all(isinstance(context.get(k), str) and context[k]
+                    and applicability.get(k) == context[k] for k in REUSE_KEYS))
+
+
+def same_skill(applicability, context, skill_tags):
+    from .skill_tags import tags_for
+    return (reusable_identity(applicability, context)
+            and applicability.get('task_id') != context.get('task_id')
+            and bool(set(skill_tags) & set(tags_for(context.get('task_id')))))
