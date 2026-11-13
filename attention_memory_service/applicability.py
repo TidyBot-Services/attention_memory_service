@@ -13,6 +13,10 @@ Compatibility rule for notes stored before the field existed: a note whose
 applicability has no ``sdk_interface_sha256`` keeps the old exact match on the
 implementation hash ``sdk_sha256``. New notes are matched on the interface
 identity only; the implementation hash stays stored for audit.
+
+Planner behavior uses the same compatibility rule: new notes match behavior,
+legacy notes match the deployment snapshot. Validation always keeps the exact
+snapshot/profile check (require_profile_match defaults to strict).
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ LAYER = {SAME_SCENE: 'scene', SAME_TASK: 'task', SAME_FAMILY: 'family'}
 
 PROFILE_KEY = 'execution_profile'
 DEV_LOCAL_KEY = 'planner_dev_local_sha256'
+BEHAVIOR_KEY = 'planner_behavior_sha256'
 _PROFILE = re.compile(r'[a-z0-9][a-z0-9-]{0,47}\Z')
 INTERFACE_KEY = 'sdk_interface_sha256'
 SDK_KEYS = frozenset(('sdk_sha256', INTERFACE_KEY))
@@ -66,10 +71,10 @@ def valid_interface(context):
 
 def validate_profile(value):
     """Only omission represents legacy; explicit null/legacy are invalid."""
-    if isinstance(value, dict) and DEV_LOCAL_KEY in value:
-        digest = value[DEV_LOCAL_KEY]
-        if not isinstance(digest, str) or not _SHA.fullmatch(digest):
-            raise ValueError('planner_dev_local_sha256 must be 64 lowercase hexadecimal characters')
+    if isinstance(value, dict):
+        for key in (DEV_LOCAL_KEY, BEHAVIOR_KEY):
+            if key in value and (not isinstance(value[key], str) or not _SHA.fullmatch(value[key])):
+                raise ValueError(key + ' must be 64 lowercase hexadecimal characters')
     # Existing validators own container-shape errors; keep legacy errors intact.
     if isinstance(value, dict) and PROFILE_KEY in value:
         profile = value[PROFILE_KEY]
@@ -77,22 +82,33 @@ def validate_profile(value):
             raise ValueError('execution_profile must match ^[a-z0-9][a-z0-9-]{0,47}$ and cannot be legacy')
 
 
-def profile_matches(applicability, context):
-    """A note can cross no execution-profile boundary, including legacy."""
+def exact_profile_matches(applicability, context):
+    """Validation/source evidence retains exact snapshot equality."""
     return (applicability.get(PROFILE_KEY) == context.get(PROFILE_KEY)
             and applicability.get(DEV_LOCAL_KEY) == context.get(DEV_LOCAL_KEY))
 
 
-def require_profile_match(applicability, context):
+def profile_matches(applicability, context):
+    """Reuse: new notes bind behavior; legacy notes bind the exact snapshot."""
+    key = BEHAVIOR_KEY if BEHAVIOR_KEY in applicability else DEV_LOCAL_KEY
+    return (applicability.get(PROFILE_KEY) == context.get(PROFILE_KEY)
+            and applicability.get(key) == context.get(key))
+
+
+def require_profile_match(applicability, context, *, for_reuse=False):
     from .core.store import StateConflictError
     validate_profile(applicability)
     validate_profile(context)
-    if not profile_matches(applicability, context):
+    # Validation callers keep the original strict check by default. Only
+    # ordinary Dev exposure/observational outcomes opt into behavior matching.
+    matches = profile_matches if for_reuse else exact_profile_matches
+    if not matches(applicability, context):
+        key = BEHAVIOR_KEY if for_reuse and BEHAVIOR_KEY in applicability else DEV_LOCAL_KEY
         raise StateConflictError(
             f"execution profile mismatch: note {applicability.get(PROFILE_KEY, 'legacy')}, "
             f"context {context.get(PROFILE_KEY, 'legacy')}"
-            + (f"; planner_dev_local_sha256 note {applicability.get(DEV_LOCAL_KEY)}, context {context.get(DEV_LOCAL_KEY)}"
-               if DEV_LOCAL_KEY in applicability or DEV_LOCAL_KEY in context else ''))
+            + (f"; {key} note {applicability.get(key)}, context {context.get(key)}"
+               if key in applicability or key in context else ''))
 
 
 def config_profile(config):
@@ -108,7 +124,7 @@ def config_profile(config):
 
 def profile_fields(applicability):
     """Omission labels legacy without changing existing response bytes."""
-    return {k: applicability[k] for k in (PROFILE_KEY, DEV_LOCAL_KEY) if k in applicability}
+    return {k: applicability[k] for k in (PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY) if k in applicability}
 
 
 def sdk_matches(applicability, context):

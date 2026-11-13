@@ -186,7 +186,7 @@ def record_outcome(service, *, grant_id, development_id, public_feedback_text, p
     if execution_import_id is not None:
         require(grant['context'] == d['context'], 'agent outcome grant scope mismatch')
     provenance = service.v2.provenance(grant['memory_id'])
-    require_profile_match(provenance['artifact']['applicability'], grant['context'])
+    require_profile_match(provenance['artifact']['applicability'], grant['context'], for_reuse=True)
     plan = service.v2.get_plan(grant['memory_id'])
     with sqlite3.connect(service.store.path) as db:
         db.execute('BEGIN IMMEDIATE')

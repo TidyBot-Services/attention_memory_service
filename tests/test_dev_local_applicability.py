@@ -94,7 +94,8 @@ def test_registered_fields_and_old_note_response_bytes(tmp_path):
     assert capture(tmp_path)==Path(__file__).with_name('legacy_profile_flow.json').read_bytes()
 
 
-def test_validation_and_cross_seed_propagation(tmp_path,monkeypatch):
+@pytest.mark.parametrize('behavior',[None,'e'*64])
+def test_validation_and_cross_seed_propagation(tmp_path,monkeypatch,behavior):
     from tests.dev_v2_fixtures import Fixture
     from tests.test_single_scene import setup_scene,import_pairs
     from tests.test_cross_seed import batch,finish,target
@@ -106,10 +107,12 @@ def test_validation_and_cross_seed_propagation(tmp_path,monkeypatch):
             value['execution_settings']['planner_deployment']=dict(sha256=current['sha'])
         if isinstance(value,dict) and isinstance(value.get('context'),dict):
             value['context'][KEY]=current['sha']
+            if behavior:value['context']['planner_behavior_sha256']=behavior
         return original(path,value)
     monkeypatch.setattr(Fixture,'write',staticmethod(write))
     fixture,svc,plan=setup_scene(tmp_path,interface=True,execution_profile='r3-20261025')
     assert svc.store.get_memory('m1').applicability[KEY]=='a'*64
+    assert svc.store.get_memory('m1').applicability.get('planner_behavior_sha256')==behavior
     with pytest.raises(StateConflictError,match=KEY):svc.record_plan('m1',plan)
     plan[KEY]='a'*64;svc.record_plan('m1',plan)
     record=fixture.records['c0']

@@ -68,7 +68,7 @@ class DevMemoryUse:
         if memory is None:
             note = self.service.store.get_memory(memory_id)
             if note is not None:
-                require_profile_match(note.applicability, context)
+                require_profile_match(note.applicability, context, for_reuse=True)
             raise StateConflictError("memory is not trusted or applicable to Dev context")
         provenance = self.service.v2._provenance(memory_id)
         marker = flags(provenance)
@@ -94,7 +94,7 @@ class DevMemoryUse:
                     or current.get("expires_at") is not None
                     and current["expires_at"] <= time.time()):
                 raise StateConflictError("memory was revoked or expired before Dev exposure")
-            require_profile_match(current.get('applicability', {}), context)
+            require_profile_match(current.get('applicability', {}), context, for_reuse=True)
             marker.update(profile_fields(current.get('applicability', {})))
             # Scene and task authority share one trust predicate.
             trusted = current['status'] == MemoryStatus.TRUSTED.value and (

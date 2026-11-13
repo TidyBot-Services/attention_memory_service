@@ -22,8 +22,8 @@ from .core.store import AttentionStore, StateConflictError
 from .seed_guard import classify_seed
 from .seeded_notes import is_test_seeded, is_provisional, flags, TUPLE_KEYS
 from .applicability import (INTERFACE_KEY, LEVELS, SAME_SCENE, SAME_TASK, SAME_FAMILY, same_family, same_scene,
-                            same_task, valid_interface, PROFILE_KEY, DEV_LOCAL_KEY, profile_matches, validate_profile,
-                            require_profile_match, profile_fields)
+                            same_task, valid_interface, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY, profile_matches, validate_profile,
+                            require_profile_match, profile_fields, exact_profile_matches)
 
 
 def trusted_here(memory, level, provenance=None, context=None):
@@ -427,7 +427,8 @@ class MemoryV2Manager:
             if value.get("channel") == "dev_agent" and source.get("channel") != "dev_agent":
                 raise StateConflictError("agent source channel differs")
             if (memory.applicability != value["artifact"]["applicability"]
-                    or not profile_matches(memory.applicability, source["context"])
+                    or not exact_profile_matches(memory.applicability, source["context"])
+                    or memory.applicability.get(BEHAVIOR_KEY) != source["context"].get(BEHAVIOR_KEY)
                     or any(memory.applicability.get(k) != source["context"][k] for k in SCOPE)
                     or memory.guidance != source["guidance"]
                     or memory.candidate_repair != source["repair"]
@@ -592,7 +593,7 @@ class MemoryV2Manager:
         if is_provisional(provenance) and (provenance.get('channel') == 'dev_v2' or provenance.get('channel')=='dev_agent' and provenance.get('source_import_id')):
             plan = self.get_plan(item.memory_id)
             case = plan['cases'][0]
-            if not set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}:
+            if not set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}:
                 return None
             if (context.get('seed') == provenance['source_seed']
                     and same_scene(item.applicability, context, SCOPE)
@@ -604,7 +605,7 @@ class MemoryV2Manager:
                 return SAME_FAMILY
             return None
         if is_test_seeded(provenance) or is_provisional(provenance):
-            if set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY} != TUPLE_KEYS:
+            if set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY} != TUPLE_KEYS:
                 return None
             if same_scene(item.applicability, context, TUPLE_KEYS):
                 return SAME_SCENE
@@ -616,7 +617,7 @@ class MemoryV2Manager:
         if self._trusted_exact(item, provenance, context):
             return SAME_SCENE
         if (item.status is MemoryStatus.TRUSTED and provenance.get('channel') == 'dev_v2'
-                and set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}):
+                and set(context) - {INTERFACE_KEY, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY} >= TUPLE_KEYS - {'scene_contract_ref'}):
             plan = self.get_plan(item.memory_id)
             prompts = {case.get('task_prompt') for case in (plan or {}).get('cases', [])}
             if plan is not None and same_task(item.applicability, context, prompts):

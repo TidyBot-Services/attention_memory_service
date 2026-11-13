@@ -10,7 +10,7 @@ import time
 from .core.models import MemoryRecord, MemoryStatus
 from .core.store import StateConflictError
 from .dev_v2 import SCOPE, SHA
-from .applicability import validate_profile, PROFILE_KEY, DEV_LOCAL_KEY
+from .applicability import validate_profile, PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY
 from .note_title import validate_group, validate_summary, validate_title
 
 TUPLE_KEYS = frozenset((*SCOPE, 'seed', 'camera_names', 'task_prompt', 'scene_contract_ref'))
@@ -47,7 +47,7 @@ def validate_context(context):
     validate_profile(context)
     # sdk_interface_sha256 is optional only for notes seeded before it existed;
     # see applicability.py for the matching rule.
-    if not isinstance(context, dict) or set(context) - {'sdk_interface_sha256', PROFILE_KEY, DEV_LOCAL_KEY} != TUPLE_KEYS:
+    if not isinstance(context, dict) or set(context) - {'sdk_interface_sha256', PROFILE_KEY, DEV_LOCAL_KEY, BEHAVIOR_KEY} != TUPLE_KEYS:
         raise ValueError('test seed requires the complete exact single-scene tuple')
     if 'sdk_interface_sha256' in context and (
             not isinstance(context['sdk_interface_sha256'], str)

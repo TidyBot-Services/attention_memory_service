@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..applicability import profile_matches, validate_profile
+from ..applicability import exact_profile_matches as profile_matches, validate_profile
 from .models import MemoryRecord, MemoryStatus, MemoryUseRecord
 from .store import AttentionStore, StateConflictError
 
