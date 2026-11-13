@@ -14,8 +14,9 @@ from tests.dev_v2_fixtures import Fixture
 
 @pytest.mark.parametrize('name, expected', [
     ('live/a.jpg', True), ('frames/a.jpeg', True), ('recording_frames/a.png', True),
-    ('recording_views/top/a.jpg', True), ('snapshots/objects/a.png', True),
-    ('snapshots/objects/abc', True), ('live/camera_initial.png', False),
+    ('recording_views/top/a.jpg', True), ('snapshots/objects/a.png', False),
+    ('snapshots/objects/abc', False), ('snapshots/objects/code.py', False),
+    ('snapshots/objects/notes.txt', False), ('live/camera_initial.png', False),
     ('frames/camera_final.png', False), ('a.png', False), ('frames/a.json', False)])
 def test_rule(name, expected):
     assert is_frame_image(name) is expected
@@ -38,6 +39,18 @@ def test_strip_count_idempotence_and_ref(tmp_path):
     service.dev_v2.register('frames', catalog)
     with pytest.raises(StateConflictError, match='registered evidence file missing'):
         service.dev_v2.ref('frames', dict(uri=str(frame), sha256=digest(b'RGB')), raw=True)
+
+
+def test_snapshot_objects_remain_verified_evidence(tmp_path):
+    service,catalog,_=setup(tmp_path)
+    obj=Path(catalog['root'])/'snapshots/objects/abc'
+    obj.parent.mkdir(parents=True);obj.write_bytes(b'code or notes')
+    catalog['files']['snapshots/objects/abc']=digest(obj.read_bytes())
+    service.dev_v2.register('objects',catalog)
+    assert 'snapshots/objects/abc' in service.dev_v2.catalog('objects')['files']
+    obj.unlink()
+    with pytest.raises(StateConflictError,match='missing'):
+        service.dev_v2.register('objects',catalog)
 
 
 def test_legacy_reregister_and_startup_still_checks_nonframes(tmp_path):

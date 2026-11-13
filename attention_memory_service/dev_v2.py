@@ -53,8 +53,7 @@ def is_frame_image(name):
         return False
     parts = path.parts
     return (path.suffix.lower() in {'.png', '.jpg', '.jpeg'} and
-            bool(set(parts) & {'frames', 'live', 'recording_frames', 'recording_views'})) or any(
-                parts[i:i + 2] == ('snapshots', 'objects') for i in range(len(parts) - 1))
+            bool(set(parts) & {'frames', 'live', 'recording_frames', 'recording_views'}))
 
 
 def without_frame_images(catalog):
